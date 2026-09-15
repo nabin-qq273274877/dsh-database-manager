@@ -1,0 +1,86 @@
+{
+  "name": "dsh-database-manager",
+  "version": "0.1.0",
+  "description": "Database management for the DeepSeek Harness Web GUI: a sidebar entry and a dedicated centre panel managing SQLite / MySQL / Redis (config store, live connection pool, a phpMyAdmin-style SQL browser, a RedisDesktopManager-style Redis browser), plus agent tools (db_list, db_schema, db_query, db_exec) behind an approval-gated write switch.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "plugin": {
+      "schemaVersion": 1,
+      "displayName": {
+        "zh-CN": "数据库管理",
+        "en": "Database Manager"
+      },
+      "summary": {
+        "zh-CN": "侧边栏「数据库管理」面板：统一管理 SQLite / MySQL / Redis，并提供受审批保护的 agent 工具",
+        "en": "Sidebar Database Manager panel for SQLite / MySQL / Redis with approval-guarded agent tools"
+      },
+      "category": "database"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-renderer"
+      ],
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib",
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsx scripts/build.ts",
+    "build:watch": "tsx watch scripts/build.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit && vitest run",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "database",
+    "sqlite",
+    "mysql",
+    "redis"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nabin-qq273274877/dsh-database-manager.git"
+  },
+  "dependencies": {
+    "ioredis": "^5.9.3",
+    "mysql2": "^3.24.4"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.2",
+    "@types/node": "^22.20.0",
+    "@types/react": "^18.3.0",
+    "esbuild-wasm": "^0.28.2",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
