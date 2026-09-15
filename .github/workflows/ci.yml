@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  # 守卫：仅当 v* tag 指向 master 分支时，后续 job 才真正执行。
+  # 在 feature 分支误打 tag 会被此守卫拦截，build-and-test / publish 保持 skipped，
+  # 不会触发「Some jobs were not successful」的失败通知。
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      onMain: ${{ steps.check.outputs.onMain }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 拉取完整历史，确保 origin/master 可用
+
+      - name: Check tag points at master
+        id: check
+        run: |
+          if git merge-base --is-ancestor "$GITHUB_SHA" "origin/master"; then
+            echo "onMain=true" >> "$GITHUB_OUTPUT"
+            echo "tag $GITHUB_REF_NAME is on master"
+          else
+            echo "onMain=false" >> "$GITHUB_OUTPUT"
+            echo "tag $GITHUB_REF_NAME is NOT on master; skipping CI"
+          fi
+
+  build-and-test:
+    needs: guard
+    if: needs.guard.outputs.onMain == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm run build
+
+      - run: pnpm test
+
+      - name: Verify built files exist
+        run: |
+          test -f lib/index.js
+          test -f lib/client.js
+
+  publish:
+    needs: build-and-test
+    if: needs.guard.outputs.onMain == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+
+      # 发布仍走 npm（provenance 需要），依赖已由 pnpm 装好
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
