@@ -10,7 +10,7 @@ import * as React from 'react'
 import type { DataSourceSummary, DbKind, EngineAvailability, GateSettingsView, TestResult } from '../protocol.ts'
 import type { DbApi } from './api.ts'
 import { SourceFormDialog } from './SourceFormDialog.ts'
-import { ErrorBanner, Empty, Modal, t } from './ui.ts'
+import { ErrorBanner, BackButton, Empty, Modal, t } from './ui.ts'
 
 /** Grouping modes offered by the toolbar select. */
 type GroupMode = 'none' | 'kind' | 'group' | 'tag'
@@ -27,6 +27,8 @@ export interface SourceListViewProps {
   saveGate(patch: Partial<GateSettingsView>): Promise<void>
   /** Open one data source's database panel. */
   onConnect(source: DataSourceSummary): void
+  /** Leave the panel and hand the centre column back to the conversation. */
+  onBack(): void
 }
 
 /** The host/credential cells shown for one source. */
@@ -299,6 +301,7 @@ export function SourceListView(props: SourceListViewProps): React.ReactElement {
     React.createElement(
       'div',
       { className: 'dbm-header' },
+      React.createElement(BackButton, { onBack: props.onBack }),
       React.createElement('span', { className: 'dbm-title' }, t('panel.title')),
       React.createElement('span', { className: 'dbm-subtitle' }, t('panel.subtitle')),
       React.createElement('span', { className: 'dbm-spacer' }),

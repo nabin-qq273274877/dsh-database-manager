@@ -22,11 +22,16 @@ export interface DatabasePanelProps {
   api: DbApi
   /** Bumps on every locale change so the view re-renders its copy. */
   localeTick: number
+  /**
+   * Leave the panel: hand the centre column back to the conversation. Owned by
+   * the mount, which is the only place that can reach the layout router.
+   */
+  onClose(): void
 }
 
 /** The panel root. */
 export function DatabasePanel(props: DatabasePanelProps): React.ReactElement {
-  const { controller, api, localeTick } = props
+  const { controller, api, localeTick, onClose } = props
   const [snapshot, setSnapshot] = React.useState(() => controller.getSnapshot())
   const [sources, setSources] = React.useState<DataSourceSummary[] | undefined>(undefined)
   const [settings, setSettings] = React.useState<GateSettingsView>({ allowAgentWrite: false, requireApproval: true })
@@ -93,7 +98,11 @@ export function DatabasePanel(props: DatabasePanelProps): React.ReactElement {
       api,
       source: screen.source,
       initialSchemas: screen.schemas,
+      // Inside a data source the back control steps out to the list; the list's
+      // own control is the one that leaves the panel, mirroring how a file
+      // manager separates "up a level" from "close".
       onBack: () => controller.showList(),
+      onClose,
     })
   } else if (screen.name === 'redis') {
     body = React.createElement(RedisDatabaseView, {
@@ -101,6 +110,7 @@ export function DatabasePanel(props: DatabasePanelProps): React.ReactElement {
       source: screen.source,
       initialInfo: screen.info,
       onBack: () => controller.showList(),
+      onClose,
     })
   } else if (sources === undefined) {
     body = React.createElement(Empty, { message: t('common.loading') })
@@ -113,8 +123,18 @@ export function DatabasePanel(props: DatabasePanelProps): React.ReactElement {
       reload,
       saveGate,
       onConnect: (source: DataSourceSummary) => { void connect(source) },
+      onBack: onClose,
     })
   }
 
-  return React.createElement('div', { className: 'dbm-root' }, error === undefined ? null : React.createElement(ErrorBanner, { message: error }), body as never)
+  // The error banner rides above the active screen, which supplies its own
+  // `.dbm-root` column. This wrapper must therefore NOT be another `.dbm-root`:
+  // nesting two 100%-height flex columns doubled the layout (measured as two
+  // `.dbm-root` elements in the centre column) and broke the inner scroll areas.
+  return React.createElement(
+    'div',
+    { className: 'dbm-shell' },
+    error === undefined ? null : React.createElement(ErrorBanner, { message: error }),
+    body as never,
+  )
 }

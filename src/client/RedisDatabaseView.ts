@@ -9,7 +9,7 @@ import * as React from 'react'
 import type { DataSourceSummary, RedisInfo, RedisKeyInfo, RedisValue } from '../protocol.ts'
 import type { DbApi } from './api.ts'
 import { keyFromCommand, splitCommand } from './command.ts'
-import { ErrorBanner, Empty, TabStrip, formatBytes, formatTtl, formatUptime, isNull, renderCell, t } from './ui.ts'
+import { BackButton, ErrorBanner, Empty, TabStrip, formatBytes, formatTtl, formatUptime, isNull, renderCell, t } from './ui.ts'
 
 /** The right-hand tabs of a Redis panel. */
 type RedisTab = 'value' | 'info' | 'console'
@@ -20,13 +20,15 @@ export interface RedisDatabaseViewProps {
   source: DataSourceSummary
   /** Server overview fetched at connect time. */
   initialInfo: RedisInfo
-  /** Leave the database panel and return to the list. */
+  /** Step out of this data source, back to the data-source list. */
   onBack(): void
+  /** Leave the panel entirely and show the conversation. */
+  onClose(): void
 }
 
 /** The Redis panel. */
 export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactElement {
-  const { api, source, initialInfo, onBack } = props
+  const { api, source, initialInfo, onBack, onClose } = props
   const [info, setInfo] = React.useState<RedisInfo>(initialInfo)
   const [db, setDb] = React.useState(source.db ?? 0)
   const [pattern, setPattern] = React.useState('*')
@@ -223,10 +225,12 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
     React.createElement(
       'div',
       { className: 'dbm-header' },
-      React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-sm', onClick: onBack }, `← ${t('panel.close')}`),
+      React.createElement(BackButton, { onBack, label: t('panel.backToList') }),
       React.createElement('span', { className: 'dbm-title' }, source.name),
       React.createElement('span', { className: 'dbm-badge dbm-badge-redis' }, 'redis'),
       React.createElement('span', { className: 'dbm-subtitle dbm-mono' }, `${source.host ?? ''}:${source.port ?? ''}/db${db}`),
+      React.createElement('span', { className: 'dbm-spacer' }),
+      React.createElement(BackButton, { onBack: onClose }),
     ),
     error === undefined ? null : React.createElement(ErrorBanner, { message: error }),
     notice === undefined ? null : React.createElement('div', { className: 'dbm-ok', style: { padding: '6px 14px' } }, notice),

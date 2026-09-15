@@ -12,6 +12,8 @@ export const zh = {
   'panel.title': '数据库管理',
   'panel.subtitle': 'SQLite / MySQL / Redis',
   'panel.close': '返回会话',
+  'panel.backToConversation': '返回会话',
+  'panel.backToList': '数据库列表',
   'panel.engines': '引擎',
   'panel.engine.missing': '{kind} 驱动不可用：{detail}',
 
@@ -211,6 +213,8 @@ export const en: Record<DbKey, string> = {
   'panel.title': 'Database Manager',
   'panel.subtitle': 'SQLite / MySQL / Redis',
   'panel.close': 'Back to conversation',
+  'panel.backToConversation': 'Back to conversation',
+  'panel.backToList': 'Data sources',
   'panel.engines': 'Engines',
   'panel.engine.missing': '{kind} driver unavailable: {detail}',
 

@@ -4,6 +4,21 @@
  */
 
 export const PANEL_CSS = `
+/*
+ * The panel's outer shell. It exists only to stack an optional error banner
+ * above the active screen, which owns the real .dbm-root column — nesting two
+ * 100%-height flex columns doubled the layout, so this one stays a plain
+ * full-height box.
+ */
+.dbm-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+}
+
 .dbm-root {
   display: flex;
   flex-direction: column;
@@ -36,17 +51,31 @@ export const PANEL_CSS = `
 .dbm-entry-glyph > svg { display: block; }
 
 /* ---- header ------------------------------------------------------------ */
+/*
+ * Deliberately close to the SSH panel's header (its .panelHeader/.panelTitle):
+ * horizontal padding 14px and a 15-16px bold title, so the two panels read as
+ * the same product rather than two different takes on a header.
+ */
 .dbm-header {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 10px 14px;
+  gap: 10px;
+  padding: 12px 14px;
   border-bottom: 1px solid var(--dsw-alias-border-l3);
   flex: none;
 }
-.dbm-title { font-size: 15px; font-weight: 600; }
+.dbm-title { font-size: 16px; font-weight: 700; }
 .dbm-subtitle { color: var(--dsw-alias-label-secondary); font-size: 12px; }
 .dbm-spacer { flex: 1; }
+
+/* The back control: a quiet outlined button, matching dsh-ssh's ghost button. */
+.dbm-back { padding: 5px 12px; font-size: 12px; }
+.dbm-btn-ghost {
+  background: transparent;
+  border: 1px solid var(--dsw-alias-border-l2, var(--dsw-alias-border-l3));
+  color: var(--dsw-alias-label-primary);
+}
+.dbm-btn-ghost:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover); }
 
 /* ---- controls ---------------------------------------------------------- */
 .dbm-btn {
@@ -62,14 +91,23 @@ export const PANEL_CSS = `
   cursor: pointer;
   white-space: nowrap;
 }
-.dbm-btn:hover:not(:disabled) { background: var(--dsw-alias-button-floating-hover); }
+/*
+ * Hover states are written per-variant, never on the base class.
+ *
+ * A base .dbm-btn:hover:not(:disabled) rule scores (0,3,0) and therefore beats
+ * a plain .dbm-btn-primary (0,1,0) on background — which made the primary
+ * button swap to the light hover fill while keeping its inverted (white) text,
+ * i.e. it vanished on hover. Keeping each variant's background in a rule of
+ * matching specificity removes that trap.
+ */
 .dbm-btn:disabled { opacity: .5; cursor: default; }
 .dbm-btn-primary {
   background: var(--dsw-alias-label-primary);
   color: var(--dsw-alias-label-primary-inverted);
   border-color: transparent;
 }
-.dbm-btn-primary:hover:not(:disabled) { filter: brightness(1.1); }
+.dbm-btn:hover:not(:disabled):not(.dbm-btn-primary) { background: var(--dsw-alias-button-floating-hover); }
+.dbm-btn-primary:hover:not(:disabled) { filter: brightness(1.15); }
 .dbm-btn-danger { color: var(--dsw-alias-label-danger, #d33); }
 .dbm-btn-sm { padding: 3px 8px; font-size: 12px; border-radius: 6px; }
 

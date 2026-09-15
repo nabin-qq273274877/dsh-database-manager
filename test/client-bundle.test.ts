@@ -40,6 +40,8 @@ interface Loaded {
   effects: string[]
   /** Stylesheets the plugin injected, in append order. */
   styles: InjectedStyle[]
+  /** Document-level listeners the plugin subscribed, for the arbitration logic. */
+  documentListeners: Array<{ type: string; listener: unknown; capture: unknown }>
   dictionaries: Array<{ ns: string; dicts: Record<string, unknown> }>
   /** The plugin's apply(), already invoked. */
   applied: boolean
@@ -60,7 +62,8 @@ function load(overrides: {
   const effects: string[] = []
   const styles: InjectedStyle[] = []
   const dictionaries: Loaded['dictionaries'] = []
-  const result: Loaded = { registered, effects, styles, dictionaries, applied: false }
+  const documentListeners: Loaded['documentListeners'] = []
+  const result: Loaded = { registered, effects, styles, documentListeners, dictionaries, applied: false }
 
   /** The registry the plugin's apply() is handed as `ctx`. */
   const makeContext = (): Record<string, unknown> => {
@@ -149,12 +152,24 @@ function load(overrides: {
     'console',
     `${BUNDLE}\nreturn { loaded: window.__ModuleLoader__ };`,
   )
-  // A document stub with just enough DOM for the stylesheet injection: the
-  // plugin creates a <style>, sets its dataset, and appends it to head.
+  // A document stub with just enough DOM for the two things the plugin does at
+  // mount: append a <style> to head, and subscribe document-level listeners
+  // for the centre-column arbitration.
   const appended: InjectedStyle[] = []
+  const capturedListeners: Array<{ type: string; listener: unknown; capture: unknown }> = []
+  const htmlAttributes = new Set<string>()
   const documentStub = {
-    documentElement: { lang: 'zh' },
+    documentElement: {
+      lang: 'zh',
+      setAttribute: (name: string) => { htmlAttributes.add(name) },
+      removeAttribute: (name: string) => { htmlAttributes.delete(name) },
+      hasAttribute: (name: string) => htmlAttributes.has(name),
+    },
     querySelector: () => null,
+    addEventListener: (type: string, listener: unknown, capture?: unknown) => {
+      capturedListeners.push({ type, listener, capture })
+    },
+    removeEventListener: () => {},
     createElement: (tag: string) => {
       const element = {
         tagName: tag.toUpperCase(),
@@ -192,6 +207,7 @@ function load(overrides: {
   // The style append happens inside an effect, which this harness runs
   // synchronously during apply() — so collect it only after apply() returned.
   styles.push(...appended)
+  documentListeners.push(...capturedListeners)
   // Render each registered component once so a render-time crash is visible.
   if (overrides.render !== false) {
     for (const entry of registered) {
@@ -322,5 +338,52 @@ describe('built client half', () => {
     const html = element.props['dangerouslySetInnerHTML'] as { __html: string }
     expect(html.__html).toContain('width="18"')
     expect(html.__html).toContain('height="18"')
+  })
+
+  it('subscribes the document listeners the centre-column arbitration needs', () => {
+    const loaded = load()
+    const types = loaded.documentListeners.map(entry => entry.type)
+    // keydown: Escape closes. click (capture): the sidebar row toggle and the
+    // session-row hand-back. dsh-panel-activate: a sibling panel taking the
+    // column closes ours.
+    expect(types).toEqual(expect.arrayContaining(['keydown', 'click', 'dsh-panel-activate']))
+    // The click listeners must run in the capture phase, so ours settles the
+    // state before the shell's own row handler acts on the same press.
+    const clicks = loaded.documentListeners.filter(entry => entry.type === 'click')
+    expect(clicks.length).toBeGreaterThan(0)
+    expect(clicks.every(entry => entry.capture === true)).toBe(true)
+  })
+
+  it('marks the entry row with the attribute the toggle recognises', () => {
+    const loaded = load({ render: false })
+    const entry = loaded.registered.find(item => item.slot === 'sidebar.panellist')!
+    const element = (entry.component as (props: unknown) => { props: Record<string, unknown> })({ size: 16, active: false })
+    expect(element.props['data-dsh-dbm-entry']).toBe('database-manager')
+  })
+
+  it('wires a back-to-conversation control into every view header', () => {
+    // The panel is a full takeover of the centre column, so each screen needs a
+    // way out. Behaviour (does pressing it return to the chat?) is proven by
+    // scripts/e2e-panel.mjs in a real browser; here the guarantee is structural:
+    // the control exists, carries the markers, and every header wires it.
+    //
+    // Calling the components would need a React renderer (hooks outside one
+    // throw), and the list screen renders its loading state with no header until
+    // its first fetch resolves — so the artifact itself is the honest subject.
+    const loaded = load({ render: false })
+    const css = loaded.styles[0]!.css
+    expect(css).toMatch(/\.dbm-back\s*\{/)
+
+    // The control's markers, as they appear in the built artifact.
+    expect(BUNDLE).toContain('data-dsh-center-view-back')
+    expect(BUNDLE).toMatch(/dbm-btn dbm-btn-ghost dbm-back/)
+    expect(BUNDLE).toMatch(/panel\.backToConversation/)
+    // The list screen's own label for stepping back to the data-source list.
+    expect(BUNDLE).toMatch(/panel\.backToList/)
+
+    // Every header construction (list, SQL view, Redis view) instantiates the
+    // control, so none of the three screens can ship without a way back.
+    const backButtonUses = BUNDLE.match(/createElement\(BackButton/g) ?? []
+    expect(backButtonUses.length).toBeGreaterThanOrEqual(3)
   })
 })

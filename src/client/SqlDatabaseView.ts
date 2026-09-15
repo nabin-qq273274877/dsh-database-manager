@@ -9,7 +9,7 @@ import * as React from 'react'
 
 import type { ColumnInfo, DataSourceSummary, IndexInfo, TableInfo, TablePage } from '../protocol.ts'
 import type { DbApi } from './api.ts'
-import { ErrorBanner, Empty, Modal, TabStrip, isNull, renderCell, t } from './ui.ts'
+import { BackButton, ErrorBanner, Empty, Modal, TabStrip, isNull, renderCell, t } from './ui.ts'
 
 /** The right-hand tabs of a SQL database panel. */
 type SqlTab = 'browse' | 'structure' | 'sql' | 'search' | 'insert'
@@ -20,8 +20,10 @@ export interface SqlDatabaseViewProps {
   source: DataSourceSummary
   /** Schemas known at connect time; refreshed by the view. */
   initialSchemas: string[]
-  /** Leave the database panel and return to the list. */
+  /** Step out of this data source, back to the data-source list. */
   onBack(): void
+  /** Leave the panel entirely and show the conversation. */
+  onClose(): void
 }
 
 /** One page of rows plus the mode that produced it. */
@@ -33,7 +35,7 @@ interface RowsState {
 
 /** The SQL database panel. */
 export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement {
-  const { api, source, initialSchemas, onBack } = props
+  const { api, source, initialSchemas, onBack, onClose } = props
   const [schemas, setSchemas] = React.useState<string[]>(initialSchemas)
   const [activeSchema, setActiveSchema] = React.useState<string | undefined>(initialSchemas[0])
   const [tables, setTables] = React.useState<TableInfo[]>([])
@@ -331,10 +333,12 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     React.createElement(
       'div',
       { className: 'dbm-header' },
-      React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-sm', onClick: onBack }, `← ${t('panel.close')}`),
+      React.createElement(BackButton, { onBack, label: t('panel.backToList') }),
       React.createElement('span', { className: 'dbm-title' }, source.name),
       React.createElement('span', { className: `dbm-badge dbm-badge-${source.kind}` }, source.kind),
       React.createElement('span', { className: 'dbm-subtitle dbm-mono' }, source.kind === 'sqlite' ? (source.file ?? '') : `${source.host ?? ''}:${source.port ?? ''}`),
+      React.createElement('span', { className: 'dbm-spacer' }),
+      React.createElement(BackButton, { onBack: onClose }),
     ),
     error === undefined ? null : React.createElement(ErrorBanner, { message: error }),
     notice === undefined ? null : React.createElement('div', { className: 'dbm-ok', style: { padding: '6px 14px' } }, notice),

@@ -155,6 +155,34 @@ export function ErrorBanner(props: { message: string }): React.ReactElement {
   return React.createElement('div', { className: 'dbm-error' }, props.message)
 }
 
+/**
+ * The panel's back-to-conversation control.
+ *
+ * Shaped after the SSH panel's control, which is what users already read as
+ * "leave this panel": a chevron plus a label in a ghost button. It is rendered
+ * on every screen of this panel, because the panel is a full takeover of the
+ * centre column — the conversation is not visible behind it, so without a
+ * control here the only way back would be a sidebar row.
+ *
+ * The label is the accessible name; `data-dsh-center-view-back` is the marker
+ * sibling plugins and skin CSS use to find the control (dsh-ssh sets it too).
+ */
+export function BackButton(props: { onBack(): void; label?: string }): React.ReactElement {
+  const label = props.label ?? t('panel.backToConversation')
+  return React.createElement(
+    'button',
+    {
+      type: 'button',
+      className: 'dbm-btn dbm-btn-ghost dbm-back',
+      'aria-label': label,
+      'data-dsh-center-view-back': '',
+      onClick: props.onBack,
+    },
+    React.createElement('span', { 'aria-hidden': 'true' }, '‹'),
+    React.createElement('span', null, label),
+  )
+}
+
 /** A lightweight "no data" placeholder. */
 export function Empty(props: { message: string }): React.ReactElement {
   return React.createElement('div', { className: 'dbm-empty' }, props.message)
