@@ -270,6 +270,9 @@ export function SourceListView(props: SourceListViewProps): React.ReactElement {
       React.createElement(SourceFormDialog, {
         key: 'form',
         ...(editing === undefined ? {} : { source: editing }),
+        // Tests the draft against the host without saving it, so a wrong host
+        // or password is caught before the entry exists.
+        onTest: (payload, baseId) => api.testConnection(payload, baseId),
         onSubmit: async (payload: Record<string, unknown>) => {
           if (editing === undefined) await api.createSource(payload as never)
           else await api.updateSource(editing.id, payload as never)

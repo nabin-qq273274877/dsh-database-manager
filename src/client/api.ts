@@ -109,6 +109,20 @@ export class DbApi {
     return (await send<{ result: TestResult }>(DB_API.test(id), 'POST')).result
   }
 
+  /**
+   * Test an UNSAVED payload. Nothing is stored, so the dialog can verify a
+   * connection before the user commits the form.
+   * @param payload - the draft fields.
+   * @param baseId - the entry being edited, so an untouched password falls back
+   *   to the stored one (the browser never receives it).
+   */
+  async testConnection(payload: DataSourcePayload, baseId?: string): Promise<TestResult> {
+    return (await send<{ result: TestResult }>(DB_API.testConnection, 'POST', {
+      ...payload,
+      ...(baseId === undefined ? {} : { baseId }),
+    })).result
+  }
+
   /** Connect and fetch the opening payload for the database panel. */
   async connect(id: string): Promise<{
     ok: boolean

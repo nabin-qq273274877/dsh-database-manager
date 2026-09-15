@@ -247,6 +247,31 @@ export class DataSourceStore {
     return this.load().sources
   }
 
+  /**
+   * Build a full entry from an UNSAVED payload, for a connection test that must
+   * not touch the store.
+   *
+   * On update, an omitted secret keeps the stored value — the browser never
+   * receives passwords, so "test the form as it stands" has to resolve them
+   * host-side. Without `baseId` there is nothing to inherit from and an omitted
+   * password simply means "no password".
+   *
+   * @param payload - the draft payload from the dialog.
+   * @param baseId - the entry being edited, when this is an update.
+   */
+  draftEntry(payload: DataSourcePayload, baseId?: string): DataSourceEntry {
+    const base = baseId === undefined ? undefined : this.find(baseId)
+    const kind = (payload.kind ?? base?.kind ?? 'sqlite') as DbKind
+    const problem = validatePayload(payload, base)
+    if (problem !== undefined) throw new Error(problem)
+    const now = Date.now()
+    const id = base?.id ?? this.allocateId(payload, this.list())
+    const seeded = base ?? { ...blankEntry(kind, now), id, name: (payload.name ?? id).trim() || id }
+    const entry = applyPayload(seeded, payload, kind, now)
+    if (entry.name.trim() === '') entry.name = entry.id
+    return entry
+  }
+
   /** The persisted settings, with defaults applied. */
   settings(): StoredSettings {
     const raw = this.load().settings

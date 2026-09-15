@@ -112,13 +112,17 @@ export function Modal(props: ModalProps): React.ReactElement {
       { className: 'dbm-modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': title },
       React.createElement('div', { className: 'dbm-modal-head' }, title),
       React.createElement('div', { className: 'dbm-modal-body' }, children as never),
+      // The footer wrapper owns the top border and nothing else: button layout
+      // belongs to the caller, so a dialog that needs its own arrangement
+      // (e.g. a secondary action on the left) is not fighting this row. It was
+      // previously right-aligned here, which nested a second flex row inside it
+      // and quietly broke the split layout.
       footer === undefined ? null : React.createElement('div', { className: 'dbm-modal-foot' }, footer as never),
     ),
   )
 }
 
-/** One tab-stop descriptor. */
-export interface TabItem<T extends string> {
+/** One tab-stop descriptor. */export interface TabItem<T extends string> {
   id: T
   label: string
 }

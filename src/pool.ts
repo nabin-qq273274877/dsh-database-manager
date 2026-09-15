@@ -7,7 +7,7 @@
  * behaviour (a held MySQL/Redis connection is a real resource on the server).
  */
 
-import type { DataSourceEntry, DbKind } from './protocol.ts'
+import type { DataSourceEntry, DbKind, TestResult } from './protocol.ts'
 import { MysqlDriver } from './drivers/mysql.ts'
 import { RedisDriver } from './drivers/redis.ts'
 import { SqliteDriver } from './drivers/sqlite.ts'
@@ -96,6 +96,25 @@ export class ConnectionPool {
     const entry = this.store.find(id)
     if (entry === undefined) throw new Error(`no data source with id "${id}"`)
     return { entry, driver: this.acquire(entry) }
+  }
+
+  /**
+   * Test a connection described by an UNSAVED payload, then dispose it.
+   *
+   * The driver is deliberately never pooled: its id may collide with the
+   * stored entry the user is editing (that is the normal case), and pooling it
+   * would swap the live connection out from under the open panel. The transient
+   * driver is always closed, so a failed test cannot leak a socket.
+   *
+   * @param entry - a full entry built from the draft payload.
+   */
+  async testTransient(entry: DataSourceEntry): Promise<TestResult> {
+    const driver = createDriver(entry)
+    try {
+      return await driver.test()
+    } finally {
+      await driver.close().catch(() => { /* a failed close is not actionable */ })
+    }
   }
 
   /** Arm (or re-arm) the idle release timer for one pooled driver. */

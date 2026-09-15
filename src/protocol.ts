@@ -165,6 +165,12 @@ export interface TestResult {
   latencyMs?: number
   /** Engine version / server greeting when the test succeeded. */
   serverVersion?: string
+  /**
+   * Extra information that is neither a failure nor a version — e.g. that a
+   * SQLite file does not exist yet and will be created on connect. Rendered
+   * beside the outcome so the user is not surprised by a later side effect.
+   */
+  note?: string
   error?: string
 }
 
@@ -267,6 +273,11 @@ export const DB_API_BASE = '/api/dsh-database' as const
 export const DB_API = {
   sources: DB_API_BASE + '/sources',
   test: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/test`,
+  /**
+   * Test an UNSAVED payload. Distinct from `test(id)`: nothing is written to the
+   * store, so the dialog can verify a connection before the user commits.
+   */
+  testConnection: DB_API_BASE + '/test-connection',
   database: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/connect`,
   schemas: (id: string, params?: string) =>
     `${DB_API_BASE}/sources/${encodeURIComponent(id)}/schemas${params === undefined ? '' : '?' + params}`,

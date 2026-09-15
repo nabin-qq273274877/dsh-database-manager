@@ -287,7 +287,6 @@ export const PANEL_CSS = `
   white-space: pre-wrap;
   word-break: break-word;
 }
-.dbm-ok { color: #1a8a4a; font-size: 12px; }
 
 /* ---- data grid --------------------------------------------------------- */
 .dbm-data { flex: 1; min-height: 0; overflow: auto; }
@@ -358,12 +357,55 @@ export const PANEL_CSS = `
   flex: none;
 }
 .dbm-modal-body { padding: 14px 16px; overflow: auto; display: flex; flex-direction: column; gap: 10px; }
+/*
+ * The footer wrapper carries the separator only. Button alignment is the
+ * caller's business: a dialog with its own arrangement (a secondary action on
+ * the left) must not have to fight a right-alignment imposed here. The wrapper
+ * is a flex row so a caller that passes a plain button list still lays out
+ * horizontally.
+ */
 .dbm-modal-foot {
   padding: 12px 16px;
   border-top: 1px solid var(--dsw-alias-border-l3);
   display: flex;
+  align-items: center;
   gap: 8px;
-  justify-content: flex-end;
   flex: none;
 }
+/* A footer that is just a list of actions keeps the classic right alignment. */
+.dbm-modal-foot > .dbm-btn { margin-left: 0; }
+.dbm-modal-foot > :first-child:not(.dbm-modal-foot-split) { margin-left: auto; }
+/*
+ * Split footer: the test action sits on the left, away from the commit pair, so
+ * "check this" is never mistaken for "confirm this".
+ */
+.dbm-modal-foot-split {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.dbm-modal-foot-left { display: flex; align-items: center; gap: 8px; flex: 1 1 auto; }
+.dbm-modal-foot-right { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+
+/*
+ * A labelled field on one line: label / control / optional unit. Used for the
+ * connect timeout, which previously shared a wrapping row with the TLS checkbox
+ * and broke onto a second line at the dialog's real width.
+ */
+.dbm-field-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--dsw-alias-label-secondary);
+}
+.dbm-field-inline > .dbm-input { width: 110px; }
+
+/*
+ * Success messages can carry a note on its own line. The block display keeps
+ * the note off the same baseline as the headline, which is what made a long
+ * success line look like two unrelated fragments.
+ */
+.dbm-ok { color: #1a8a4a; font-size: 12px; display: block; }
 `

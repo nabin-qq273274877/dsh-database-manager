@@ -6,7 +6,7 @@ import * as React from 'react'
  * one instead.
  */
 
-import type { DataSourcePayload, DataSourceSummary, DbKind } from '../protocol.ts'
+import type { DataSourcePayload, DataSourceSummary, DbKind, TestResult } from '../protocol.ts'
 import { DB_KINDS } from '../protocol.ts'
 import { ErrorBanner, Modal, t } from './ui.ts'
 
@@ -16,6 +16,11 @@ export interface SourceFormDialogProps {
   source?: DataSourceSummary
   /** Preselected engine for a create. */
   initialKind?: DbKind
+  /**
+   * Test the form as it stands. Must not persist anything: the user has not
+   * committed yet. Implemented by the host's transient test path.
+   */
+  onTest?(payload: DataSourcePayload, baseId?: string): Promise<TestResult>
   onSubmit(payload: DataSourcePayload): Promise<void>
   onClose(): void
 }
@@ -35,7 +40,6 @@ interface FormState {
   password: string
   clearPassword: boolean
   database: string
-  db: string
   tls: boolean
   connectTimeoutMs: string
   readonly: boolean
@@ -63,7 +67,6 @@ function initialState(source: DataSourceSummary | undefined, initialKind: DbKind
       password: '',
       clearPassword: false,
       database: '',
-      db: initialKind === 'redis' ? '0' : '',
       tls: false,
       connectTimeoutMs: '',
       readonly: false,
@@ -83,7 +86,6 @@ function initialState(source: DataSourceSummary | undefined, initialKind: DbKind
     password: '',
     clearPassword: false,
     database: source.database ?? '',
-    db: source.db === undefined ? '' : String(source.db),
     tls: source.tls === true,
     connectTimeoutMs: source.connectTimeoutMs === undefined ? '' : String(source.connectTimeoutMs),
     readonly: source.readonly,
@@ -119,8 +121,6 @@ function toPayload(state: FormState, isEdit: boolean): DataSourcePayload {
     if (state.kind === 'mysql') {
       payload.user = state.user.trim()
       if (state.database.trim() !== '') payload.database = state.database.trim()
-    } else if (state.db.trim() !== '') {
-      payload.db = Number(state.db)
     }
     // An untouched password field means "keep the stored one"; an explicit
     // clear is an explicit empty string.
@@ -146,14 +146,19 @@ function missingFields(state: FormState): string[] {
 
 /** Create / edit dialog for one data source. */
 export function SourceFormDialog(props: SourceFormDialogProps): React.ReactElement {
-  const { source, initialKind, onSubmit, onClose } = props
+  const { source, initialKind, onTest, onSubmit, onClose } = props
   const isEdit = source !== undefined
   const [state, setState] = React.useState<FormState>(() => initialState(source, initialKind ?? 'sqlite'))
   const [busy, setBusy] = React.useState(false)
+  const [testing, setTesting] = React.useState(false)
   const [error, setError] = React.useState<string | undefined>(undefined)
+  const [testResult, setTestResult] = React.useState<TestResult | undefined>(undefined)
 
   const patch = (next: Partial<FormState>): void => {
     setState(current => ({ ...current, ...next }))
+    // Any edit invalidates a previous test outcome: leaving a stale "连接成功"
+    // beside changed fields is worse than showing nothing.
+    setTestResult(undefined)
   }
 
   const submit = async (): Promise<void> => {
@@ -169,6 +174,29 @@ export function SourceFormDialog(props: SourceFormDialogProps): React.ReactEleme
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure))
       setBusy(false)
+    }
+  }
+
+  /** Test the draft without saving it. */
+  const runTest = async (): Promise<void> => {
+    if (onTest === undefined) return
+    // Validate the same fields Save would refuse, so the two buttons agree on
+    // what "a usable draft" means.
+    const missing = missingFields(state)
+    if (missing.length > 0) {
+      setError(t('form.required', { fields: missing.join('、') }))
+      setTestResult(undefined)
+      return
+    }
+    setTesting(true)
+    setError(undefined)
+    setTestResult(undefined)
+    try {
+      setTestResult(await onTest(toPayload(state, isEdit), isEdit ? source.id : undefined))
+    } catch (failure) {
+      setTestResult({ ok: false, error: failure instanceof Error ? failure.message : String(failure) })
+    } finally {
+      setTesting(false)
     }
   }
 
@@ -197,7 +225,7 @@ export function SourceFormDialog(props: SourceFormDialogProps): React.ReactEleme
           disabled: isEdit,
           onChange: (event: { target: { value: string } }) => {
             const kind = event.target.value as DbKind
-            patch({ kind, port: kind === 'sqlite' ? '' : defaultPort(kind), db: kind === 'redis' ? (state.db === '' ? '0' : state.db) : '' })
+            patch({ kind, port: kind === 'sqlite' ? '' : defaultPort(kind) })
           },
         },
         DB_KINDS.map(kind => React.createElement('option', { key: kind, value: kind }, kind)),
@@ -227,6 +255,10 @@ export function SourceFormDialog(props: SourceFormDialogProps): React.ReactEleme
       field(t('form.file'), input(state.file, value => patch({ file: value }), { placeholder: t('form.file.placeholder'), spellcheck: false }), 'file'),
     )
   } else {
+    // Only fields the engine actually has. Redis needs no "database index"
+    // here: a Redis connection is pinned to one db for its lifetime, and the
+    // panel switches between all 16 while browsing, so asking up front would be
+    // a setting that does not do what it looks like it does.
     const connection: unknown[] = [
       field(t('form.host'), input(state.host, value => patch({ host: value }), { placeholder: '127.0.0.1', spellcheck: false }), 'host'),
       field(t('form.port'), input(state.port, value => patch({ port: value }), { inputMode: 'numeric' }), 'port'),
@@ -236,13 +268,9 @@ export function SourceFormDialog(props: SourceFormDialogProps): React.ReactEleme
         field(t('form.user'), input(state.user, value => patch({ user: value }), { placeholder: 'root' }), 'user'),
         field(t('form.database'), input(state.database, value => patch({ database: value })), 'database'),
       )
-    } else {
-      connection.push(field(t('form.db'), input(state.db, value => patch({ db: value }), { inputMode: 'numeric' }), 'db'))
     }
     children.push(React.createElement('div', { className: 'dbm-grid', key: 'connection' }, connection as never))
 
-    const passwordLabel = state.kind === 'mysql' ? t('form.user') : undefined
-    void passwordLabel
     children.push(
       field(
         t('form.password'),
@@ -272,21 +300,36 @@ export function SourceFormDialog(props: SourceFormDialogProps): React.ReactEleme
         ),
       )
     }
+
+    // TLS and the timeout each get their own line. Side by side they wrapped at
+    // the dialog's real width: the wrapping row put the timeout field on the
+    // next line and left the TLS checkbox visually detached from its own hint.
+    children.push(
+      React.createElement(
+        'label',
+        { className: 'dbm-check', key: 'tls' },
+        React.createElement('input', {
+          type: 'checkbox',
+          checked: state.tls,
+          onChange: (event: { target: { checked: boolean } }) => patch({ tls: event.target.checked }),
+        }),
+        t('form.tls'),
+      ),
+    )
+    children.push(React.createElement('div', { className: 'dbm-hint', key: 'tls-hint' }, t('form.tls.hint')))
     children.push(
       React.createElement(
         'div',
-        { className: 'dbm-row', key: 'tls' },
-        React.createElement(
-          'label',
-          { className: 'dbm-check' },
-          React.createElement('input', {
-            type: 'checkbox',
-            checked: state.tls,
-            onChange: (event: { target: { checked: boolean } }) => patch({ tls: event.target.checked }),
-          }),
-          t('form.tls'),
-        ),
-        field(t('form.timeout'), input(state.connectTimeoutMs, value => patch({ connectTimeoutMs: value }), { inputMode: 'numeric', placeholder: '10000' }), 'timeout'),
+        { className: 'dbm-field-inline', key: 'timeout' },
+        React.createElement('span', null, t('form.timeout')),
+        React.createElement('input', {
+          className: 'dbm-input',
+          value: state.connectTimeoutMs,
+          inputMode: 'numeric',
+          placeholder: '10000',
+          onChange: (event: { target: { value: string } }) => patch({ connectTimeoutMs: event.target.value }),
+        }),
+        React.createElement('span', { className: 'dbm-hint' }, t('form.timeout.unit')),
       ),
     )
   }
@@ -320,13 +363,55 @@ export function SourceFormDialog(props: SourceFormDialogProps): React.ReactEleme
 
   if (error !== undefined) children.push(React.createElement(ErrorBanner, { key: 'error', message: error }))
 
+  // The test outcome lives at the bottom of the body, directly above the button
+  // that produced it, so the result and its cause stay visually adjacent.
+  if (testResult !== undefined) {
+    children.push(
+      testResult.ok
+        ? React.createElement(
+            'div',
+            { className: 'dbm-ok', key: 'test-ok' },
+            t('form.test.ok', { ms: testResult.latencyMs ?? 0, version: testResult.serverVersion ?? '' }).trim(),
+            testResult.note === undefined ? null : React.createElement('div', { className: 'dbm-hint' }, t('form.test.note', { note: testResult.note })),
+          )
+        : React.createElement(ErrorBanner, { key: 'test-fail', message: t('test.fail', { error: testResult.error ?? '' }) }),
+    )
+  }
+
+  const footerBusy = busy || testing
   return React.createElement(Modal, {
     title: isEdit ? t('form.editTitle') : t('form.newTitle'),
-    onClose: () => { if (!busy) onClose() },
-    footer: [
-      React.createElement('button', { key: 'cancel', type: 'button', className: 'dbm-btn', disabled: busy, onClick: onClose }, t('form.cancel')),
-      React.createElement('button', { key: 'save', type: 'button', className: 'dbm-btn dbm-btn-primary', disabled: busy, onClick: () => { void submit() } }, busy ? t('common.loading') : t('form.save')),
-    ],
+    // A close during a test would drop the in-flight request's UI, so the same
+    // guard covers both buttons.
+    onClose: () => { if (!footerBusy) onClose() },
+    footer: React.createElement(
+      'div',
+      { className: 'dbm-modal-foot-split' },
+      // Left: test the draft. Right: commit or discard.
+      React.createElement(
+        'div',
+        { className: 'dbm-modal-foot-left' },
+        onTest === undefined
+          ? null
+          : React.createElement(
+              'button',
+              {
+                key: 'test',
+                type: 'button',
+                className: 'dbm-btn',
+                disabled: footerBusy,
+                onClick: () => { void runTest() },
+              },
+              testing ? t('form.testing') : t('form.test'),
+            ),
+      ),
+      React.createElement(
+        'div',
+        { className: 'dbm-modal-foot-right' },
+        React.createElement('button', { key: 'cancel', type: 'button', className: 'dbm-btn', disabled: footerBusy, onClick: onClose }, t('form.cancel')),
+        React.createElement('button', { key: 'save', type: 'button', className: 'dbm-btn dbm-btn-primary', disabled: footerBusy, onClick: () => { void submit() } }, busy ? t('common.loading') : t('form.save')),
+      ),
+    ),
     children,
   })
 }

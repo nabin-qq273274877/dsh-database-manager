@@ -125,12 +125,22 @@ export class SqliteDriver implements SqlDriver {
 
   async test(): Promise<TestResult> {
     const started = Date.now()
+    // A SQLite "connection" is a file handle, and opening a missing file CREATES
+    // it. Saying so before the first connect is the difference between "my data
+    // is there" and "I just silently created an empty database next to it".
+    const file = this.entry.file ?? ''
+    const existedBefore = file === ':memory:' || file === '' ? true : sqliteFileStatus(file).exists
     try {
       const version = await this.run(db => {
         const row = db.prepare('SELECT sqlite_version() AS v').get() as { v?: unknown } | undefined
         return row?.v === undefined ? undefined : String(row.v)
       })
-      return { ok: true, latencyMs: Date.now() - started, ...(version === undefined ? {} : { serverVersion: `SQLite ${version}` }) }
+      return {
+        ok: true,
+        latencyMs: Date.now() - started,
+        ...(version === undefined ? {} : { serverVersion: `SQLite ${version}` }),
+        ...(existedBefore ? {} : { note: 'the file did not exist and has been created' }),
+      }
     } catch (error) {
       return { ok: false, latencyMs: Date.now() - started, error: error instanceof Error ? error.message : String(error) }
     }

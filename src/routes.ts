@@ -131,6 +131,35 @@ export function makeRoutes(deps: RoutesDeps): { routes: WebRoute[]; upgrade: Web
         return
       }
 
+      // ---- Unsaved connection test: /test-connection -----------------------
+      // The dialog's 测试连接 button. Nothing is written to the store and no
+      // driver is pooled, so a user can check a connection mid-edit without
+      // committing it or disturbing the pool entry behind the open panel.
+      if (path === '/api/dsh-database/test-connection') {
+        if (method !== 'POST') {
+          writeError(res, 405, `${method} is not allowed on ${path}`)
+          return
+        }
+        const body = asJsonObject(await readJsonBody(req))
+        if (body === undefined) {
+          writeError(res, 400, 'body must be a JSON object')
+          return
+        }
+        const baseId = typeof body['baseId'] === 'string' && body['baseId'] !== '' ? body['baseId'] : undefined
+        let entry
+        try {
+          entry = store.draftEntry(body as never, baseId)
+        } catch (error) {
+          // A draft that cannot even be validated is reported as a failed TEST
+          // rather than an HTTP error: the dialog shows it inline, next to the
+          // button the user just pressed.
+          writeJson(res, 200, { result: { ok: false, error: errorMessage(error) } })
+          return
+        }
+        writeJson(res, 200, { result: await pool.testTransient(entry) })
+        return
+      }
+
       // ---- Engine availability: /engines ----------------------------------
       if (path === '/api/dsh-database/engines') {
         if (method !== 'GET') {

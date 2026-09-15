@@ -256,6 +256,86 @@ describe.skipIf(!available)('built host half', () => {
     expect(response.status).toBe(400)
   })
 
+  describe('unsaved connection test (/test-connection)', () => {
+    it('tests a draft against a real engine without storing anything', async () => {
+      const before = (await (await fetch(`${base}/sources`)).json()) as { sources: unknown[] }
+      const response = await fetch(`${base}/test-connection`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ kind: 'sqlite', name: 'draft check', file: join(dir, 'draft.db') }),
+      })
+      expect(response.status).toBe(200)
+      const body = (await response.json()) as { result: { ok: boolean; serverVersion?: string } }
+      expect(body.result.ok).toBe(true)
+      expect(body.result.serverVersion).toMatch(/SQLite/)
+
+      // The whole point: nothing was persisted.
+      const after = (await (await fetch(`${base}/sources`)).json()) as { sources: unknown[] }
+      expect(after.sources).toHaveLength(before.sources.length)
+    })
+
+    it('reports an invalid draft as a failed test, not an HTTP error', async () => {
+      // The dialog shows this inline next to the button; a 400 would surface as
+      // a generic request failure instead of a usable message.
+      const response = await fetch(`${base}/test-connection`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ kind: 'mysql', name: 'no host' }),
+      })
+      expect(response.status).toBe(200)
+      const body = (await response.json()) as { result: { ok: boolean; error?: string } }
+      expect(body.result.ok).toBe(false)
+      expect(body.result.error).toMatch(/host is required/)
+    })
+
+    it('reports an unreachable server as a failed test', async () => {
+      const response = await fetch(`${base}/test-connection`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        // Port 1 on loopback: reliably refused, and nothing listens there.
+        body: JSON.stringify({ kind: 'redis', name: 'dead', host: '127.0.0.1', port: 1, db: 0 }),
+      })
+      expect(response.status).toBe(200)
+      const body = (await response.json()) as { result: { ok: boolean; error?: string } }
+      expect(body.result.ok).toBe(false)
+      expect(typeof body.result.error).toBe('string')
+    })
+
+    it('inherits the stored password when editing and the field is left blank', async () => {
+      // The browser never receives passwords, so an untouched field can only
+      // mean "use the stored one" — resolved host-side from baseId.
+      //
+      // Cleaned up at the end: other cases in this file assert on the exact
+      // source list, and a leftover entry from here broke them.
+      const created = (await (
+        await fetch(`${base}/sources`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ kind: 'redis', name: 'withsecret', id: 'withsecret', host: '127.0.0.1', port: 1, db: 0, password: 'sekret' }),
+        })
+      ).json()) as { source: { hasPassword: boolean } }
+      expect(created.source.hasPassword).toBe(true)
+
+      try {
+        // The draft omits the password entirely, exactly as the dialog does for
+        // an untouched field. It must still be accepted (nothing listens on
+        // port 1, so the TEST fails — what matters is that the request is not
+        // rejected for a missing secret).
+        const withBase = await fetch(`${base}/test-connection`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ kind: 'redis', name: 'withsecret', host: '127.0.0.1', port: 1, db: 0, baseId: 'withsecret' }),
+        })
+        expect(withBase.status).toBe(200)
+        const body = (await withBase.json()) as { result: { ok: boolean; error?: string } }
+        expect(body.result.ok).toBe(false)
+        expect(typeof body.result.error).toBe('string')
+      } finally {
+        await fetch(`${base}/sources/withsecret`, { method: 'DELETE' })
+      }
+    })
+  })
+
   it('creates the SQLite file, tests the connection and browses it end to end', async () => {
     // Connect creates the database file on first use.
     const connect = await fetch(`${base}/sources/app/connect`, { method: 'POST' })

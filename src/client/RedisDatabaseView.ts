@@ -123,12 +123,21 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
         {
           className: 'dbm-select',
           value: String(db),
-          title: t('redis.db'),
+          // Named for what it does: it picks which database the key list is
+          // reading, not a connection-wide setting.
+          title: t('redis.db.switch'),
+          'aria-label': t('redis.db.switch'),
           onChange: (event: { target: { value: string } }) => setDb(Number(event.target.value)),
         },
-        Array.from({ length: 16 }, (_, index) => index).map(index =>
-          React.createElement('option', { key: index, value: String(index) }, `db${index}`),
-        ),
+        // Every logical database is reachable, and the ones holding keys are
+        // marked with their count — Redis itself reports this in INFO keyspace,
+        // so a database that looks empty is either genuinely empty or
+        // configured away (databases 1 in a 1-db server, or a cluster).
+        Array.from({ length: 16 }, (_, index) => index).map(index => {
+          const keysInDb = info.databases.find(entry => entry.db === index)?.keys
+          const suffix = keysInDb === undefined ? '' : ` · ${keysInDb} keys`
+          return React.createElement('option', { key: index, value: String(index) }, `db${index}${suffix}`)
+        }),
       ),
     ),
     React.createElement(
