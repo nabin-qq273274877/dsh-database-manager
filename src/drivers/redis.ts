@@ -66,6 +66,16 @@ export async function redisAvailable(): Promise<boolean> {
 /** Cap on elements read from one collection, so a huge key cannot freeze the GUI. */
 const MAX_ELEMENTS = 1000
 
+/** Fallback connection/command deadline when the entry sets none. */
+const DEFAULT_TIMEOUT_MS = 10000
+
+/**
+ * How many reconnection attempts ioredis may make before a pending command is
+ * failed. Kept small: this is a user-facing tool, so "it did not work" beats
+ * "it is still trying".
+ */
+const MAX_RECONNECT_ATTEMPTS = 3
+
 /** Redis driver bound to one stored entry. */
 export class RedisDriver implements RedisDriverContract {
   readonly kind = 'redis' as const
@@ -85,13 +95,19 @@ export class RedisDriver implements RedisDriverContract {
     const host = this.entry.host
     if (host === undefined || host === '') throw new Error('redis data source has no host configured')
     const { default: Redis } = await loadRedis()
+    const timeout = this.entry.connectTimeoutMs ?? DEFAULT_TIMEOUT_MS
     const client = new Redis(this.entry.port ?? 6379, host, {
       password: this.entry.password === '' ? undefined : this.entry.password,
       db: index,
-      connectTimeout: this.entry.connectTimeoutMs ?? 10000,
+      connectTimeout: timeout,
       // Fail a command rather than queueing it forever when the server is down;
       // a UI action must always settle.
       maxRetriesPerRequest: 2,
+      // Bounded reconnection. Without this, ioredis retries forever: a WRONG
+      // connection setting (measured: tls:true against a plaintext server)
+      // never rejects and the caller waits indefinitely. `null` after the
+      // budget stops reconnecting so the pending command fails with a reason.
+      retryStrategy: (attempt: number) => (attempt > MAX_RECONNECT_ATTEMPTS ? null : Math.min(attempt * 200, 1000)),
       enableOfflineQueue: true,
       lazyConnect: false,
       ...(this.entry.tls === true ? { tls: { rejectUnauthorized: false } } : {}),
@@ -103,11 +119,33 @@ export class RedisDriver implements RedisDriverContract {
     return client
   }
 
+  /**
+   * Run one command under a hard deadline.
+   *
+   * `maxRetriesPerRequest` and `retryStrategy` bound what ioredis will do, but a
+   * server that accepts the TCP connection and then never completes the
+   * handshake (the plaintext-server-vs-TLS-client case) produces no error to
+   * count — the promise simply never settles. Racing a timer is the only way to
+   * guarantee the UI gets an answer, and it is cheaper than hanging forever.
+   */
+  private withDeadline<T>(work: Promise<T>, timeoutMs: number, what: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`${what} timed out after ${timeoutMs} ms — the server did not complete the handshake. Check the host, port and whether this server expects an encrypted (TLS) connection.`))
+      }, timeoutMs)
+      work.then(
+        (value) => { clearTimeout(timer); resolve(value) },
+        (error) => { clearTimeout(timer); reject(error) },
+      )
+    })
+  }
+
   async test(): Promise<TestResult> {
     const started = Date.now()
+    const timeout = this.entry.connectTimeoutMs ?? DEFAULT_TIMEOUT_MS
     try {
       const client = await this.client()
-      const pong = await client.ping()
+      const pong = await this.withDeadline(client.ping(), timeout, 'connecting to Redis')
       const info = await client.info('server').catch(() => '')
       const version = /redis_version:([^\r\n]+)/.exec(info)?.[1]?.trim()
       return {
@@ -132,6 +170,11 @@ export class RedisDriver implements RedisDriverContract {
   }
 
   async info(): Promise<RedisInfo> {
+    return this.withDeadline(this.infoUnbounded(), this.deadlineMs(), 'reading Redis server info')
+  }
+
+  /** The actual info read; callers go through {@link info} for the deadline. */
+  private async infoUnbounded(): Promise<RedisInfo> {
     const client = await this.client()
     const [server, memory, clients, keyspace] = await Promise.all([
       client.info('server').catch(() => ''),
@@ -165,6 +208,11 @@ export class RedisDriver implements RedisDriverContract {
   }
 
   async keys(input: { pattern: string; cursor: string; count: number; db: number }): Promise<RedisKeyPage> {
+    return this.withDeadline(this.keysUnbounded(input), this.deadlineMs(), 'scanning Redis keys')
+  }
+
+  /** The actual scan; callers go through {@link keys} for the deadline. */
+  private async keysUnbounded(input: { pattern: string; cursor: string; count: number; db: number }): Promise<RedisKeyPage> {
     const client = await this.client(input.db)
     const pattern = input.pattern === '' ? '*' : input.pattern
     const count = Math.max(10, Math.min(input.count, 2000))
@@ -182,6 +230,11 @@ export class RedisDriver implements RedisDriverContract {
   }
 
   async value(key: string, db: number, limit: number): Promise<RedisValue> {
+    return this.withDeadline(this.valueUnbounded(key, db, limit), this.deadlineMs(), `reading key "${key}"`)
+  }
+
+  /** The actual read; callers go through {@link value} for the deadline. */
+  private async valueUnbounded(key: string, db: number, limit: number): Promise<RedisValue> {
     const client = await this.client(db)
     const type = await client.type(key)
     const ttl = await client.ttl(key)
@@ -247,11 +300,21 @@ export class RedisDriver implements RedisDriverContract {
 
   async command(args: string[], db: number): Promise<QueryResult> {
     if (args.length === 0) throw new Error('a Redis command is required')
+    return this.withDeadline(this.commandUnbounded(args, db), this.deadlineMs(), `running "${args[0]}"`)
+  }
+
+  /** The actual command; callers go through {@link command} for the deadline. */
+  private async commandUnbounded(args: string[], db: number): Promise<QueryResult> {
     const client = await this.client(db)
     const started = Date.now()
     const [name, ...rest] = args
     const result = await client.call(name!, ...rest)
     return shapeRedisReply(result, Date.now() - started)
+  }
+
+  /** The per-operation deadline for this data source. */
+  private deadlineMs(): number {
+    return this.entry.connectTimeoutMs ?? DEFAULT_TIMEOUT_MS
   }
 }
 
@@ -277,15 +340,37 @@ function readInfoField(info: string, field: string): string | undefined {
   return match?.[1]?.trim()
 }
 
-/** Human-readable ioredis error, keeping the server's own message. */
+/**
+ * Human-readable ioredis error.
+ *
+ * ioredis surfaces its own internal vocabulary, which a user cannot act on:
+ * "Reached the max retries per request limit (which is 2). Refer to
+ * maxRetriesPerRequest option for details." says nothing about what to change.
+ * The common causes are recognised and restated; anything unrecognised keeps
+ * the original text so no information is lost.
+ */
 function describeRedisError(error: unknown): string {
-  if (typeof error === 'object' && error !== null) {
-    const record = error as { code?: unknown; message?: unknown }
-    const message = typeof record.message === 'string' ? record.message : undefined
-    const code = typeof record.code === 'string' ? record.code : undefined
-    if (message !== undefined) return code === undefined ? message : `${message} (${code})`
+  const record = (typeof error === 'object' && error !== null ? error : {}) as { code?: unknown; message?: unknown }
+  const message = typeof record.message === 'string' ? record.message : undefined
+  const code = typeof record.code === 'string' ? record.code : undefined
+  const base = message ?? (error instanceof Error ? error.message : String(error))
+
+  if (base.includes('max retries per request')) {
+    return 'could not reach the server, or it did not accept the connection settings (host, port, password, TLS). ' + (code === undefined ? '' : `[${code}]`).trim()
   }
-  return error instanceof Error ? error.message : String(error)
+  if (base.includes('WRONGPASS') || base.includes('NOAUTH') || base.includes('invalid password')) {
+    return `the server rejected the password${code === undefined ? '' : ` (${code})`}`
+  }
+  if (base.includes('ECONNREFUSED')) {
+    return `nothing is listening on that host and port (${code ?? 'ECONNREFUSED'}) — check the address and that the server is running`
+  }
+  if (base.includes('ENOTFOUND') || base.includes('EAI_AGAIN')) {
+    return `the host name could not be resolved (${code ?? 'ENOTFOUND'})`
+  }
+  if (base.includes('ETIMEDOUT')) {
+    return 'the connection timed out — a firewall or an encryption mismatch can both cause this'
+  }
+  return code === undefined ? base : `${base} (${code})`
 }
 
 /**
