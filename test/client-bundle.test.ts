@@ -27,11 +27,19 @@ interface Registration {
   component: unknown
 }
 
+/** One `<style>` the plugin appended to document.head. */
+interface InjectedStyle {
+  tag: string
+  css: string
+  dataset: Record<string, string>
+}
+
 /** The result of loading the bundle into a simulated shell. */
 interface Loaded {
   registered: Registration[]
   effects: string[]
-  css: string[]
+  /** Stylesheets the plugin injected, in append order. */
+  styles: InjectedStyle[]
   dictionaries: Array<{ ns: string; dicts: Record<string, unknown> }>
   /** The plugin's apply(), already invoked. */
   applied: boolean
@@ -50,18 +58,18 @@ function load(overrides: {
   const missing = new Set(overrides.missing ?? [])
   const registered: Registration[] = []
   const effects: string[] = []
-  const css: string[] = []
+  const styles: InjectedStyle[] = []
   const dictionaries: Loaded['dictionaries'] = []
-  const result: Loaded = { registered, effects, css, dictionaries, applied: false }
+  const result: Loaded = { registered, effects, styles, dictionaries, applied: false }
 
   /** The registry the plugin's apply() is handed as `ctx`. */
   const makeContext = (): Record<string, unknown> => {
     const context: Record<string, unknown> = {
       get: (name: string) => {
-        if (missing.has(name)) return undefined
-        if (name === 'styles') {
-          return { insert: (text: string) => { css.push(text); return () => {} } }
-        }
+        // Note: no `styles` seat. An installed plugin has no such service (the
+        // client catalog exposes only layout/locale/sessions/slots/theme/timer/
+        // uiWorkspace/workspaces), so the plugin must inject its CSS itself.
+        void name
         return undefined
       },
       effect: (effect: () => unknown, label?: string) => {
@@ -141,8 +149,29 @@ function load(overrides: {
     'console',
     `${BUNDLE}\nreturn { loaded: window.__ModuleLoader__ };`,
   )
-  const documentStub = { documentElement: { lang: 'zh' } }
+  // A document stub with just enough DOM for the stylesheet injection: the
+  // plugin creates a <style>, sets its dataset, and appends it to head.
+  const appended: InjectedStyle[] = []
+  const documentStub = {
+    documentElement: { lang: 'zh' },
+    querySelector: () => null,
+    createElement: (tag: string) => {
+      const element = {
+        tagName: tag.toUpperCase(),
+        dataset: {} as Record<string, string>,
+        textContent: '',
+        remove: () => {},
+      }
+      return element
+    },
+    head: {
+      appendChild: (element: { tagName: string; textContent: string; dataset: Record<string, string> }) => {
+        appended.push({ tag: element.tagName, css: element.textContent, dataset: element.dataset })
+      },
+    },
+  }
   const captured = run(windowStub, documentStub, reactStub, console) as { loaded: unknown }
+  void captured
 
   const registration = loaded[0]
   if (registration === undefined) throw new Error('bundle did not register a module')
@@ -160,6 +189,9 @@ function load(overrides: {
   } catch (error) {
     result.error = error
   }
+  // The style append happens inside an effect, which this harness runs
+  // synchronously during apply() — so collect it only after apply() returned.
+  styles.push(...appended)
   // Render each registered component once so a render-time crash is visible.
   if (overrides.render !== false) {
     for (const entry of registered) {
@@ -225,12 +257,29 @@ describe('built client half', () => {
     expect(panel!.component).toBeTypeOf('function')
   })
 
-  it('installs its stylesheet', () => {
+  it('injects its stylesheet into document.head, since an installed plugin has no styles seat', () => {
     const loaded = load()
-    expect(loaded.css).toHaveLength(1)
-    expect(loaded.css[0]).toMatch(/\.dbm-root/)
+    expect(loaded.styles).toHaveLength(1)
+    const style = loaded.styles[0]!
+    expect(style.tag).toBe('STYLE')
+    // The harness convention: an identifiable tag, so HMR and a duplicate mount
+    // can both find it.
+    expect(style.dataset['pluginCss']).toBe('dsh-database-manager')
+    expect(style.css).toMatch(/\.dbm-root/)
     // Colours come from theme tokens, never from a hard-coded palette.
-    expect(loaded.css[0]).toMatch(/var\(--dsw-alias-/)
+    expect(style.css).toMatch(/var\(--dsw-alias-/)
+  })
+
+  it('carries the sidebar-entry alignment rule measured against the SSH row', () => {
+    const loaded = load()
+    const css = loaded.styles[0]!.css
+    // The 24px box plus 2px per side is what makes the glyph and label land on
+    // the same x as the SSH entry, whose row uses wider padding than the shell's
+    // panel row.
+    const rule = /\.dbm-entry-glyph \{[^}]*\}/.exec(css)?.[0] ?? ''
+    expect(rule).toMatch(/width: 24px/)
+    expect(rule).toMatch(/height: 24px/)
+    expect(rule).toMatch(/margin: 0 2px/)
   })
 
   it('registers both locale dictionaries with matching key sets', () => {
@@ -249,13 +298,29 @@ describe('built client half', () => {
     expect(dicts.en['entry.label']).toBe('Database')
   })
 
-  it('survives a shell that does not provide the optional styles service', () => {
-    const loaded = load({ missing: ['styles'] })
+  it('registers the panel and the row even when no optional service is present', () => {
+    // The registry provides only slots and locale; nothing else may be required,
+    // or a shell change could take the whole GUI down with this plugin.
+    const loaded = load({ missing: ['styles', 'theme', 'timer', 'layout'] })
     expect(loaded.error).toBeUndefined()
     expect(loaded.applied).toBe(true)
-    // The panel and row still register; only the stylesheet is skipped.
     expect(loaded.registered.map(item => item.slot)).toEqual(
       expect.arrayContaining(['sidebar.panellist', 'main']),
     )
+    // The stylesheet is the one thing that does not depend on any service.
+    expect(loaded.styles).toHaveLength(1)
+  })
+
+  it('renders the entry glyph as a 24px box holding the 18px svg', () => {
+    const loaded = load({ render: false })
+    const entry = loaded.registered.find(item => item.slot === 'sidebar.panellist')!
+    const element = (entry.component as (props: unknown) => { props: Record<string, unknown> })({ size: 16, active: false })
+    // The glyph carries its own class rather than an inline size, so the
+    // measured geometry lives in one place (styles.ts) and user CSS can
+    // override it.
+    expect(element.props['className']).toBe('dbm-entry-glyph')
+    const html = element.props['dangerouslySetInnerHTML'] as { __html: string }
+    expect(html.__html).toContain('width="18"')
+    expect(html.__html).toContain('height="18"')
   })
 })

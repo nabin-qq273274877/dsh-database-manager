@@ -14,6 +14,27 @@ export const PANEL_CSS = `
   font-size: 13px;
 }
 
+/* ---- sidebar entry glyph ------------------------------------------------ */
+/*
+ * The shell lays this row out with padding 7px 8px and gap 8px, while the SSH
+ * plugin's own injected row uses padding 0 10px and gap 10px around a 24px icon
+ * box. Measured in a real browser, the shell's row started its glyph 5px left of
+ * SSH's and 8px left of its label. This box adopts SSH's 24px geometry and adds
+ * the 2px per side the shell's smaller padding lacks, so the glyph and the label
+ * both land on the same x as the SSH entry.
+ */
+.dbm-entry-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 24px;
+  height: 24px;
+  margin: 0 2px;
+  flex: none;
+}
+.dbm-entry-glyph > svg { display: block; }
+
 /* ---- header ------------------------------------------------------------ */
 .dbm-header {
   display: flex;

@@ -35,13 +35,18 @@ export const PANEL_ID = 'database-manager'
 const ENTRY_ID = 'database-manager'
 
 /** Sidebar glyph: a stacked-database mark sized to the shell's nav icons. */
+/** Sidebar glyph drawn at the size the SSH entry uses (18px inside a 24px box). */
 const ICON =
-  '<svg viewBox="0 0 16 16" width="100%" height="100%" fill="none" stroke="currentColor" stroke-width="1.4" ' +
+  '<svg viewBox="0 0 16 16" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.4" ' +
   'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
   '<ellipse cx="8" cy="3.6" rx="5.1" ry="2.1"/>' +
   '<path d="M2.9 3.6v8.8c0 1.16 2.28 2.1 5.1 2.1s5.1-.94 5.1-2.1V3.6"/>' +
   '<path d="M2.9 8c0 1.16 2.28 2.1 5.1 2.1s5.1-.94 5.1-2.1"/>' +
   '</svg>'
+
+// The glyph's box geometry (24px, SSH's sizing, plus the 2px per side the
+// shell's narrower row padding lacks) lives in the `.dbm-entry-glyph` rule of
+// styles.ts, where the measured reasoning is recorded.
 
 /**
  * Required services: the slot registry and the dictionary registry. `layout` is
@@ -73,10 +78,11 @@ export function apply(ctx: unknown): void {
   const controller = new PanelController()
 
   // ---- styles ------------------------------------------------------------
-  const styles = context.get('styles') as { insert(css: string): () => void } | undefined
-  if (styles !== undefined) {
-    context.effect(() => styles.insert(PANEL_CSS), 'dsh-database-manager: styles')
-  }
+  // Injected straight into document.head. The dynamic-plugin `styles` builtin
+  // is NOT available to an installed plugin (the client service catalog has no
+  // such seat), so relying on it silently produced an unstyled panel. This is
+  // the same approach every shipped UI plugin uses for its own CSS module.
+  context.effect(() => installStyles(PANEL_CSS, 'dsh-database-manager'), 'dsh-database-manager: styles')
 
   // ---- dictionaries ------------------------------------------------------
   context.effect(() => {
@@ -116,7 +122,9 @@ export function apply(ctx: unknown): void {
           },
           (props: { size: number; active: boolean }) =>
             React.createElement('span', {
-              style: { display: 'inline-flex', width: props.size, height: props.size },
+              className: 'dbm-entry-glyph',
+              'data-dsh-dbm-entry': ENTRY_ID,
+              'data-size': String(props.size),
               dangerouslySetInnerHTML: { __html: ICON },
             }),
         ),
@@ -156,6 +164,25 @@ function labelOf(ctx: { locale: { bind(ns: string): (key: string) => string } },
   } catch {
     return fallback
   }
+}
+
+/**
+ * Insert one stylesheet into the document head and return its remover.
+ *
+ * `data-plugin-css` is the harness convention (see ui-layout): it makes the tag
+ * identifiable for HMR and for a duplicate-mount guard, and it keeps the tag
+ * from being mistaken for shell chrome.
+ */
+function installStyles(css: string, pluginId: string): () => void {
+  if (typeof document === 'undefined') return () => {}
+  const existing = document.querySelector(`style[data-plugin-css=${JSON.stringify(pluginId)}]`)
+  if (existing !== null) return () => { /* already installed by an earlier mount */ }
+  const tag = document.createElement('style')
+  tag.dataset['plugin'] = pluginId
+  tag.dataset['pluginCss'] = pluginId
+  tag.textContent = css
+  document.head.appendChild(tag)
+  return () => { tag.remove() }
 }
 
 /**
