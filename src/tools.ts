@@ -209,7 +209,7 @@ export function makeTools(
       'Triggers: table structure, describe table, schema, columns, indexes, list tables, 表结构.',
     parameters: {
       source: { type: 'string', required: true, description: 'Data source id or name from db_list.' },
-      schema: { type: 'string', description: 'SQL: the database/schema to inspect (defaults to the configured one).' },
+      schema: { type: 'string', description: 'SQL: which database/schema to inspect. Required together with "table" on MySQL, where omitting it lists the databases.' },
       table: { type: 'string', description: 'SQL: return this table\'s columns and indexes instead of the whole tree.' },
     },
     output: {
@@ -308,9 +308,19 @@ export function makeTools(
       if (!isSqlDriver(driver)) throw new Error('unsupported data source kind')
 
       const schemas = (await driver.schemas()).map(item => item.name)
-      const schema = args.schema ?? summary.database ?? (summary.kind === 'sqlite' ? 'main' : schemas[0])
+      // No stored default schema exists for MySQL any more (the browser lists
+      // every database). For SQLite the single schema is 'main'; for MySQL an
+      // unspecified schema means "describe the whole server", so only the
+      // database-level listing is returned rather than silently guessing one
+      // database and reporting its tables as if they were the answer.
+      const schema = args.schema ?? (summary.kind === 'sqlite' ? 'main' : undefined)
 
       if (args.table !== undefined && args.table !== '') {
+        if (schema === undefined) {
+          throw new Error(
+            `"table" needs a "schema" for a MySQL data source. Available: ${schemas.join(', ') || '(none)'}`,
+          )
+        }
         const tableName = args.table
         const [columns, indexes] = await Promise.all([
           driver.columns(schema, tableName),
@@ -322,11 +332,25 @@ export function makeTools(
           tables: [],
           columns,
           indexes: indexes.map(index => ({ name: index.name, unique: index.unique, columns: index.columns })),
-          tablesRendered: `table: ${tableName}`,
+          tablesRendered: `table: ${schema}.${tableName}`,
           columnsRendered: renderColumns(columns),
           indexesRendered: indexes.length === 0
             ? 'no indexes'
             : indexes.map(index => `${index.name}${index.unique ? ' (unique)' : ''}: ${index.columns.join(', ')}`).join('\n'),
+        }
+      }
+
+      // No schema named: for MySQL the useful answer is the database list
+      // itself, since each one would need its own round trip to enumerate.
+      if (schema === undefined) {
+        return {
+          kind: summary.kind,
+          schemas,
+          tables: [],
+          tablesRendered:
+            schemas.length === 0
+              ? 'no databases visible to this user'
+              : `databases (pass "schema" to list one's tables):\n${schemas.join('\n')}`,
         }
       }
 
@@ -340,7 +364,7 @@ export function makeTools(
           ...(table.rows === undefined ? {} : { rows: table.rows }),
           ...(table.comment === undefined ? {} : { comment: table.comment }),
         })),
-        tablesRendered: `schema ${schema ?? '(default)'}:\n${renderTables(tables)}`,
+        tablesRendered: `schema ${schema}:\n${renderTables(tables)}`,
       }
     },
   })

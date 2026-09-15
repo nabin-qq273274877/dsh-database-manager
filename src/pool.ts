@@ -34,7 +34,6 @@ function fingerprintOf(entry: DataSourceEntry): string {
     entry.port ?? 0,
     entry.user ?? '',
     entry.password ?? '',
-    entry.database ?? '',
     entry.db ?? 0,
     entry.tls === true,
     entry.connectTimeoutMs ?? 0,

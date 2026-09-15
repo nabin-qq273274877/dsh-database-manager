@@ -39,7 +39,6 @@ interface FormState {
   user: string
   password: string
   clearPassword: boolean
-  database: string
   tls: boolean
   connectTimeoutMs: string
   readonly: boolean
@@ -66,7 +65,6 @@ function initialState(source: DataSourceSummary | undefined, initialKind: DbKind
       user: '',
       password: '',
       clearPassword: false,
-      database: '',
       tls: false,
       connectTimeoutMs: '',
       readonly: false,
@@ -85,7 +83,6 @@ function initialState(source: DataSourceSummary | undefined, initialKind: DbKind
     user: source.user ?? '',
     password: '',
     clearPassword: false,
-    database: source.database ?? '',
     tls: source.tls === true,
     connectTimeoutMs: source.connectTimeoutMs === undefined ? '' : String(source.connectTimeoutMs),
     readonly: source.readonly,
@@ -120,7 +117,6 @@ function toPayload(state: FormState, isEdit: boolean): DataSourcePayload {
     if (state.port.trim() !== '') payload.port = Number(state.port)
     if (state.kind === 'mysql') {
       payload.user = state.user.trim()
-      if (state.database.trim() !== '') payload.database = state.database.trim()
     }
     // An untouched password field means "keep the stored one"; an explicit
     // clear is an explicit empty string.
@@ -255,10 +251,12 @@ export function SourceFormDialog(props: SourceFormDialogProps): React.ReactEleme
       field(t('form.file'), input(state.file, value => patch({ file: value }), { placeholder: t('form.file.placeholder'), spellcheck: false }), 'file'),
     )
   } else {
-    // Only fields the engine actually has. Redis needs no "database index"
-    // here: a Redis connection is pinned to one db for its lifetime, and the
-    // panel switches between all 16 while browsing, so asking up front would be
-    // a setting that does not do what it looks like it does.
+    // Only fields the engine actually has, and no "default database":
+    //  - Redis is pinned to one db per connection, and the panel switches
+    //    between all 16 while browsing, so a stored index would look like a
+    //    global setting while only affecting where the browser opens.
+    //  - MySQL connects with no schema at all, which is what lets the browser
+    //    list every database; picking one is done per operation in the panel.
     const connection: unknown[] = [
       field(t('form.host'), input(state.host, value => patch({ host: value }), { placeholder: '127.0.0.1', spellcheck: false }), 'host'),
       field(t('form.port'), input(state.port, value => patch({ port: value }), { inputMode: 'numeric' }), 'port'),
@@ -266,10 +264,12 @@ export function SourceFormDialog(props: SourceFormDialogProps): React.ReactEleme
     if (state.kind === 'mysql') {
       connection.push(
         field(t('form.user'), input(state.user, value => patch({ user: value }), { placeholder: 'root' }), 'user'),
-        field(t('form.database'), input(state.database, value => patch({ database: value })), 'database'),
       )
     }
     children.push(React.createElement('div', { className: 'dbm-grid', key: 'connection' }, connection as never))
+    if (state.kind === 'mysql') {
+      children.push(React.createElement('div', { className: 'dbm-hint', key: 'schemaless-hint' }, t('form.mysql.noDefaultSchema')))
+    }
 
     children.push(
       field(

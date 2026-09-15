@@ -37,10 +37,24 @@ interface RowsState {
 export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement {
   const { api, source, initialSchemas, onBack, onClose } = props
   const [schemas, setSchemas] = React.useState<string[]>(initialSchemas)
-  const [activeSchema, setActiveSchema] = React.useState<string | undefined>(initialSchemas[0])
-  const [tables, setTables] = React.useState<TableInfo[]>([])
   const [tableFilter, setTableFilter] = React.useState('')
-  const [expanded, setExpanded] = React.useState<Record<string, boolean>>({})
+  /**
+   * Which databases are expanded. Independent per database, like phpMyAdmin:
+   * opening one must not close another, and a database's tables are loaded the
+   * first time it is opened (lazily, so a server with many databases does not
+   * pay for all of them up front).
+   */
+  const [openSchemas, setOpenSchemas] = React.useState<Record<string, boolean>>({})
+  /** Tables per database, keyed by schema name; absent = not loaded yet. */
+  const [tablesBySchema, setTablesBySchema] = React.useState<Record<string, TableInfo[]>>({})
+  /** Databases whose table load is in flight. */
+  const [loadingSchemas, setLoadingSchemas] = React.useState<Record<string, boolean>>({})
+  /**
+   * The database the right-hand side operates on, and the open table. A table
+   * is identified by database + name, since the same name can exist in two
+   * databases.
+   */
+  const [activeSchema, setActiveSchema] = React.useState<string | undefined>(undefined)
   const [activeTable, setActiveTable] = React.useState<string | undefined>(undefined)
   const [tab, setTab] = React.useState<SqlTab>('browse')
   const [error, setError] = React.useState<string | undefined>(undefined)
@@ -62,28 +76,70 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
       const list = await api.schemas(source.id)
       const names = list.map(item => item.name)
       setSchemas(names)
-      setActiveSchema(current => (current !== undefined && names.includes(current) ? current : names[0]))
+      // A database that vanished (dropped elsewhere) keeps no stale entry.
+      setTablesBySchema(current => {
+        const next: Record<string, TableInfo[]> = {}
+        for (const [name, tables] of Object.entries(current)) if (names.includes(name)) next[name] = tables
+        return next
+      })
+      setActiveSchema(current => (current !== undefined && names.includes(current) ? current : undefined))
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure))
     }
   }, [api, source.id, source.kind])
 
-  /** Refresh the table list for one schema. */
-  const loadTables = React.useCallback(async (schema: string | undefined): Promise<void> => {
+  /**
+   * Load one database's tables, reusing the cached list unless `force`.
+   *
+   * @param schema - the database to load.
+   * @param force - reload even when a list is already cached (the refresh
+   *   button, and after a write that could change the table set).
+   */
+  const loadTables = React.useCallback(async (schema: string | undefined, force = false): Promise<void> => {
+    if (schema === undefined) return
+    if (!force && tablesBySchema[schema] !== undefined) return
+    setLoadingSchemas(current => ({ ...current, [schema]: true }))
     try {
       const list = await api.tables(source.id, schema)
-      setTables(list)
-      setActiveTable(current => (current !== undefined && list.some(item => item.name === current) ? current : undefined))
+      setTablesBySchema(current => ({ ...current, [schema]: list }))
+      setError(undefined)
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure))
+      // Cache an empty list so a failing database does not retry on every
+      // render; the refresh button clears it.
+      setTablesBySchema(current => ({ ...current, [schema]: [] }))
+    } finally {
+      setLoadingSchemas(current => ({ ...current, [schema]: false }))
     }
-  }, [api, source.id])
+  }, [api, source.id, tablesBySchema])
 
   React.useEffect(() => { void loadSchemas() }, [loadSchemas])
-  React.useEffect(() => { void loadTables(activeSchema) }, [loadTables, activeSchema])
+  // Single-schema engines (SQLite) have nothing to expand: open and load their
+  // only schema immediately so the tree is populated without a click.
+  React.useEffect(() => {
+    if (schemas.length !== 1) return
+    const only = schemas[0]!
+    setOpenSchemas(current => (current[only] === undefined ? { ...current, [only]: true } : current))
+    void loadTables(only)
+  }, [schemas, loadTables])
 
-  /** Load one page of the active table. */
+  /** Expand or collapse one database, loading its tables on first open. */
+  const toggleSchema = (schema: string): void => {
+    const next = !(openSchemas[schema] ?? false)
+    setOpenSchemas(current => ({ ...current, [schema]: next }))
+    if (next) void loadTables(schema)
+  }
+
+  /**
+   * Load one page of one table.
+   *
+   * The schema is a required field of `options`, not read from state: the caller
+   * may be loading a table in a database other than the active one (opening a
+   * table from the tree sets both together), and a stale `activeSchema` here
+   * would silently read the wrong database.
+   */
   const loadRows = React.useCallback(async (options: {
+    schema: string
     table: string
     page: number
     pageSize: number
@@ -96,7 +152,7 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     setRows(current => ({ page: current?.page ?? emptyPage(), loading: true, ...(current?.error === undefined ? {} : { error: current.error }) }))
     try {
       const result = await api.rows(source.id, {
-        ...(activeSchema === undefined ? {} : { schema: activeSchema }),
+        schema: options.schema,
         table: options.table,
         page: options.page,
         pageSize: options.pageSize,
@@ -111,14 +167,14 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     } catch (failure) {
       setRows(current => ({ page: current?.page ?? emptyPage(), loading: false, error: failure instanceof Error ? failure.message : String(failure) }))
     }
-  }, [api, source.id, activeSchema])
+  }, [api, source.id])
 
-  /** Load structure metadata for the active table. */
-  const loadStructure = React.useCallback(async (table: string): Promise<void> => {
+  /** Load structure metadata for one table. */
+  const loadStructure = React.useCallback(async (schema: string, table: string): Promise<void> => {
     try {
       const [cols, idx] = await Promise.all([
-        api.columns(source.id, table, activeSchema),
-        api.indexes(source.id, table, activeSchema).catch(() => [] as IndexInfo[]),
+        api.columns(source.id, table, schema),
+        api.indexes(source.id, table, schema).catch(() => [] as IndexInfo[]),
       ])
       setColumns(cols)
       setIndexes(idx)
@@ -127,16 +183,23 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     }
   }, [api, source.id, activeSchema])
 
-  /** Open one table in the given tab. */
-  const openTable = (table: string, nextTab: SqlTab = 'browse'): void => {
+  /**
+   * Open one table in the given tab.
+   *
+   * The database is passed explicitly rather than read from state: the tree can
+   * open a table in a database that is not the currently active one, and relying
+   * on `activeSchema` here would query the wrong database (or none at all).
+   */
+  const openTable = (schema: string, table: string, nextTab: SqlTab = 'browse'): void => {
+    setActiveSchema(schema)
     setActiveTable(table)
     setTab(nextTab)
     setOrderBy(undefined)
     setPage(1)
     setError(undefined)
     setNotice(undefined)
-    if (nextTab === 'structure') void loadStructure(table)
-    if (nextTab === 'browse') void loadRows({ table, page: 1, pageSize, mode: 'browse' })
+    if (nextTab === 'structure') void loadStructure(schema, table)
+    if (nextTab === 'browse') void loadRows({ schema, table, page: 1, pageSize, mode: 'browse' })
   }
 
   /** Switch tabs, loading whatever the target tab needs. */
@@ -144,42 +207,59 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     setTab(next)
     setError(undefined)
     setNotice(undefined)
-    if (activeTable === undefined) return
-    if (next === 'structure') void loadStructure(activeTable)
-    if (next === 'browse') void loadRows({ table: activeTable, page: 1, pageSize, mode: 'browse' })
-    if (next === 'insert') void loadStructure(activeTable)
+    if (activeTable === undefined || activeSchema === undefined) return
+    if (next === 'structure') void loadStructure(activeSchema, activeTable)
+    if (next === 'browse') void loadRows({ schema: activeSchema, table: activeTable, page: 1, pageSize, mode: 'browse' })
+    if (next === 'insert') void loadStructure(activeSchema, activeTable)
   }
 
-  const filteredTables = tables.filter(table => tableFilter === '' || table.name.toLowerCase().includes(tableFilter.toLowerCase()))
+  /** Whether a table name matches the filter (empty filter matches all). */
+  const matchesFilter = (name: string): boolean =>
+    tableFilter === '' || name.toLowerCase().includes(tableFilter.toLowerCase())
 
   // ---- left tree ---------------------------------------------------------
+  // phpMyAdmin shape: every database is a node that expands independently, and
+  // the filter searches table names inside whichever databases are open. The
+  // previous version showed tables for the ACTIVE database only, so on MySQL the
+  // tree looked like a single-database browser.
   const tree: unknown[] = []
-  for (const schema of schemas.length === 0 ? [undefined] : schemas) {
-    const label = schema ?? (source.kind === 'sqlite' ? 'main' : t('common.none'))
-    const isOpen = expanded[label] ?? schemas.length <= 1
-    if (schemas.length > 1 || source.kind !== 'sqlite') {
+  for (const schema of schemas) {
+    const isOpen = openSchemas[schema] ?? false
+    const tables = tablesBySchema[schema]
+    const loading = loadingSchemas[schema] === true
+    tree.push(
+      React.createElement(
+        'button',
+        {
+          key: `schema-${schema}`,
+          type: 'button',
+          className: 'dbm-tree-item',
+          'data-active': String(activeSchema === schema && activeTable === undefined),
+          title: schema,
+          onClick: () => toggleSchema(schema),
+        },
+        React.createElement('span', { className: 'dbm-tree-caret' }, isOpen ? '▾' : '▸'),
+        React.createElement('span', { className: 'dbm-tree-name' }, schema),
+        tables === undefined
+          ? null
+          : React.createElement('span', { className: 'dbm-tree-meta' }, String(tables.filter(table => matchesFilter(table.name)).length)),
+      ),
+    )
+    if (!isOpen) continue
+
+    if (loading && tables === undefined) {
+      tree.push(React.createElement('div', { key: `loading-${schema}`, className: 'dbm-tree-item dbm-tree-indent-1 dbm-hint' }, t('common.loading')))
+      continue
+    }
+    const list = (tables ?? []).filter(table => matchesFilter(table.name))
+    if (list.length === 0) {
       tree.push(
         React.createElement(
-          'button',
-          {
-            key: `schema-${label}`,
-            type: 'button',
-            className: 'dbm-tree-item',
-            onClick: () => {
-              setExpanded(current => ({ ...current, [label]: !isOpen }))
-              setActiveSchema(schema)
-            },
-          },
-          React.createElement('span', { className: 'dbm-tree-caret' }, isOpen ? '▾' : '▸'),
-          React.createElement('span', { className: 'dbm-tree-name' }, label),
+          'div',
+          { key: `empty-${schema}`, className: 'dbm-tree-item dbm-tree-indent-1 dbm-hint' },
+          t('db.noTables'),
         ),
       )
-    }
-    if (!isOpen) continue
-    if (activeSchema !== schema && schemas.length > 1) continue
-    const list = filteredTables
-    if (list.length === 0) {
-      tree.push(React.createElement('div', { key: `empty-${label}`, className: 'dbm-tree-item dbm-tree-indent-1 dbm-hint' }, t('db.noTables')))
       continue
     }
     for (const table of list) {
@@ -187,12 +267,14 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
         React.createElement(
           'button',
           {
-            key: `table-${label}-${table.name}`,
+            key: `table-${schema}-${table.name}`,
             type: 'button',
             className: 'dbm-tree-item dbm-tree-indent-1',
-            'data-active': String(activeTable === table.name),
-            title: table.comment ?? table.name,
-            onClick: () => openTable(table.name),
+            // A table name alone is ambiguous across databases; the active
+            // pair is what the right-hand pane is showing.
+            'data-active': String(activeTable === table.name && activeSchema === schema),
+            title: `${schema}.${table.name}${table.comment === undefined ? '' : ` — ${table.comment}`}`,
+            onClick: () => openTable(schema, table.name),
           },
           React.createElement('span', { className: 'dbm-tree-caret' }, table.type === 'view' ? '◫' : '▤'),
           React.createElement('span', { className: 'dbm-tree-name' }, table.name),
@@ -219,16 +301,28 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
         type: 'button',
         className: 'dbm-btn dbm-btn-sm',
         title: t('common.refresh'),
-        onClick: () => { void loadSchemas(); void loadTables(activeSchema) },
+        onClick: () => {
+          void loadSchemas()
+          // Refresh every database that is open, so an expanded node reflects
+          // reality after an external change. A collapsed node reloads the next
+          // time it is opened anyway.
+          for (const schema of schemas) if (openSchemas[schema] === true) void loadTables(schema, true)
+        },
       }, '⟳'),
     ),
     React.createElement('div', { className: 'dbm-side-body' }, tree as never),
   )
 
   // ---- right area --------------------------------------------------------
+  // The right pane exists only once a database AND a table are both chosen:
+  // every operation below is scoped to that pair.
+  const selection = activeSchema !== undefined && activeTable !== undefined
+    ? { schema: activeSchema, table: activeTable }
+    : undefined
+
   const body: unknown[] = []
-  if (activeTable === undefined) {
-    body.push(React.createElement(Empty, { key: 'empty', message: t('redis.selectKey') }))
+  if (selection === undefined) {
+    body.push(React.createElement(Empty, { key: 'empty', message: t('db.selectTable') }))
   } else {
     body.push(
       React.createElement(TabStrip, {
@@ -256,18 +350,18 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
           const nextDir = orderBy === column && orderDir === 'asc' ? 'desc' : 'asc'
           setOrderBy(column)
           setOrderDir(nextDir)
-          void loadRows({ table: activeTable, page, pageSize, mode: 'browse', orderBy: column, orderDir: nextDir })
+          void loadRows({ schema: selection.schema, table: selection.table, page, pageSize, mode: 'browse', orderBy: column, orderDir: nextDir })
         },
         onPage: (next) => {
           setPage(next)
-          void loadRows({ table: activeTable, page: next, pageSize, mode: 'browse', ...(orderBy === undefined ? {} : { orderBy, orderDir }) })
+          void loadRows({ schema: selection.schema, table: selection.table, page: next, pageSize, mode: 'browse', ...(orderBy === undefined ? {} : { orderBy, orderDir }) })
         },
         onPageSize: (size) => {
           setPageSize(size)
           setPage(1)
-          void loadRows({ table: activeTable, page: 1, pageSize: size, mode: 'browse' })
+          void loadRows({ schema: selection.schema, table: selection.table, page: 1, pageSize: size, mode: 'browse' })
         },
-        onRefresh: () => { void loadRows({ table: activeTable, page, pageSize, mode: 'browse', ...(orderBy === undefined ? {} : { orderBy, orderDir }) }) },
+        onRefresh: () => { void loadRows({ schema: selection.schema, table: selection.table, page, pageSize, mode: 'browse', ...(orderBy === undefined ? {} : { orderBy, orderDir }) }) },
       }))
     }
 
@@ -294,7 +388,8 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
           key: 'search-body',
           onSearch: (payload) => {
             void loadRows({
-              table: activeTable,
+              schema: selection.schema,
+              table: selection.table,
               page: 1,
               pageSize,
               mode: 'search',
@@ -313,13 +408,15 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
           key: 'insert-body',
           api,
           source,
-          schema: activeSchema,
-          table: activeTable,
+          schema: selection.schema,
+          table: selection.table,
           columns,
           onDone: (message) => {
             setNotice(message)
             setError(undefined)
-            void loadRows({ table: activeTable, page: 1, pageSize, mode: 'browse' })
+            // An INSERT can change the row count the tree shows, so refresh it.
+            void loadTables(selection.schema, true)
+            void loadRows({ schema: selection.schema, table: selection.table, page: 1, pageSize, mode: 'browse' })
           },
           onError: (message) => { setError(message); setNotice(undefined) },
         }),

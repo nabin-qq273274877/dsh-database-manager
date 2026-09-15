@@ -97,7 +97,6 @@ export function summarize(entry: DataSourceEntry): DataSourceSummary {
     ...(entry.host === undefined ? {} : { host: entry.host }),
     ...(entry.port === undefined ? {} : { port: entry.port }),
     ...(entry.user === undefined ? {} : { user: entry.user }),
-    ...(entry.database === undefined ? {} : { database: entry.database }),
     ...(entry.db === undefined ? {} : { db: entry.db }),
     ...(entry.tls === undefined ? {} : { tls: entry.tls }),
     ...(entry.connectTimeoutMs === undefined ? {} : { connectTimeoutMs: entry.connectTimeoutMs }),
@@ -168,14 +167,12 @@ function applyPayload(base: DataSourceEntry, payload: DataSourcePayload, kind: D
     delete next.port
     delete next.user
     delete next.password
-    delete next.database
     delete next.db
     delete next.tls
   } else if (kind === 'mysql') {
     next.host = str(payload.host) ?? base.host
     next.port = payload.port ?? base.port ?? defaultPort('mysql')
     next.user = payload.user === undefined ? base.user : str(payload.user)
-    next.database = payload.database === undefined ? base.database : str(payload.database)
     next.tls = payload.tls === undefined ? base.tls : payload.tls === true
     // An omitted password keeps the stored one; an explicit empty string clears it.
     if (payload.password !== undefined) next.password = payload.password === '' ? undefined : payload.password
@@ -191,7 +188,6 @@ function applyPayload(base: DataSourceEntry, payload: DataSourcePayload, kind: D
     else next.password = base.password
     delete next.file
     delete next.user
-    delete next.database
   }
 
   if (payload.connectTimeoutMs !== undefined) next.connectTimeoutMs = payload.connectTimeoutMs
@@ -211,6 +207,22 @@ function blankEntry(kind: DbKind, now: number): DataSourceEntry {
     createdAt: now,
     updatedAt: now,
   }
+}
+
+/**
+ * Drop fields a previous version wrote that the current model no longer has.
+ *
+ * Applied on READ rather than only on write: the MySQL default-schema field was
+ * removed, but an existing store file still carries it, and leaving it in the
+ * object would let it leak back out through `summarize` or a later save.
+ *
+ * @param entry - a record read from disk.
+ */
+function dropLegacyFields(entry: DataSourceEntry): DataSourceEntry {
+  const legacy = entry as DataSourceEntry & { database?: unknown }
+  if (legacy.database === undefined) return entry
+  delete legacy.database
+  return legacy
 }
 
 /**
@@ -237,7 +249,9 @@ export class DataSourceStore {
     const file = parsed as Partial<StoreFile>
     return {
       version: typeof file.version === 'number' ? file.version : FORMAT_VERSION,
-      sources: Array.isArray(file.sources) ? file.sources.filter(isValidEntryShape) : [],
+      sources: Array.isArray(file.sources)
+        ? file.sources.filter(isValidEntryShape).map(dropLegacyFields)
+        : [],
       settings: file.settings,
     }
   }

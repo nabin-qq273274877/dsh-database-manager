@@ -50,9 +50,14 @@ export interface DataSourceEntry {
   user?: string
   /** MySQL / Redis: password. Stored in the user-owned store file, plaintext. */
   password?: string
-  /** MySQL: default schema for the browser. */
-  database?: string
-  /** Redis: logical database index. */
+  /**
+   * Redis: logical database index the key browser opens on.
+   *
+   * MySQL deliberately has no default-schema field: connecting without one lets
+   * the browser list every database, which is the phpMyAdmin behaviour users
+   * expect, and a schema is chosen per operation instead. A stored `database`
+   * from an older version is ignored and dropped on the next save.
+   */
   db?: number
   /** MySQL / Redis: connect over TLS. */
   tls?: boolean
@@ -79,7 +84,6 @@ export interface DataSourceSummary {
   host?: string
   port?: number
   user?: string
-  database?: string
   db?: number
   tls?: boolean
   connectTimeoutMs?: number
@@ -235,7 +239,6 @@ export interface DataSourcePayload {
   port?: number
   user?: string
   password?: string
-  database?: string
   db?: number
   tls?: boolean
   connectTimeoutMs?: number

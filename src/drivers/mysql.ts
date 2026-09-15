@@ -81,7 +81,9 @@ export class MysqlDriver implements SqlDriver {
       port: this.entry.port ?? 3306,
       user: this.entry.user ?? 'root',
       password: this.entry.password ?? '',
-      database: this.entry.database,
+      // No default schema on the pool: a connection bound to one database
+      // cannot see the others, and the browser must list every database. Each
+      // statement qualifies its schema (or issues USE) instead.
       connectTimeout: timeout,
       waitForConnections: true,
       connectionLimit: 4,
@@ -148,10 +150,25 @@ export class MysqlDriver implements SqlDriver {
       .map(name => ({ name }) satisfies SchemaInfo)
   }
 
-  async tables(schema?: string): Promise<TableInfo[]> {
-    const target = schema !== undefined && schema !== '' ? schema : this.entry.database
-    if (target === undefined || target === '') throw new Error('a schema is required')
+  /**
+   * The schema an operation applies to.
+   *
+   * Required rather than defaulted: this data source no longer stores a default
+   * schema, precisely so the browser can list every database. Silently falling
+   * back to "the first one" would run a statement against a schema the user
+   * never chose, which is the kind of mistake that loses data.
+   */
+  private requireSchema(schema: string | undefined): string {
+    const target = schema !== undefined && schema !== '' ? schema : undefined
+    if (target === undefined) {
+      throw new Error('a schema is required for this operation — pick a database in the browser first')
+    }
     requireIdentifier(target, 'schema name', quoteMysql)
+    return target
+  }
+
+  async tables(schema?: string): Promise<TableInfo[]> {
+    const target = this.requireSchema(schema)
     const [rows] = await (await this.open()).query({
       sql:
         'SELECT TABLE_NAME AS name, TABLE_TYPE AS type, TABLE_ROWS AS rows_count, TABLE_COMMENT AS comment ' +
@@ -174,9 +191,7 @@ export class MysqlDriver implements SqlDriver {
   }
 
   async columns(schema: string | undefined, table: string): Promise<ColumnInfo[]> {
-    const target = schema !== undefined && schema !== '' ? schema : this.entry.database
-    if (target === undefined || target === '') throw new Error('a schema is required')
-    requireIdentifier(target, 'schema name', quoteMysql)
+    const target = this.requireSchema(schema)
     requireIdentifier(table, 'table name', quoteMysql)
     const [rows] = await (await this.open()).query({
       sql:
@@ -204,9 +219,7 @@ export class MysqlDriver implements SqlDriver {
   }
 
   async indexes(schema: string | undefined, table: string): Promise<IndexInfo[]> {
-    const target = schema !== undefined && schema !== '' ? schema : this.entry.database
-    if (target === undefined || target === '') throw new Error('a schema is required')
-    requireIdentifier(target, 'schema name', quoteMysql)
+    const target = this.requireSchema(schema)
     requireIdentifier(table, 'table name', quoteMysql)
     const [rows] = await (await this.open()).query({
       sql:
@@ -236,8 +249,7 @@ export class MysqlDriver implements SqlDriver {
   }
 
   async rows(query: RowQuery): Promise<TablePage> {
-    const schema = query.schema !== undefined && query.schema !== '' ? query.schema : this.entry.database
-    if (schema === undefined || schema === '') throw new Error('a schema is required')
+    const schema = this.requireSchema(query.schema)
     const columns = await this.columns(schema, query.table)
     if (columns.length === 0) throw new Error(`no such table: ${schema}.${query.table}`)
     const qualified = qualifyMysql(schema, query.table)
@@ -281,21 +293,53 @@ export class MysqlDriver implements SqlDriver {
 
   async exec(sql: string, params: unknown[], schema?: string): Promise<QueryResult> {
     assertSingleStatement(sql)
-    if (schema !== undefined && schema !== '') {
-      // Pin the session's default schema so an unqualified statement lands in
-      // the schema the user is looking at.
-      requireIdentifier(schema, 'schema name', quoteMysql)
-      return this.runQuery(`USE ${quoteMysql(schema)}`, [], 0)
-        .then(() => this.runQuery(sql, params, 0))
-    }
-    return this.runQuery(sql, params, 0)
+    if (schema !== undefined && schema !== '') requireIdentifier(schema, 'schema name', quoteMysql)
+    return this.runQuery(sql, params, 0, schema)
   }
 
-  /** One statement round trip with timing and result-set shaping. */
-  private async runQuery(sql: string, params: unknown[], limit: number, _schema?: string): Promise<QueryResult> {
-    const started = Date.now()
-    const [result, fields] = await (await this.open()).query({ sql, values: params })
-    const durationMs = Date.now() - started
+  /**
+   * One statement round trip, optionally scoped to a schema.
+   *
+   * The schema is applied with `USE` on the SAME pooled connection that runs the
+   * statement. Issuing `USE` separately and hoping for the same connection would
+   * be wrong twice over: the statement could land on a different connection, and
+   * the schema choice would leak into whatever else later reuses that one.
+   */
+  private async runQuery(sql: string, params: unknown[], limit: number, schema?: string): Promise<QueryResult> {
+    const pool = await this.open()
+    const connection = await pool.getConnection()
+    try {
+      if (schema !== undefined && schema !== '') await connection.query({ sql: `USE ${quoteMysql(schema)}` })
+      const started = Date.now()
+      const [result, fields] = await connection.query({ sql, values: params })
+      return this.shape(result, fields, limit, Date.now() - started)
+    } finally {
+      // Reset the session before handing the connection back.
+      //
+      // `USE` changes the connection's default database for GOOD: the pool
+      // reuses connections, so without this reset the next statement to borrow
+      // this one would run against the database a PREVIOUS statement chose.
+      // Measured: after scoping a statement to db_b, an unscoped
+      // `SELECT DATABASE()` on the same pooled connection answered db_b. That is
+      // a silent-wrong-database bug — exactly what removing the default-schema
+      // field was meant to eliminate — so the reset is required, not an
+      // optimisation.
+      //
+      // Note the reset must NOT `return`: a `return` inside `finally` would
+      // discard the value (or the exception) the try block produced.
+      try {
+        await connection.query({ sql: 'USE `information_schema`' })
+        connection.release()
+      } catch {
+        // A failed reset means the session state is unknown; dropping the
+        // connection is safer than returning it to the pool polluted.
+        connection.destroy()
+      }
+    }
+  }
+
+  /** Shape one driver reply into the wire result. */
+  private shape(result: unknown, fields: unknown, limit: number, durationMs: number): QueryResult {
     if (Array.isArray(result)) {
       const fieldList = Array.isArray(fields) ? fields : []
       const columns = fieldList
@@ -327,7 +371,7 @@ export class MysqlDriver implements SqlDriver {
 
   async insertRow(schema: string | undefined, table: string, values: RowValue[]): Promise<QueryResult> {
     if (values.length === 0) throw new Error('insert requires at least one column value')
-    const target = schema !== undefined && schema !== '' ? schema : this.entry.database
+    const target = this.requireSchema(schema)
     const qualified = qualifyMysql(target, table)
     const names = values.map(item => requireIdentifier(item.column, 'column name', quoteMysql)).join(', ')
     const placeholders = values.map(() => '?').join(', ')
@@ -337,7 +381,7 @@ export class MysqlDriver implements SqlDriver {
   async updateRow(schema: string | undefined, table: string, values: RowValue[], keys: RowKey[]): Promise<QueryResult> {
     if (values.length === 0) throw new Error('update requires at least one column value')
     if (keys.length === 0) throw new Error('update requires a row key')
-    const target = schema !== undefined && schema !== '' ? schema : this.entry.database
+    const target = this.requireSchema(schema)
     const qualified = qualifyMysql(target, table)
     const assignments = values.map(item => `${requireIdentifier(item.column, 'column name', quoteMysql)} = ?`).join(', ')
     const where = keys.map(item => `${requireIdentifier(item.column, 'column name', quoteMysql)} <=> ?`).join(' AND ')
@@ -350,7 +394,7 @@ export class MysqlDriver implements SqlDriver {
 
   async deleteRow(schema: string | undefined, table: string, keys: RowKey[]): Promise<QueryResult> {
     if (keys.length === 0) throw new Error('delete requires a row key')
-    const target = schema !== undefined && schema !== '' ? schema : this.entry.database
+    const target = this.requireSchema(schema)
     const qualified = qualifyMysql(target, table)
     const where = keys.map(item => `${requireIdentifier(item.column, 'column name', quoteMysql)} <=> ?`).join(' AND ')
     return this.exec(`DELETE FROM ${qualified} WHERE ${where}`, keys.map(item => item.value), target)
