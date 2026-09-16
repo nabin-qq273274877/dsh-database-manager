@@ -21,6 +21,17 @@ if (baseUrl === undefined || sourceId === undefined || dbArg === undefined || ou
 }
 const db = Number(dbArg)
 
+/**
+ * The key to select for the screenshot, as an expression evaluated in the page.
+ *
+ * Computed here rather than inside the page flow: the flow is a template
+ * literal, and nesting another template literal inside it is what produced the
+ * unbalanced-brace errors when this script was written.
+ */
+const jsonKeyPath = namespace === undefined || namespace === ''
+  ? 'null'
+  : `keyByPath(${JSON.stringify(`${namespace.replace(/:$/, '')}:config:app:db`)})`
+
 const FLOW = `(async () => {
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const byText = (sel, text) =>
@@ -87,30 +98,53 @@ const FLOW = `(async () => {
 
   ${namespace === undefined ? '' : `
   // Open the namespace folder and every folder beneath it, so the shot shows
-  // the nesting the way the reference UI does. Expanding is data-driven rather
-  // than a hard-coded path list: the tree's shape is exactly what is under test,
-  // and a hard-coded path would silently no-op when the shape differs.
+  // the nesting. Expanding is data-driven rather than a hard-coded path list:
+  // the tree's shape is what is being reviewed, and a hard-coded path would
+  // silently no-op when the shape differs.
+  //
+  // Each folder is opened by data-path, and the loop repeats because opening one
+  // level reveals the next. Levels load lazily, so a pass must also WAIT for the
+  // newly revealed children to arrive before deciding what is still collapsed.
   const ns = ${JSON.stringify((namespace ?? '').replace(/:$/, ''))};
-  await ensureOpen(ns);
-  // Several passes, because opening a folder reveals the next level down.
-  for (let pass = 0; pass < 4; pass++) {
+  if (ns !== '') {
+    const root = Array.from(document.querySelectorAll('.dbm-side-body [data-kind="folder"]'))
+      .find((el) => (el.getAttribute('data-path') || '') === ns);
+    if (root && root.getAttribute('aria-expanded') !== 'true') click(root);
+    await waitFor(() => {
+      const el = Array.from(document.querySelectorAll('.dbm-side-body [data-kind="folder"]'))
+        .find((node) => (node.getAttribute('data-path') || '') === ns);
+      return el && el.getAttribute('aria-expanded') === 'true' ? true : null;
+    }, 20000);
+  }
+
+  for (let pass = 0; pass < 6; pass++) {
     const collapsed = Array.from(document.querySelectorAll('.dbm-side-body [data-kind="folder"]'))
       .filter((el) => {
-        const path = el.getAttribute('title') || '';
-        const underNs = path === ns || path.startsWith(ns + ':');
-        return underNs && el.getAttribute('aria-expanded') !== 'true';
+        const path = el.getAttribute('data-path') || '';
+        const wanted = ns === '' ? true : path === ns || path.startsWith(ns + ':');
+        return wanted && el.getAttribute('aria-expanded') !== 'true';
       });
     if (collapsed.length === 0) break;
     for (const el of collapsed) click(el);
-    await sleep(500);
+    // Wait for the lazy level to actually arrive, not just for the class flip:
+    // the arrow changes immediately while the rows come from the host.
+    await sleep(900);
   }
   `}
 
   // Select a key so the value pane is populated, matching the reference shot.
-  const leaf = (${namespace === undefined ? 'null' : `keyByPath(${JSON.stringify(`${(namespace ?? '').replace(/:$/, '')}:config:db`)})`})
-    || keyRow('db') || keyRow('c') || document.querySelector('.dbm-side-body [data-kind="key"]');
-  if (leaf) click(leaf);
-  await sleep(1500);
+  // Addressed by full name: labels repeat once several folders are open.
+  const wanted = ${jsonKeyPath};
+  const leaf = wanted
+    || document.querySelector('.dbm-side-body [data-kind="key"]');
+  if (leaf) {
+    click(leaf);
+    await waitFor(() => {
+      const badge = document.querySelector('.dbm-main .dbm-badge');
+      return badge ? true : null;
+    }, 15000);
+  }
+  await sleep(600);
   return 'ok';
 })()`
 
