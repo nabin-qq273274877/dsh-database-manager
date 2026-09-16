@@ -42,10 +42,25 @@ export interface RedisFolderRow {
 export interface RedisLevel {
   folders: RedisFolderRow[]
   keys: RedisKeyInfo[]
-  /** True when the row list was cut short. */
+  /**
+   * True when this level is not fully represented — either the row list was
+   * capped or the scan stopped at its key budget. What exactly is short is
+   * conveyed by `keysAtLevel` and `countsApproximate`, which the notice reads.
+   */
   truncated: boolean
   /** How many keys live at this level, whether or not all were returned. */
   keysAtLevel: number
+  /**
+   * True when the folder counts are LOWER BOUNDS, because the scan stopped at its
+   * budget before covering the whole level. Only reachable on a database far too
+   * large to walk during a click, so the UI states the basis of the numbers
+   * instead of presenting them as exact.
+   */
+  countsApproximate?: boolean
+  /** How many keys the scan visited, i.e. the sample size when partial. */
+  scannedKeys?: number
+  /** The database's total keys, so a partial-scan notice can give a basis. */
+  dbSize?: number
   /**
    * True while a fetch for this level is in flight.
    *
@@ -350,7 +365,28 @@ export function RedisKeyTree(props: RedisKeyTreeProps): React.ReactElement {
 
     for (const info of keys) rows.push(renderKey(db, info, depth, refreshing))
 
-    if (level.truncated) {
+    /**
+     * How much of this level is missing, and WHY.
+     *
+     * The two causes need different wording, because they mean different things to
+     * the number the user is looking at:
+     *
+     * - an early stop → the counts are lower bounds, so a folder reading 300000 is
+     *   "at least" that, and a folder could be missing entirely;
+     * - a capped row list → the counts are exact and only the rows were withheld.
+     *
+     * Reporting one message for both made an incomplete list look like a display
+     * limit, which is the kind of thing someone deletes on.
+     */
+    if (level.countsApproximate === true) {
+      rows.push(React.createElement('div', {
+        key: `approx-${db}-${prefix}`,
+        className: `dbm-tree-hint dbm-tree-depth-${Math.min(depth, 8)} dbm-hint`,
+      }, t('redisdb.levelApproximate', {
+        scanned: (level.scannedKeys ?? 0).toLocaleString(),
+        total: (level.dbSize ?? 0).toLocaleString(),
+      })))
+    } else if (level.truncated) {
       rows.push(React.createElement('div', {
         key: `trunc-${db}-${prefix}`,
         className: `dbm-tree-hint dbm-tree-depth-${Math.min(depth, 8)} dbm-hint`,

@@ -5,4 +5,7 @@ node_modules/
 .DS_Store
 # Screenshots from scripts/shot-redis-tree.mjs — review artifacts, not sources.
 .shots/
+# Local agent working agreement (contains environment-specific limits). Kept out
+# of version control on purpose: it names this machine's production endpoint.
+AGENTS.md
 

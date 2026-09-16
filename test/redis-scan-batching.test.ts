@@ -81,15 +81,17 @@ describe('level scan batching', () => {
     const batches = scanCounts.length
     const batchSize = scanCounts[0]
     expect(batchSize).toBeGreaterThanOrEqual(10_000)
-    // Round trips, not seconds: at 17 ms RTT each batch costs 17 ms, so staying
-    // under ~100 batches keeps the traversal near 1.5 s instead of ~14 s.
+    // Round trips, not seconds: at 17 ms RTT each batch costs ~17 ms, so staying
+    // under ~100 batches keeps one level's fetch near 1.5 s instead of ~14 s.
+    // This now also reflects the key budget stopping the walk early — the two
+    // limits point the same way, and either one holding keeps the call fast.
     expect(batches).toBeLessThanOrEqual(100)
   })
 
   it('a full traversal still completes, so counts remain exact', async () => {
-    // Raising COUNT must not truncate the scan: a partial pass produces a WRONG
-    // folder count, which is worse than a slow one. This is the invariant that
-    // made the earlier 151142-vs-200000 bug possible.
+    // A level under the key budget must be walked completely: a partial pass
+    // produces a WRONG folder count, which is worse than a slow one. This is the
+    // invariant that made the earlier 151142-vs-200000 bug possible.
     const { client } = stubClient(25_000)
     const driver = driverWith(client)
 
@@ -99,6 +101,62 @@ describe('level scan batching', () => {
     expect(page.folders).toHaveLength(1)
     expect(page.folders[0]!.keys).toBe(25_000)
     expect(page.countsApproximate).toBe(false)
+    // The whole level was visited, so the sample size is the level's size.
+    expect(page.scannedKeys).toBe(25_000)
+  })
+
+  it('stops at the key budget on a huge level, and SAYS the counts are lower bounds', async () => {
+    // The production case: db1 holds 19.5M keys, which a complete walk reaches in
+    // ~4 minutes and ~600 MiB of transferred names. The scan must stop early — and
+    // the result must not present the partial list as complete, because the folder
+    // counts are what a user checks before deleting.
+    const { client, scanCounts } = stubClient(2_000_000)
+    const driver = driverWith(client)
+
+    const page = await driver.level({ db: 0, prefix: '', withTypes: false })
+
+    // Stopped early, and reported as such.
+    expect(page.countsApproximate).toBe(true)
+    expect(page.truncated).toBe(true)
+    expect(page.scannedKeys).toBeGreaterThanOrEqual(200_000)
+    // The cap is what bounds the work: a couple of dozen batches, not two hundred.
+    expect(scanCounts.length).toBeLessThanOrEqual(30)
+    // Counts are a LOWER BOUND, never above the level's true size.
+    const reported = page.folders.reduce((sum, folder) => sum + folder.keys, 0)
+    expect(reported).toBeLessThanOrEqual(page.dbSize)
+    // And the sample is not absurdly small: it found the one folder the stub has,
+    // since every key sits under the same prefix.
+    expect(page.folders).toHaveLength(1)
+  })
+
+  it('the dedup guard survives, so an at-least-once duplicate is not double-counted', async () => {
+    // SCAN may return the same key twice while the hash table rehashes. Counting
+    // occurrences as they stream would over-report, so the visited names are
+    // retained and deduplicated. This asserts the guard still works after the
+    // memory rework — a duplicate must not inflate a folder's count.
+    const keys = ['jd:a', 'jd:b', 'jd:a', 'jd:c', 'jd:b']
+    const client = {
+      scan: (() => {
+        let served = false
+        return async () => {
+          if (served) return ['0', []]
+          served = true
+          // The same five entries, two of them repeats.
+          return ['42', keys]
+        }
+      })(),
+      dbsize: async () => 3,
+      // `jd` is a folder, not a key, so no own-key adjustment applies.
+      type: async () => 'none',
+    }
+    const driver = driverWith(client)
+
+    const page = await driver.level({ db: 0, prefix: '', withTypes: false })
+
+    expect(page.folders).toHaveLength(1)
+    expect(page.folders[0]!.name).toBe('jd')
+    // Three DISTINCT keys, not the five entries the scan returned.
+    expect(page.folders[0]!.keys).toBe(3)
   })
 
   it('scales the round-trip count linearly, not per key', async () => {

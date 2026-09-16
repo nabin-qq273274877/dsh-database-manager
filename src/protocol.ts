@@ -282,8 +282,24 @@ export interface RedisLevelPage {
   keysAtLevel: number
   /** Total keys the database holds (DBSIZE), independent of this level. */
   dbSize: number
-  /** True when at least one child folder's count was itself capped. */
+  /**
+   * True when the folder counts below are LOWER BOUNDS rather than exact.
+   *
+   * Set when the level's scan stopped at its key budget. A complete walk of a
+   * huge database is not possible within a click: the production db1 holds 19.5M
+   * keys, needing ~4 minutes and ~600 MiB of transferred key names. The folders
+   * found are the ones holding most of the keys (a bounded pass visits keys in
+   * hash-table order, effectively a sample), but a rare folder can be absent — so
+   * the UI must not present the list as complete.
+   */
   countsApproximate: boolean
+  /**
+   * How many keys the scan actually visited (the sample size, when partial).
+   *
+   * Reported so the UI can state the basis of an approximate count — "counted
+   * from N scanned keys" is checkable, whereas a bare estimate is not.
+   */
+  scannedKeys?: number
 }
 
 /** One element edit to apply to a collection key. */

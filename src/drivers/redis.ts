@@ -44,6 +44,12 @@ interface RedisClient {
   xrange(key: string, start: string, end: string, ...args: Array<string | number>): Promise<Array<[string, string[]]>>
   select(db: number): Promise<string>
   call(command: string, ...args: Array<string | number>): Promise<unknown>
+  /**
+   * Run a Lua script. Used for the keyspace index, where folding a batch of key
+   * names server-side is the difference between a few bytes and ~600 MiB crossing
+   * the wire for one large database.
+   */
+  eval(script: string, numKeys: number, ...args: Array<string | number>): Promise<unknown>
   del(...keys: string[]): Promise<number>
   /** Batch commands into one round trip; used for TYPE/TTL over many keys. */
   pipeline(): RedisPipeline
@@ -158,6 +164,133 @@ function compareKeyNames(a: string, b: string): number {
 const MAX_TREE_KEYS = 50000
 
 /**
+ * Fold a bounded batch of the keyspace into counts, inside Redis.
+ *
+ * Written as a script rather than host-side grouping for one measured reason: a
+ * level's cost is dominated by shipping key names, not by finding them. On a
+ * production database of 19.5M keys, walking 500k keys took 5.2 s while returning
+ * the names and 1.5 s while returning nothing — i.e. ~70% of the time was transfer.
+ * This returns only counters plus a BOUNDED sample of names, so one batch's payload
+ * stays small no matter how large the database is.
+ *
+ * The loop is bounded by `batchKeys` so ONE call cannot stall the server for long:
+ * Redis is single-threaded, so a script's duration is a pause for every other
+ * client (measured 271-708 ms at a 100k batch). The caller resumes from the
+ * returned cursor, which is how a complete traversal becomes many short calls
+ * instead of one long one.
+ *
+ * Returned, as five strings:
+ *   [1] next cursor ('0' when the walk finished)
+ *   [2] how many keys this call examined
+ *   [3] "ancestorPath<TAB>count" — each key counts into every proper prefix, so a
+ *       folder's number covers its whole subtree
+ *   [4] "parentPath<TAB>count" — how many keys sit DIRECTLY at each level, i.e. the
+ *       "N keys" a level reports even when its rows are not all held
+ *   [5] "parentPath<TAB>name<US>name..." — a bounded sample of direct key names,
+ *       which is what the tree draws as rows
+ *
+ * The tables it builds are all keyed by PATH or LEVEL, never by key, so their size
+ * is bounded by the number of folders rather than by the number of keys. That is
+ * deliberate: accumulating even one entry per key would put millions of entries in
+ * the server's memory, which is the same class of harm as the transfer cost this
+ * script exists to remove.
+ *
+ * ARGV: cursor, batchKeys, separator, nameBudget.
+ */
+const INDEX_AGGREGATE_SCRIPT = `
+local cursor = ARGV[1]
+local batch = tonumber(ARGV[2])
+local sep = ARGV[3]
+local nameBudget = tonumber(ARGV[4])
+local US = string.char(1)
+
+local folders = {}
+local direct = {}
+local leaves = {}
+local visited = 0
+local namesSent = 0
+
+while true do
+  local reply = redis.call('SCAN', cursor, 'COUNT', 1000)
+  cursor = reply[1]
+  local names = reply[2]
+  for i = 1, #names do
+    local key = names[i]
+    visited = visited + 1
+    -- Fold into every proper prefix, so each ancestor folder counts this key.
+    local from = 1
+    while true do
+      local at = string.find(key, sep, from, true)
+      if at == nil then break end
+      local ancestor = string.sub(key, 1, at - 1)
+      folders[ancestor] = (folders[ancestor] or 0) + 1
+      from = at + 1
+    end
+    -- The key's own level: parent path plus its leaf name.
+    local last = 1
+    local at = string.find(key, sep, 1, true)
+    while at ~= nil do
+      last = at + 1
+      at = string.find(key, sep, at + 1, true)
+    end
+    local parent = ''
+    local leaf = key
+    if last > 1 then
+      parent = string.sub(key, 1, last - 2)
+      leaf = string.sub(key, last)
+    end
+    direct[parent] = (direct[parent] or 0) + 1
+    -- Names are only needed to draw rows, and only a page of them, so the total
+    -- sent per call is capped. The counts above are unaffected by the cap.
+    if namesSent < nameBudget then
+      if leaves[parent] == nil then leaves[parent] = {} end
+      local bucket = leaves[parent]
+      bucket[#bucket + 1] = leaf
+      namesSent = namesSent + 1
+    end
+  end
+  if cursor == '0' or visited >= batch then break end
+end
+
+local folderParts = {}
+for path, n in pairs(folders) do
+  folderParts[#folderParts + 1] = path .. '\\t' .. tostring(n)
+end
+
+local directParts = {}
+for parent, n in pairs(direct) do
+  directParts[#directParts + 1] = parent .. '\\t' .. tostring(n)
+end
+
+local leafParts = {}
+for parent, bucket in pairs(leaves) do
+  leafParts[#leafParts + 1] = parent .. '\\t' .. table.concat(bucket, US)
+end
+
+return {
+  cursor,
+  tostring(visited),
+  table.concat(folderParts, '\\n'),
+  table.concat(directParts, '\\n'),
+  table.concat(leafParts, '\\n'),
+}
+`
+
+/** One aggregated batch from {@link RedisDriver.aggregateBatch}. */
+export interface AggregateBatch {
+  /** Next SCAN cursor; `'0'` means the walk reached the end. */
+  cursor: string
+  /** How many keys this batch examined. */
+  visited: number
+  /** `ancestor path -> how many keys this batch found at or under it`. */
+  folderDeltas: Map<string, number>
+  /** `parent path -> how many keys sit directly at that level`. */
+  directCounts: Map<string, number>
+  /** `parent path -> a bounded sample of direct key names`. */
+  leaves: Map<string, string[]>
+}
+
+/**
  * SCAN batch size for level, search and tree scans.
  *
  * COUNT is a hint for how many keys Redis gathers per reply, and it divides the
@@ -182,6 +315,33 @@ const MAX_TREE_KEYS = 50000
  * traversal becomes the cost rather than the network.
  */
 const TREE_SCAN_COUNT = 10000
+
+/**
+ * How many keys one level scan may visit before it stops early.
+ *
+ * A level scan is inherently O(keys under that prefix) — Redis has no prefix
+ * index, so discovering sub-folders means walking them. On most databases that is
+ * trivial, but the production db1 measured 19.5M keys (19.4M of them under a
+ * single folder), where a complete walk transfers roughly 600 MiB of key names;
+ * measured at ~5.9 s per 500k keys over a 19 ms link, a full pass needs ~4
+ * minutes. No deadline can make that fit a UI click.
+ *
+ * So the scan is BOUNDED, and the result says so. The keys it does visit are a
+ * random sample, because SCAN walks hash-table order — which is why a bounded pass
+ * finds the folders holding most of the keys. Measured on db1: 50k keys already
+ * found both major folders, 500k found all four, missing only a folder holding 12
+ * keys out of 19.5M.
+ *
+ * 200000 is a deliberate compromise: ~2 s over a 19 ms link, comfortable for a
+ * click, and it saw 3 of db1's 4 folders. This is NOT the knob for very large
+ * databases — `countsApproximate` is, by telling the user the list may be short.
+ *
+ * It also bounds MEMORY, which is the second reason for the cap: exact
+ * deduplication needs the visited names retained (SCAN is at-least-once), so
+ * visiting at most this many keeps that set near 12 MB instead of the ~1.2 GB a
+ * complete db1 walk would need — to draw a handful of rows.
+ */
+const LEVEL_SCAN_KEY_BUDGET = 200_000
 
 /**
  * How many keys one TYPE/TTL pipeline batch covers.
@@ -515,6 +675,94 @@ export class RedisDriver implements RedisDriverContract {
   }
 
   /**
+   * Fold ONE bounded batch of the keyspace into ancestor counts, server-side.
+   *
+   * This is the primitive the keyspace index is built from, and it exists because
+   * of a measured constraint: `SCAN MATCH p:*` still walks the whole keyspace, so
+   * listing any level costs a full traversal — ~230 s and ~600 MiB of key names for
+   * a 19.5M-key database. Folding the names into counts INSIDE the server collapses
+   * that payload to a few bytes per batch (measured: ~0 KiB for 100k keys).
+   *
+   * Each call is bounded, and that bound is a deliberate safety limit rather than a
+   * performance knob: Redis runs scripts on its single thread, so a call blocks
+   * every other client for its whole duration (measured 271-708 ms at 100k keys).
+   * The caller drives the cursor and chooses the batch, so the pause can be kept
+   * small on a server that also serves live traffic.
+   *
+   * Returns `null` when the server rejects scripting (some managed offerings
+   * disable EVAL), which lets the caller fall back to folding on the host.
+   *
+   * @param cursor - SCAN cursor to resume from; `'0'` starts a fresh walk.
+   * @param batchKeys - how many matching keys this call may examine before returning.
+   */
+  async aggregateBatch(input: {
+    db?: number
+    cursor: string
+    batchKeys: number
+    /** Cap on key names returned by this call, so a reply stays small. */
+    nameBudget: number
+  }): Promise<AggregateBatch | null> {
+    const client = await this.client(input.db)
+    let raw: unknown
+    try {
+      raw = await client.eval(
+        INDEX_AGGREGATE_SCRIPT,
+        0,
+        input.cursor,
+        String(input.batchKeys),
+        SEPARATOR,
+        String(input.nameBudget),
+      )
+    } catch (error) {
+      // Distinguish "this server has no scripting" from a transient failure. Only
+      // the former justifies the slower host-side path; anything else is surfaced.
+      const message = error instanceof Error ? error.message : String(error)
+      if (/unknown command|not supported|ERR unknown|NOPERM|disabled/i.test(message)) return null
+      throw error
+    }
+    if (!Array.isArray(raw)) return null
+
+    const [next, visited, folderLines, directLines, leafLines] = raw as string[]
+
+    const folderDeltas = new Map<string, number>()
+    for (const line of (folderLines ?? '').split('\n')) {
+      if (line === '') continue
+      const tab = line.lastIndexOf('\t')
+      folderDeltas.set(line.slice(0, tab), Number(line.slice(tab + 1)))
+    }
+
+    const directCounts = new Map<string, number>()
+    for (const line of (directLines ?? '').split('\n')) {
+      if (line === '') continue
+      const tab = line.lastIndexOf('\t')
+      directCounts.set(line.slice(0, tab), Number(line.slice(tab + 1)))
+    }
+
+    const leaves = new Map<string, string[]>()
+    for (const line of (leafLines ?? '').split('\n')) {
+      if (line === '') continue
+      const tab = line.indexOf('\t')
+      const parent = line.slice(0, tab)
+      // No empty-name filter: a key ending in the separator (`a:`) has an EMPTY
+      // leaf name and is a legitimate key. Dropping it made such keys unreachable
+      // in the tree — caught by comparing against the existing scanner on a fixture
+      // that includes `trailing:`.
+      const names = line.slice(tab + 1).split('\u0001')
+      const held = leaves.get(parent)
+      if (held === undefined) leaves.set(parent, names)
+      else held.push(...names)
+    }
+
+    return { cursor: String(next), visited: Number(visited), folderDeltas, directCounts, leaves }
+  }
+
+  /** DBSIZE for one logical database, used to size the index and its progress bar. */
+  async keyCount(db: number): Promise<number> {
+    const client = await this.client(db)
+    return client.dbsize().catch(() => 0)
+  }
+
+  /**
    * One folder level of one database — how the tree is built.
    *
    * The previous design scanned the WHOLE keyspace and grouped it in the
@@ -554,20 +802,26 @@ export class RedisDriver implements RedisDriverContract {
     const match = `${escapeGlob(prefix)}*`
 
     /**
-     * Every key under the prefix, deduplicated.
+     * This level's key rows, plus a count per IMMEDIATE child folder.
      *
-     * Deduplication is a correctness requirement, not tidiness: SCAN is
-     * at-least-once — Redis documents that a key may be returned twice across a
-     * full iteration (it can move between hash-table slots during a rehash) — so
-     * counting as the scan streams would over-report a folder's size.
+     * Three properties matter, and each is a decision rather than a detail:
      *
-     * The scan ALWAYS runs to completion. A partial pass cannot produce a correct
-     * folder count, and a wrong count is worse than a slow one: it is what made
-     * `goods` (200000 keys) display as 151142.
+     * - Only the FIRST segment after the prefix is ever accumulated, so a level
+     *   reports folders by counting segments instead of by holding every key name.
+     *   The earlier version collected all names into a Set and grouped afterwards;
+     *   on db1 that is ~1.2 GB of strings to draw a handful of rows.
      *
-     * Measured at 265k keys / 26.5 MB of names: 631 ms and 38 MiB, which is an
-     * acceptable per-scan cost in the host process and does not accumulate. The
-     * alternative that was actually broken was a per-key TYPE/TTL round trip.
+     * - The scan stops after {@link LEVEL_SCAN_KEY_BUDGET} keys. A complete walk of
+     *   db1 needs ~4 minutes and ~600 MiB of transferred names, so a click cannot
+     *   wait for it. Stopping early makes the counts LOWER BOUNDS, which is what
+     *   `countsApproximate` reports.
+     *
+     * - Deduplication is still exact WITHIN the budget, because the visited names
+     *   are retained in a Set. SCAN is at-least-once (a key can come back twice
+     *   while the hash table rehashes), so counting occurrences as they stream
+     *   would over-report — the guard the original code had, and it is kept. The
+     *   budget is what makes it affordable: ~200k names is roughly 12 MB, against
+     *   ~1.2 GB for an unbounded walk.
      */
     const names = new Set<string>()
     let cursor = '0'
@@ -576,12 +830,44 @@ export class RedisDriver implements RedisDriverContract {
       const [next, found] = await client.scan(cursor, 'MATCH', match, 'COUNT', TREE_SCAN_COUNT)
       cursor = String(next)
       for (const name of found) {
-        // A key that IS the prefix is added after the loop: it does not begin
-        // with `prefix + ':'`, so this pattern never matches it.
+        // A key that IS this level's prefix does not begin with `prefix + ':'`,
+        // so `match` never returns it; it is added below instead.
         if (name.slice(prefix.length) === '') continue
         names.add(name)
       }
-    } while (cursor !== '0')
+      // The budget is checked after a whole batch so the sample is not cut mid
+      // reply, and the cursor is left non-zero to record that the walk was partial.
+    } while (cursor !== '0' && names.size < LEVEL_SCAN_KEY_BUDGET)
+
+    /**
+     * Whether the walk covered the level completely.
+     *
+     * A non-zero cursor means Redis still had slots to visit, so the folders and
+     * counts below are a lower bound. This is surfaced rather than hidden: the
+     * counts are the number a user checks before deleting a folder, and a silently
+     * short list is exactly the failure mode the earlier `goods` bug produced
+     * (151142 shown for 200000 keys).
+     */
+    const scannedKeys = names.size
+    const complete = cursor === '0'
+    const countsApproximate = !complete
+
+    // One pass over the deduped names yields both this level's keys and the
+    // sub-folder counts, so no folder is scanned twice.
+    const counts = new Map<string, number>()
+    const keysHere: string[] = []
+    for (const name of names) {
+      const rest = name.slice(prefix.length)
+      const at = rest.indexOf(SEPARATOR)
+      if (at === -1) keysHere.push(name)
+      else {
+        const segment = rest.slice(0, at)
+        counts.set(segment, (counts.get(segment) ?? 0) + 1)
+      }
+    }
+    // Release them before the TYPE/TTL batch so the peak does not stack with that
+    // batch's replies.
+    names.clear()
 
     /**
      * A key whose name IS this level's prefix (`a:b` alongside `a:b:c`).
@@ -602,23 +888,6 @@ export class RedisDriver implements RedisDriverContract {
     if (input.prefix !== '') {
       ownKeyPresent = await client.type(input.prefix) !== 'none'
     }
-
-    // One pass over the deduped names yields both this level's keys and the
-    // sub-folder counts, so no folder is scanned twice.
-    const counts = new Map<string, number>()
-    const keysHere: string[] = []
-    for (const name of names) {
-      const rest = name.slice(prefix.length)
-      const at = rest.indexOf(SEPARATOR)
-      if (at === -1) keysHere.push(name)
-      else {
-        const segment = rest.slice(0, at)
-        counts.set(segment, (counts.get(segment) ?? 0) + 1)
-      }
-    }
-    // The names are no longer needed; release them before the TYPE/TTL batch so
-    // the peak does not stack with that batch's replies.
-    names.clear()
 
     /**
      * Each child folder's size, made to equal what deleting that folder removes.
@@ -658,12 +927,15 @@ export class RedisDriver implements RedisDriverContract {
     return {
       folders: childFolders,
       keys,
-      // Only the ROW list can be short here; the counts are exact because the
-      // scan above ran to completion.
-      truncated: keysAtLevel > shown.length,
+      // Two different ways this level can be short, and they are reported
+      // separately so the UI can say which: the ROW list may be capped (rows were
+      // withheld, `keysAtLevel` is exact), or the SCAN may have stopped early
+      // (counts are lower bounds, `countsApproximate` is true).
+      truncated: keysAtLevel > shown.length || countsApproximate,
       keysAtLevel,
       dbSize,
-      countsApproximate: false,
+      countsApproximate,
+      scannedKeys,
     }
   }
 

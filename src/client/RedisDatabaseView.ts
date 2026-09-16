@@ -149,6 +149,13 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
           keys: page.keys,
           truncated: page.truncated,
           keysAtLevel: page.keysAtLevel,
+          // Carried through so the tree can say the counts are lower bounds
+          // rather than showing them as exact — the difference matters most on a
+          // folder row, which is what a delete is confirmed against.
+          countsApproximate: page.countsApproximate,
+          scannedKeys: page.scannedKeys,
+          // The level's own size, so the "partial" notice can give a basis.
+          dbSize: page.dbSize,
         },
       }))
       setError(undefined)
