@@ -15,10 +15,12 @@ import {
   type RedisCreateResult,
   type RedisDeletePrefixResult,
   type RedisDeleteResult,
+  type RedisElementEdit,
   type RedisInfo,
   type RedisKeyPage,
+  type RedisLevelPage,
+  type RedisMutationResult,
   type RedisPrefixCount,
-  type RedisTreePage,
   type RedisValue,
   type SchemaInfo,
   type ColumnInfo,
@@ -219,9 +221,50 @@ export class DbApi {
     })).result
   }
 
-  /** Every key in one logical database, for the folder tree. */
-  async redisTree(id: string, options: { db: number; pattern?: string }): Promise<RedisTreePage> {
-    return (await readJson<{ page: RedisTreePage }>(await fetch(DB_API.redisTree(id, query(options))))).page
+  /**
+   * One folder level of one database.
+   *
+   * The tree loads this way rather than whole-database: a level scan is bounded
+   * by the level's own size, and a folder the user never opens is never read.
+   * `withTypes: false` skips the TYPE/TTL round trips (useful for a level that
+   * is all folders).
+   */
+  async redisLevel(id: string, options: { db: number; prefix: string; withTypes: boolean }): Promise<RedisLevelPage> {
+    return (await readJson<{ page: RedisLevelPage }>(
+      await fetch(DB_API.redisLevel(id, query({
+        db: options.db,
+        prefix: options.prefix,
+        withTypes: options.withTypes ? '1' : '0',
+      }))),
+    )).page
+  }
+
+  /** Replace a string key's value; TTL is preserved. */
+  async redisSetString(id: string, body: { key: string; value: string; db: number }): Promise<RedisMutationResult> {
+    return (await send<{ result: RedisMutationResult }>(
+      `${DB_API.redisString(id)}?${query({ db: body.db })}`, 'POST',
+      { key: body.key, value: body.value },
+    )).result
+  }
+
+  /** Set a key's TTL; `ttl: null` means no expiry (PERSIST, not EXPIRE 0). */
+  async redisSetTtl(id: string, body: { key: string; ttl: number | null; db: number }): Promise<RedisMutationResult> {
+    return (await send<{ result: RedisMutationResult }>(
+      `${DB_API.redisTtl(id)}?${query({ db: body.db })}`, 'POST',
+      { key: body.key, ttl: body.ttl },
+    )).result
+  }
+
+  /** Add, change or remove one element of a collection key. */
+  async redisEditElement(id: string, body: {
+    key: string
+    db: number
+    edit: RedisElementEdit
+  }): Promise<RedisMutationResult> {
+    return (await send<{ result: RedisMutationResult }>(
+      `${DB_API.redisElement(id)}?${query({ db: body.db })}`, 'POST',
+      { key: body.key, ...body.edit },
+    )).result
   }
 
   /** Create one or more keys; resolves with the names that were created. */

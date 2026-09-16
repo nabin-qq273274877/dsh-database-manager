@@ -208,13 +208,12 @@ export interface RedisKeyPage {
 }
 
 /**
- * One database's complete key set, for the folder tree.
+ * Every key in one database matching a pattern, with type and TTL.
  *
- * The tree groups keys by the `:` separator in their names, and a group is only
- * correct if it sees every key under it — so this is a full scan of one logical
- * database rather than a SCAN page. It is bounded by a cap: past
- * {@link RedisTreePage.truncated} the caller must not treat the grouping as
- * complete.
+ * NOT what the tree loads — the tree loads one level at a time
+ * ({@link RedisLevelPage}). This is for callers that need the whole matching set
+ * in one shot (exports, tests asserting what a folder operation left behind), and
+ * it is capped: past the cap `truncated` is true and `keys` is incomplete.
  */
 export interface RedisTreePage {
   keys: RedisKeyInfo[]
@@ -222,6 +221,70 @@ export interface RedisTreePage {
   dbSize: number
   /** True when the scan stopped at the cap, so `keys` is incomplete. */
   truncated: boolean
+}
+
+/**
+ * One folder level of one database — how the tree is actually built.
+ *
+ * A whole-keyspace scan cannot serve a large database: 480k keys is tens of
+ * megabytes of JSON and a per-key TYPE/TTL round trip each. Instead the tree
+ * asks for one level at a time, so expanding a folder costs one bounded scan of
+ * that folder's prefix and only its immediate children cross the wire. A folder
+ * that is never opened is never scanned.
+ */
+export interface RedisLevelPage {
+  /**
+   * Immediate sub-folders of the requested prefix, with the number of keys each
+   * holds in total (including nested folders). Sorted by name.
+   */
+  folders: Array<{ name: string; path: string; keys: number }>
+  /**
+   * Keys that live exactly at the requested level. Their type and TTL are
+   * fetched, but NOT their values — reading 20k values to draw a tree would be
+   * the same mistake in a different place.
+   */
+  keys: RedisKeyInfo[]
+  /**
+   * True when this level was cut short — either the scan hit its work ceiling,
+   * or the level holds more key rows than were sent. `keysAtLevel` is the true
+   * count either way, so the UI can state what was withheld.
+   */
+  truncated: boolean
+  /**
+   * How many keys live exactly at this level, whether or not all were returned.
+   * A flat prefix of 200k keys reports 200000 here while `keys` holds the first
+   * page, so "showing the first N of M" is accurate rather than a guess.
+   */
+  keysAtLevel: number
+  /** Total keys the database holds (DBSIZE), independent of this level. */
+  dbSize: number
+  /** True when at least one child folder's count was itself capped. */
+  countsApproximate: boolean
+}
+
+/** One element edit to apply to a collection key. */
+export interface RedisElementEdit {
+  /** Which kind of edit this is. */
+  op: 'set' | 'delete' | 'push' | 'add'
+  /**
+   * list: the 0-based index to write.
+   * hash / zset / set: unused (the field/member identifies the element).
+   */
+  index?: number
+  /** hash field, or zset/set member. */
+  member?: string
+  /** The new value: list/hash element, or a zset score. */
+  value?: string
+}
+
+/** Outcome of a key mutation (value, element, or TTL). */
+export interface RedisMutationResult {
+  /** Rows/fields/elements the server reported as changed. */
+  affected: number
+  /** The key's TTL after the mutation, so the panel can redraw truthfully. */
+  ttl: number
+  /** True when the mutation removed the key entirely (deleting the last element). */
+  removed: boolean
 }
 
 /** Key types this plugin can create from the new-key form. */
@@ -369,6 +432,14 @@ export const DB_API = {
   redisCommand: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/command`,
   /** One database's whole key set for the folder tree. */
   redisTree: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/tree?${params}`,
+  /** One folder level of one database (the tree's lazy-load endpoint). */
+  redisLevel: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/level?${params}`,
+  /** Replace a string key's value. */
+  redisString: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/string`,
+  /** Set or clear a key's TTL. */
+  redisTtl: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/ttl`,
+  /** Add, change or remove one element of a collection key. */
+  redisElement: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/element`,
   /** Create one or more keys. */
   redisCreate: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/key`,
   /** Delete one key (query param `key`) — DELETE on the same path as create. */

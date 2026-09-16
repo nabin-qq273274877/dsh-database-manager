@@ -12,19 +12,21 @@ import * as React from 'react'
  * agent write gate (auth.ts) is deliberately not involved.
  */
 
-import type { DataSourceSummary, RedisInfo, RedisKeyInfo, RedisTreePage, RedisValue } from '../protocol.ts'
+import type { DataSourceSummary, RedisInfo, RedisValue } from '../protocol.ts'
 import type { DbApi } from './api.ts'
 import { keyFromCommand, splitCommand } from './command.ts'
 import {
   DeleteDialog,
   NewKeyDialog,
   RedisKeyTree,
+  levelKey,
   type RedisCreatePayload,
   type RedisDbNode,
+  type RedisLevel,
   type RedisSelection,
 } from './RedisKeyTree.ts'
-import { buildRedisTree, filterTree, type RedisTree } from './redis-tree.ts'
-import { BackButton, ErrorBanner, Empty, TabStrip, formatBytes, formatTtl, formatUptime, isNull, renderCell, t } from './ui.ts'
+import { RedisValueEditor } from './RedisValueEditor.ts'
+import { BackButton, ErrorBanner, Empty, TabStrip, formatTtl, formatUptime, isNull, renderCell, t } from './ui.ts'
 
 /** The right-hand tabs of a Redis panel. */
 type RedisTab = 'value' | 'info' | 'console'
@@ -49,15 +51,17 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
   const { api, source, initialInfo, onBack, onClose } = props
   const [info, setInfo] = React.useState<RedisInfo>(initialInfo)
   const [filter, setFilter] = React.useState('')
-  const [trees, setTrees] = React.useState<Record<number, RedisTree | undefined>>({})
-  const [loadingDbs, setLoadingDbs] = React.useState<Record<number, boolean>>({})
   /**
-   * Databases start collapsed. Opening one scans it for the first time, so a
-   * server with keys in several databases pays only for what is opened — and
-   * opening all sixteen by default would scan every one on every visit.
+   * Loaded levels, keyed by `${db}\0${prefix}`.
    *
-   * The connection's own database is opened automatically: that is where the
-   * user configured this source to point, so it is where they expect to land.
+   * A level is fetched the first time its folder is opened, never before — the
+   * whole point of the design, since a production database cannot be scanned up
+   * front.
+   */
+  const [levels, setLevels] = React.useState<Record<string, RedisLevel | undefined>>({})
+  /**
+   * Databases start collapsed, except the one this source is configured for:
+   * that is where the user expects to land, and it is one bounded scan.
    */
   const [openDbs, setOpenDbs] = React.useState<Record<number, boolean>>(() => ({ [source.db ?? 0]: true }))
   const [openFolders, setOpenFolders] = React.useState<Record<number, Record<string, boolean> | undefined>>({})
@@ -79,55 +83,81 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
   const [busy, setBusy] = React.useState(false)
 
   /**
-   * Load one database's whole key set and build its tree.
+   * Load one level.
    *
-   * A whole scan rather than a SCAN page, because the tree groups by prefix and
-   * a partial page would render folders that silently lack members. The scan is
-   * capped host-side and reports truncation, which the tree surfaces.
+   * The TYPE/TTL fetch is skipped for the database root, which on a large
+   * database is nothing but folders — that is the difference between a root that
+   * opens immediately and one that spends a round trip per key on rows the user
+   * cannot see.
+   *
+   * @param prefix - '' for the database root.
    */
-  const loadTree = React.useCallback(async (db: number): Promise<void> => {
-    setLoadingDbs(current => ({ ...current, [db]: true }))
+  const loadLevel = React.useCallback(async (db: number, prefix: string): Promise<void> => {
+    const key = levelKey(db, prefix)
+    setLevels(current => ({
+      ...current,
+      [key]: current[key] === undefined
+        ? { folders: [], keys: [], truncated: false, keysAtLevel: 0, loading: true }
+        : { ...current[key]!, loading: true, error: undefined },
+    }))
     try {
-      const page: RedisTreePage = await api.redisTree(source.id, { db })
-      setTrees(current => ({ ...current, [db]: buildRedisTree(page.keys, page.truncated) }))
+      const page = await api.redisLevel(source.id, { db, prefix, withTypes: prefix !== '' })
+      setLevels(current => ({
+        ...current,
+        [key]: {
+          folders: page.folders,
+          keys: page.keys,
+          truncated: page.truncated,
+          keysAtLevel: page.keysAtLevel,
+        },
+      }))
       setError(undefined)
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : String(failure))
-      // An empty tree so the node does not sit on "scanning…" forever; the
-      // refresh control retries.
-      setTrees(current => ({ ...current, [db]: buildRedisTree([], false) }))
-    } finally {
-      setLoadingDbs(current => ({ ...current, [db]: false }))
+      setLevels(current => ({
+        ...current,
+        [key]: {
+          folders: [], keys: [], truncated: false, keysAtLevel: 0,
+          error: failure instanceof Error ? failure.message : String(failure),
+        },
+      }))
     }
   }, [api, source.id])
 
-  /** Refresh the server overview and every loaded tree. */
+  /** Refresh the server overview and every level already loaded. */
   const refreshAll = React.useCallback(async (): Promise<void> => {
     try {
       setInfo(await api.redisInfo(source.id))
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure))
     }
-    for (const db of Object.keys(trees)) void loadTree(Number(db))
-  }, [api, source.id, trees, loadTree])
+    // Only the open levels: a collapsed folder's data is discarded anyway, and
+    // re-scanning it would defeat the lazy design.
+    const open = Object.keys(levels)
+    for (const key of open) {
+      const at = key.indexOf('\u0000')
+      void loadLevel(Number(key.slice(0, at)), key.slice(at + 1))
+    }
+  }, [api, source.id, levels, loadLevel])
 
-  // Scan the connection's own database once, since it starts expanded.
+  // Load the connection's own database root once, since it starts expanded.
   const initialDb = source.db ?? 0
-  React.useEffect(() => { void loadTree(initialDb) }, [initialDb, loadTree])
+  React.useEffect(() => { void loadLevel(initialDb, '') }, [initialDb, loadLevel])
 
-  /** Expand or collapse one database, loading it on first open. */
+  /** Expand or collapse one database, loading its root level on first open. */
   const toggleDb = (db: number): void => {
     const next = openDbs[db] !== true
     setOpenDbs(current => ({ ...current, [db]: next }))
-    if (next && trees[db] === undefined) void loadTree(db)
+    if (next && levels[levelKey(db, '')] === undefined) void loadLevel(db, '')
   }
 
-  /** Expand or collapse one folder. Folders hold no state of their own. */
+  /** Expand or collapse one folder, loading its level on first open. */
   const toggleFolder = (db: number, path: string): void => {
+    const next = openFolders[db]?.[path] !== true
     setOpenFolders(current => {
       const forDb = current[db] ?? {}
-      return { ...current, [db]: { ...forDb, [path]: forDb[path] !== true } }
+      return { ...current, [db]: { ...forDb, [path]: next } }
     })
+    if (next && levels[levelKey(db, path)] === undefined) void loadLevel(db, path)
   }
 
   /** Load one key's value from a specific database. */
@@ -161,15 +191,6 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
     return Array.from({ length: highest + 1 }, (_, db) => ({ db, keys: byDb.get(db) ?? 0 }))
   }, [info.databases, source.db])
 
-  /** The trees as filtered for display. */
-  const visibleTrees = React.useMemo(() => {
-    const next: Record<number, RedisTree | undefined> = {}
-    for (const [key, tree] of Object.entries(trees)) {
-      next[Number(key)] = tree === undefined ? undefined : filterTree(tree, filter)
-    }
-    return next
-  }, [trees, filter])
-
   // ---- write actions -----------------------------------------------------
   const submitCreate = async (keys: RedisCreatePayload[]): Promise<void> => {
     if (createFor === undefined) return
@@ -188,6 +209,7 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
         })
       }
       await refreshAll()
+      await loadLevel(createFor.db, createFor.folderPath ?? '')
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure))
     } finally {
@@ -218,7 +240,7 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
       if (deleteFor.target.kind === 'key') {
         const { db, key } = deleteFor.target
         const removed = await api.redisDeleteKey(source.id, { key, db })
-        setNotice(removed ? t('sql.affected', { n: 1, ms: 0 }) : t('redis.noKeys'))
+        setNotice(removed ? t('redisdelete.done', { n: 1 }) : t('redis.noKeys'))
         if (activeKey?.db === db && activeKey.key === key) {
           setActiveKey(undefined)
           setValue(undefined)
@@ -227,14 +249,17 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
         const { db, path } = deleteFor.target
         const result = await api.redisDeletePrefix(source.id, { prefix: path, db })
         setNotice(result.truncated
-          ? `${t('sql.affected', { n: result.deleted, ms: 0 })} · ${t('redisdelete.truncated')}`
-          : t('sql.affected', { n: result.deleted, ms: 0 }))
+          ? `${t('redisdelete.done', { n: result.deleted })} · ${t('redisdelete.truncated')}`
+          : t('redisdelete.done', { n: result.deleted }))
         // The open key may have just been deleted; drop it rather than leaving
         // a stale value on screen.
         if (activeKey?.db === db && (activeKey.key === path || activeKey.key.startsWith(`${path}:`))) {
           setActiveKey(undefined)
           setValue(undefined)
         }
+        // A folder's parent level changed too (the folder itself may be gone).
+        const parent = path.includes(':') ? path.slice(0, path.lastIndexOf(':')) : ''
+        void loadLevel(db, parent)
       }
       setError(undefined)
       setDeleteFor(undefined)
@@ -274,8 +299,7 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
       { className: 'dbm-side-body' },
       React.createElement(RedisKeyTree, {
         databases,
-        trees: visibleTrees,
-        loadingDbs,
+        levels,
         openDbs,
         openFolders,
         filter,
@@ -307,10 +331,28 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
   ]
 
   if (tab === 'value') {
+    const activeDb = activeKey?.db ?? initialDb
     body.push(
       value === undefined
         ? React.createElement(Empty, { key: 'empty', message: valueLoading ? t('common.loading') : t('redis.selectKey') })
-        : React.createElement(ValueView, { key: 'value', value, source }),
+        : React.createElement(RedisValueEditor, {
+            key: `value-${activeDb}-${value.key}`,
+            api,
+            source,
+            db: activeDb,
+            value,
+            onReload: () => { void loadValue(activeDb, value.key) },
+            onDone: (message) => { setNotice(message); setError(undefined) },
+            onError: (message) => { setError(message); setNotice(undefined) },
+            onRemoved: () => {
+              // Removing a collection's last element deletes the key; the tree
+              // must drop it rather than keep offering a key that is gone.
+              setActiveKey(undefined)
+              setValue(undefined)
+              setNotice(t('redisedit.deleted'))
+              void loadLevel(activeDb, value.key.includes(':') ? value.key.slice(0, value.key.lastIndexOf(':')) : '')
+            },
+          }),
     )
   }
 
@@ -373,102 +415,6 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
       onConfirm: () => { void confirmDelete() },
       onClose: () => setDeleteFor(undefined),
     }),
-  )
-}
-
-/** The 值 tab: the selected key's content, shaped by type. */
-function ValueView(props: { value: RedisValue; source: DataSourceSummary }): React.ReactElement {
-  const { value } = props
-  const head = React.createElement(
-    'div',
-    { className: 'dbm-pad' },
-    React.createElement('div', { className: 'dbm-row' }, React.createElement('strong', { className: 'dbm-mono' }, value.key)),
-    React.createElement(
-      'div',
-      { className: 'dbm-row' },
-      React.createElement('span', { className: `dbm-badge dbm-badge-${value.type === 'string' ? 'ok' : 'sqlite'}` }, value.type),
-      React.createElement('span', { className: 'dbm-hint' }, `${t('redis.ttl')}: ${formatTtl(value.ttl)}`),
-      value.truncated === true ? React.createElement('span', { className: 'dbm-hint' }, t('redis.truncated', { n: 1000 })) : null,
-    ),
-  )
-
-  if (value.type === 'string') {
-    return React.createElement(
-      'div',
-      { className: 'dbm-tab-body' },
-      head,
-      React.createElement(
-        'div',
-        { className: 'dbm-scroll' },
-        React.createElement(
-          'div',
-          { className: 'dbm-pad' },
-          React.createElement('div', { className: 'dbm-hint' }, `${t('redis.stringValue')} · ${formatBytes((value.value ?? '').length)}`),
-          React.createElement('pre', { className: 'dbm-mono', style: { whiteSpace: 'pre-wrap', wordBreak: 'break-all', margin: 0 } }, value.value ?? ''),
-        ),
-      ),
-    )
-  }
-
-  const rows: Array<[string, string, string | undefined]> = []
-  if (value.items !== undefined) {
-    value.items.forEach((item, index) => rows.push([String(index), item, undefined]))
-  }
-  if (value.fields !== undefined) {
-    value.fields.forEach(item => rows.push([item.field, item.value, undefined]))
-  }
-  if (value.members !== undefined) {
-    value.members.forEach(item => rows.push([item.member, item.score, item.score]))
-  }
-  if (value.entries !== undefined) {
-    value.entries.forEach(entry => {
-      for (const field of entry.fields) rows.push([`${entry.id} · ${field.field}`, field.value, entry.id])
-    })
-  }
-
-  const isHash = value.fields !== undefined
-  const isZset = value.members !== undefined
-  const isStream = value.entries !== undefined
-  const firstLabel = isHash ? t('redis.field') : isZset ? t('redis.member') : isStream ? t('redis.entry') : '#'
-
-  return React.createElement(
-    'div',
-    { className: 'dbm-tab-body' },
-    head,
-    React.createElement(
-      'div',
-      { className: 'dbm-data' },
-      rows.length === 0
-        ? React.createElement(Empty, { message: t('redis.noKeys') })
-        : React.createElement(
-            'table',
-            null,
-            React.createElement(
-              'thead',
-              null,
-              React.createElement(
-                'tr',
-                null,
-                React.createElement('th', null, firstLabel),
-                React.createElement('th', null, t('redis.value')),
-                isZset ? React.createElement('th', null, t('redis.score')) : null,
-              ),
-            ),
-            React.createElement(
-              'tbody',
-              null,
-              rows.map(([left, right, third], index) =>
-                React.createElement(
-                  'tr',
-                  { key: index },
-                  React.createElement('td', { title: left }, left),
-                  React.createElement('td', { title: right }, right),
-                  isZset ? React.createElement('td', null, third ?? '') : null,
-                ),
-              ),
-            ),
-          ),
-    ),
   )
 }
 
@@ -638,4 +584,4 @@ function ConsoleView(props: {
 
 /** Re-exported so the panel root keeps one import site for the dialogs. */
 export { RedisKeyTree, NewKeyDialog, DeleteDialog }
-export type { RedisDbNode, RedisSelection, RedisKeyInfo }
+export type { RedisDbNode, RedisLevel, RedisSelection }

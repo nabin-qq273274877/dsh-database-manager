@@ -10,8 +10,11 @@ import type {
   QueryResult,
   RedisCreateKey,
   RedisDeletePrefixResult,
+  RedisElementEdit,
   RedisInfo,
   RedisKeyPage,
+  RedisLevelPage,
+  RedisMutationResult,
   RedisTreePage,
   RedisValue,
   SchemaInfo,
@@ -92,7 +95,9 @@ export interface RedisDriver {
   info(): Promise<RedisInfo>
   /** SCAN one page of keys. */
   keys(input: { pattern: string; cursor: string; count: number; db: number }): Promise<RedisKeyPage>
-  /** Every key in one database, for the folder tree (bounded, reports truncation). */
+  /** One folder level of one database — what the tree lazily loads. */
+  level(input: { db: number; prefix: string; withTypes: boolean }): Promise<RedisLevelPage>
+  /** Every key in one database matching a pattern (bounded; reports truncation). */
   tree(input: { db: number; pattern?: string }): Promise<RedisTreePage>
   /** Read one key's full value (bounded by `limit` per collection). */
   value(key: string, db: number, limit: number): Promise<RedisValue>
@@ -100,6 +105,12 @@ export interface RedisDriver {
   createKey(input: RedisCreateKey, db: number): Promise<void>
   /** Delete one key; returns whether it existed. */
   deleteKey(key: string, db: number): Promise<boolean>
+  /** Replace a string key's value, keeping its TTL. */
+  setString(key: string, value: string, db: number): Promise<RedisMutationResult>
+  /** Set a key's TTL; a non-positive value means "no expiry" (PERSIST). */
+  setTtl(key: string, seconds: number, db: number): Promise<RedisMutationResult>
+  /** Add, change or remove one element of a collection key. */
+  editElement(key: string, edit: RedisElementEdit, db: number): Promise<RedisMutationResult>
   /** Delete a folder: its own key plus every descendant, scanned fresh here. */
   deletePrefix(path: string, db: number): Promise<RedisDeletePrefixResult>
   /** How many keys a folder holds (the delete dialog's warning). */

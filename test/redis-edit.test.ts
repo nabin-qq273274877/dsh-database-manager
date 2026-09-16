@@ -375,4 +375,283 @@ describe.skipIf(!up)('Redis key editing (live server)', () => {
       await driver.deletePrefix(`${PREFIX}iso`, other)
     })
   })
+
+  describe('level (the tree\'s lazy-load scan)', () => {
+    beforeAll(async () => {
+      // A level-shaped fixture: two branches with known counts.
+      await driver.deletePrefix(`${ROOT}lv`, DB)
+      for (let i = 0; i < 5; i++) {
+        await driver.createKey({ key: `${PREFIX}lv:alpha:${i}`, type: 'string', value: 'v' }, DB)
+        await driver.createKey({ key: `${PREFIX}lv:beta:${i}`, type: 'string', value: 'v' }, DB)
+      }
+      // A leaf directly at the `lv` level, plus a key that doubles as a folder.
+      await driver.createKey({ key: `${PREFIX}lv:leaf`, type: 'list', items: ['a'] }, DB)
+      await driver.createKey({ key: `${PREFIX}lv:alpha`, type: 'string', value: 'doubles' }, DB)
+    })
+
+    it('reports sub-folders with key counts that match what deleting them removes', async () => {
+      const page = await driver.level({ db: DB, prefix: `${PREFIX}lv`, withTypes: true })
+
+      const folders = Object.fromEntries(page.folders.map(folder => [folder.name, folder.keys]))
+      // Each branch holds 5 children, plus the same-named key `lv:alpha` which
+      // the folder delete also removes — so alpha is 6, beta is 5.
+      expect(folders['alpha']).toBe(6)
+      expect(folders['beta']).toBe(5)
+      expect(page.folders.map(folder => folder.name).sort()).toEqual(['alpha', 'beta'])
+
+      // The direct leaf is a key at this level, not a folder.
+      expect(page.keys.map(key => key.key)).toContain(`${PREFIX}lv:leaf`)
+      expect(page.keys.find(key => key.key === `${PREFIX}lv:leaf`)?.type).toBe('list')
+      // `lv:alpha` is ALSO a direct child key of `lv` (it has no separator after
+      // the prefix), so it is listed here as well as counted into folder alpha.
+      // Listing it is what makes it clickable; counting it into alpha is what
+      // makes the folder row's number equal the deletion scope.
+      expect(page.keys.map(key => key.key)).toContain(`${PREFIX}lv:alpha`)
+      expect(page.keysAtLevel).toBe(2)
+      expect(page.truncated).toBe(false)
+    })
+
+    it('counts a folder\'s same-named key into that folder, not only the parent level', async () => {
+      // The property that matters: the number on the folder row equals what
+      // deleting it destroys.
+      const atLv = await driver.level({ db: DB, prefix: `${PREFIX}lv`, withTypes: false })
+      const alpha = atLv.folders.find(folder => folder.name === 'alpha')!
+      expect(alpha.keys).toBe(await driver.countPrefix(alpha.path, DB))
+
+      // Opening alpha shows its five children AND the same-named key.
+      const atAlpha = await driver.level({ db: DB, prefix: `${PREFIX}lv:alpha`, withTypes: false })
+      const alphaKeys = atAlpha.keys.map(key => key.key)
+      expect(alphaKeys).toContain(`${PREFIX}lv:alpha`)
+      expect(alphaKeys).toContain(`${PREFIX}lv:alpha:0`)
+      expect(atAlpha.keysAtLevel).toBe(6)
+    })
+
+    it('counts a folder exactly, matching what deleting it removes', async () => {
+      // This is the assertion that caught the truncated-count bug (a 200k folder
+      // reported as 151142) and then the same-named-key bug (a folder showing one
+      // fewer than the delete would destroy).
+      const page = await driver.level({ db: DB, prefix: `${PREFIX}lv`, withTypes: false })
+      for (const folder of page.folders) {
+        const counted = await driver.countPrefix(folder.path, DB)
+        expect(folder.keys).toBe(counted)
+      }
+    })
+
+    it('does not sweep in a sibling that merely shares a name prefix', async () => {
+      // Folder `lv` must not pull in `lvX:*`.
+      await driver.createKey({ key: `${PREFIX}lvX:other`, type: 'string', value: 'v' }, DB)
+      const page = await driver.level({ db: DB, prefix: `${PREFIX}lv`, withTypes: false })
+      expect(page.folders.map(folder => folder.name)).not.toContain('lvX')
+      expect(page.keys.map(key => key.key)).not.toContain(`${PREFIX}lvX:other`)
+      await driver.deletePrefix(`${PREFIX}lvX`, DB)
+    })
+
+    it('reports a level with no keys without inventing entries', async () => {
+      const page = await driver.level({ db: DB, prefix: `${PREFIX}does-not-exist`, withTypes: true })
+      expect(page.folders).toEqual([])
+      expect(page.keys).toEqual([])
+      expect(page.keysAtLevel).toBe(0)
+      expect(page.truncated).toBe(false)
+      // DBSIZE is whole-database, so it still reports the real total.
+      expect(page.dbSize).toBeGreaterThan(0)
+    })
+
+    it('caps the returned rows but still reports the true count', async () => {
+      // A flat prefix larger than the display cap: the UI must be able to say
+      // "showing the first N of M" rather than implying the folder is small.
+      const many = 5200
+      const args: string[] = ['MSET']
+      for (let i = 0; i < many; i++) args.push(`${PREFIX}flat:${i}`, 'v')
+      await driver.command(args, DB)
+
+      const page = await driver.level({ db: DB, prefix: `${PREFIX}flat`, withTypes: true })
+      expect(page.keysAtLevel).toBe(many)
+      expect(page.keys.length).toBe(5000)
+      expect(page.truncated).toBe(true)
+      // The rows that ARE returned must be real and typed.
+      expect(page.keys.every(key => key.type === 'string')).toBe(true)
+
+      await driver.deletePrefix(`${PREFIX}flat`, DB)
+    }, 60000)
+
+    it('types only the keys it returns, and skips typing when not asked', async () => {
+      const withTypes = await driver.level({ db: DB, prefix: `${PREFIX}lv:beta`, withTypes: true })
+      expect(withTypes.keys.every(key => key.type === 'string')).toBe(true)
+
+      // The root of a huge database is all folders; the caller can skip the
+      // TYPE/TTL round trips entirely.
+      const withoutTypes = await driver.level({ db: DB, prefix: `${PREFIX}lv:beta`, withTypes: false })
+      expect(withoutTypes.keys.every(key => key.type === 'unknown')).toBe(true)
+      expect(withoutTypes.keys).toHaveLength(withTypes.keys.length)
+    })
+  })
+
+  describe('setString', () => {
+    it('replaces a string value and keeps its TTL', async () => {
+      await driver.createKey({ key: `${PREFIX}s1`, type: 'string', value: 'before', ttl: 300 }, DB)
+      const result = await driver.setString(`${PREFIX}s1`, 'after', DB)
+
+      const value = await driver.value(`${PREFIX}s1`, DB, 10)
+      expect(value.value).toBe('after')
+      // Saving a value must not silently clear an expiry the user set.
+      expect(result.ttl).toBeGreaterThan(0)
+      expect(result.removed).toBe(false)
+    })
+
+    it('refuses to write a string over a non-string key', async () => {
+      // SET on a list would replace the whole key: data loss behind a "save".
+      await driver.createKey({ key: `${PREFIX}s2`, type: 'list', items: ['a'] }, DB)
+      await expect(driver.setString(`${PREFIX}s2`, 'oops', DB)).rejects.toThrow(/类型是 list/)
+      // The list must be intact.
+      const value = await driver.value(`${PREFIX}s2`, DB, 10)
+      expect(value.type).toBe('list')
+      expect(value.items).toEqual(['a'])
+    })
+
+    it('refuses to write a missing key', async () => {
+      await expect(driver.setString(`${PREFIX}ghost`, 'x', DB)).rejects.toThrow(/不存在/)
+    })
+
+    it('accepts an empty and a large value', async () => {
+      await driver.createKey({ key: `${PREFIX}s3`, type: 'string', value: 'x' }, DB)
+      await driver.setString(`${PREFIX}s3`, '', DB)
+      expect((await driver.value(`${PREFIX}s3`, DB, 10)).value).toBe('')
+
+      const big = 'x'.repeat(200000)
+      await driver.setString(`${PREFIX}s3`, big, DB)
+      expect((await driver.value(`${PREFIX}s3`, DB, 10)).value?.length).toBe(200000)
+    })
+  })
+
+  describe('setTtl', () => {
+    it('sets an expiry and clears it back to permanent', async () => {
+      await driver.createKey({ key: `${PREFIX}t1`, type: 'string', value: 'v' }, DB)
+
+      const set = await driver.setTtl(`${PREFIX}t1`, 120, DB)
+      expect(set.ttl).toBeGreaterThan(0)
+      expect(set.removed).toBe(false)
+
+      // Clearing must use PERSIST: `EXPIRE key 0` DELETES the key, which is a
+      // very different thing from "make it permanent".
+      const cleared = await driver.setTtl(`${PREFIX}t1`, 0, DB)
+      expect(cleared.ttl).toBe(-1)
+      const value = await driver.value(`${PREFIX}t1`, DB, 10)
+      expect(value.type).toBe('string')
+      expect(value.value).toBe('v')
+    })
+
+    it('treats a negative TTL as permanent rather than deleting', async () => {
+      await driver.createKey({ key: `${PREFIX}t2`, type: 'string', value: 'v', ttl: 60 }, DB)
+      await driver.setTtl(`${PREFIX}t2`, -1, DB)
+      const value = await driver.value(`${PREFIX}t2`, DB, 10)
+      expect(value.ttl).toBe(-1)
+      expect(value.value).toBe('v')
+    })
+
+    it('refuses a missing key', async () => {
+      await expect(driver.setTtl(`${PREFIX}ghost-ttl`, 60, DB)).rejects.toThrow(/不存在/)
+    })
+  })
+
+  describe('editElement', () => {
+    it('changes a list element in place, by index', async () => {
+      await driver.createKey({ key: `${PREFIX}el-list`, type: 'list', items: ['a', 'b', 'c'] }, DB)
+      await driver.editElement(`${PREFIX}el-list`, { op: 'set', index: 1, value: 'B' }, DB)
+      expect((await driver.value(`${PREFIX}el-list`, DB, 10)).items).toEqual(['a', 'B', 'c'])
+    })
+
+    it('deletes a list element by index, not by value', async () => {
+      // The list deliberately repeats a value: removing index 0 must remove ONE
+      // element, not every occurrence of it.
+      await driver.createKey({ key: `${PREFIX}el-dup`, type: 'list', items: ['x', 'y', 'x'] }, DB)
+      await driver.editElement(`${PREFIX}el-dup`, { op: 'delete', index: 0 }, DB)
+      expect((await driver.value(`${PREFIX}el-dup`, DB, 10)).items).toEqual(['y', 'x'])
+    })
+
+    it('appends to a list', async () => {
+      await driver.createKey({ key: `${PREFIX}el-push`, type: 'list', items: ['a'] }, DB)
+      await driver.editElement(`${PREFIX}el-push`, { op: 'push', value: 'b' }, DB)
+      expect((await driver.value(`${PREFIX}el-push`, DB, 10)).items).toEqual(['a', 'b'])
+    })
+
+    it('rejects an out-of-range list index with the real length', async () => {
+      await driver.createKey({ key: `${PREFIX}el-range`, type: 'list', items: ['a', 'b'] }, DB)
+      await expect(driver.editElement(`${PREFIX}el-range`, { op: 'set', index: 9, value: 'z' }, DB))
+        .rejects.toThrow(/下标 9 超出范围（列表长度 2）/)
+    })
+
+    it('adds, renames and removes a set member', async () => {
+      await driver.createKey({ key: `${PREFIX}el-set`, type: 'set', items: ['a', 'b'] }, DB)
+
+      await driver.editElement(`${PREFIX}el-set`, { op: 'add', value: 'c' }, DB)
+      expect([...((await driver.value(`${PREFIX}el-set`, DB, 10)).items ?? [])].sort()).toEqual(['a', 'b', 'c'])
+
+      // A set has no in-place edit: renaming means remove + add.
+      await driver.editElement(`${PREFIX}el-set`, { op: 'delete', member: 'a', value: 'A' }, DB)
+      const renamed = [...((await driver.value(`${PREFIX}el-set`, DB, 10)).items ?? [])].sort()
+      expect(renamed).toEqual(['A', 'b', 'c'])
+
+      await driver.editElement(`${PREFIX}el-set`, { op: 'delete', member: 'b' }, DB)
+      expect([...((await driver.value(`${PREFIX}el-set`, DB, 10)).items ?? [])].sort()).toEqual(['A', 'c'])
+    })
+
+    it('sets, changes and deletes a hash field', async () => {
+      await driver.createKey({ key: `${PREFIX}el-hash`, type: 'hash', fields: [{ field: 'f', value: '1' }] }, DB)
+
+      await driver.editElement(`${PREFIX}el-hash`, { op: 'set', member: 'g', value: '2' }, DB)
+      await driver.editElement(`${PREFIX}el-hash`, { op: 'set', member: 'f', value: 'changed' }, DB)
+      const fields = Object.fromEntries(
+        ((await driver.value(`${PREFIX}el-hash`, DB, 10)).fields ?? []).map(item => [item.field, item.value]),
+      )
+      expect(fields).toEqual({ f: 'changed', g: '2' })
+
+      await driver.editElement(`${PREFIX}el-hash`, { op: 'delete', member: 'f' }, DB)
+      const after = Object.fromEntries(
+        ((await driver.value(`${PREFIX}el-hash`, DB, 10)).fields ?? []).map(item => [item.field, item.value]),
+      )
+      expect(after).toEqual({ g: '2' })
+    })
+
+    it('changes a zset score, adds a member, and removes one', async () => {
+      await driver.createKey({ key: `${PREFIX}el-zset`, type: 'zset', members: [{ member: 'm', score: '1' }] }, DB)
+
+      // ZADD with an existing member updates its score in place.
+      await driver.editElement(`${PREFIX}el-zset`, { op: 'set', member: 'm', value: '9' }, DB)
+      await driver.editElement(`${PREFIX}el-zset`, { op: 'add', member: 'n', value: '5' }, DB)
+
+      const members = Object.fromEntries(
+        ((await driver.value(`${PREFIX}el-zset`, DB, 10)).members ?? []).map(item => [item.member, item.score]),
+      )
+      expect(members).toEqual({ m: '9', n: '5' })
+
+      await driver.editElement(`${PREFIX}el-zset`, { op: 'delete', member: 'm' }, DB)
+      const left = ((await driver.value(`${PREFIX}el-zset`, DB, 10)).members ?? []).map(item => item.member)
+      expect(left).toEqual(['n'])
+    })
+
+    it('refuses a non-numeric zset score', async () => {
+      await driver.createKey({ key: `${PREFIX}el-bad`, type: 'zset', members: [{ member: 'm', score: '1' }] }, DB)
+      await expect(driver.editElement(`${PREFIX}el-bad`, { op: 'set', member: 'm', value: 'abc' }, DB))
+        .rejects.toThrow(/分值不是数字/)
+    })
+
+    it('refuses a mismatched operation for the key\'s real type', async () => {
+      await driver.createKey({ key: `${PREFIX}el-mismatch`, type: 'string', value: 'v' }, DB)
+      await expect(driver.editElement(`${PREFIX}el-mismatch`, { op: 'set', index: 0, value: 'x' }, DB))
+        .rejects.toThrow(/不支持元素编辑/)
+    })
+
+    it('reports when the last element\'s removal deleted the key', async () => {
+      await driver.createKey({ key: `${PREFIX}el-last`, type: 'list', items: ['only'] }, DB)
+      const result = await driver.editElement(`${PREFIX}el-last`, { op: 'delete', index: 0 }, DB)
+      // Redis removes a collection key once its last element goes; the panel has
+      // to know so it does not keep showing a key that is gone.
+      expect(result.removed).toBe(true)
+      expect(result.ttl).toBe(-2)
+    })
+
+    it('refuses to edit a missing key', async () => {
+      await expect(driver.editElement(`${PREFIX}ghost-el`, { op: 'push', value: 'x' }, DB)).rejects.toThrow(/不存在/)
+    })
+  })
 })

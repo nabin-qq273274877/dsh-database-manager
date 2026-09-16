@@ -388,6 +388,18 @@ export const PANEL_CSS = `
   padding: 0;
 }
 .dbm-null { color: var(--dsw-alias-label-secondary); font-style: italic; }
+/*
+ * The value editor puts inputs inside the data grid. They must fill the cell
+ * rather than sit in it, so an editable row reads as a table row and not as a
+ * form dropped into a column.
+ */
+.dbm-data input.dbm-input {
+  box-sizing: border-box;
+  border-radius: 6px;
+  padding: 3px 7px;
+}
+/* An edited-but-unsaved cell is called out, so 保存 is never a guess. */
+.dbm-dirty { color: #c1720a; }
 .dbm-pager {
   display: flex;
   align-items: center;

@@ -12,15 +12,18 @@ import type {
   QueryResult,
   RedisCreateKey,
   RedisDeletePrefixResult,
+  RedisElementEdit,
   RedisInfo,
   RedisKeyInfo,
   RedisKeyPage,
+  RedisLevelPage,
+  RedisMutationResult,
   RedisTreePage,
   RedisValue,
   TestResult,
 } from '../protocol.ts'
 import { toWireValue } from '../sql-util.ts'
-import { keyPattern, prefixPattern } from '../redis-util.ts'
+import { SEPARATOR, escapeGlob, keyPattern, prefixPattern } from '../redis-util.ts'
 import type { RedisDriver as RedisDriverContract } from './types.ts'
 
 /** Structural view of the ioredis surface this driver uses. */
@@ -41,8 +44,27 @@ interface RedisClient {
   select(db: number): Promise<string>
   call(command: string, ...args: Array<string | number>): Promise<unknown>
   del(...keys: string[]): Promise<number>
+  /** Batch commands into one round trip; used for TYPE/TTL over many keys. */
+  pipeline(): RedisPipeline
   disconnect(): void
   on(event: string, listener: (...args: unknown[]) => void): void
+}
+
+/**
+ * ioredis's pipeline surface: commands are queued then sent together, and
+ * `exec()` resolves with one `[error, value]` pair per queued command in issue
+ * order.
+ */
+interface RedisPipeline {
+  type(key: string): RedisPipeline
+  ttl(key: string): RedisPipeline
+  exec(): Promise<Array<[Error | null, unknown]>>
+}
+
+/** Unwrap one pipeline reply, or undefined when the command failed. */
+function replyValue(reply: [Error | null, unknown] | undefined): unknown {
+  if (reply === undefined || reply[0] !== null) return undefined
+  return reply[1]
 }
 
 interface RedisModule {
@@ -80,16 +102,61 @@ export async function redisAvailable(): Promise<boolean> {
 const MAX_ELEMENTS = 1000
 
 /**
- * Ceiling on keys collected by one whole-database tree scan.
+ * Ceiling on key ROWS returned for one level.
  *
- * The tree groups keys by prefix, so a partial scan would show a folder that
- * silently lacks members — worse than saying "too many". The cap is a report
- * threshold: past it the result is marked truncated and the UI says so.
+ * A flat prefix holding 200k keys is legitimate (`goods:1` … `goods:200000`), but
+ * sending them all would put tens of megabytes into the browser and render rows
+ * nobody reads. The level still reports its true key count, so the UI can say
+ * "200000 keys, showing the first 5000" instead of pretending the folder is
+ * small or that it failed.
+ *
+ * This caps only what is DISPLAYED — the scan itself always runs to completion,
+ * because a partial scan cannot produce a correct folder count.
  */
-const MAX_TREE_KEYS = 20000
+const MAX_LEVEL_KEYS_RETURNED = 5000
 
-/** SCAN batch size for the tree scan. */
+/**
+ * Order two key names the way the tree displays them.
+ *
+ * Deliberately NOT `localeCompare`. Measured on 200k shuffled keys: an ICU
+ * collation sort took 23.3 s, versus 166 ms for this — the difference between a
+ * level that renders and one that appears hung. `localeCompare` earns its cost
+ * on human-language strings; Redis key names are identifiers, and the ordering
+ * users expect from them (RedisDesktopManager, redis-cli, a byte-wise `SORT`) is
+ * code-unit order.
+ *
+ * Case is folded first so `App` and `app` group together as they did before this
+ * change — dropping that would silently reorder every mixed-case tree. The fold
+ * is done inside the comparator rather than by precomputing a lowercase copy of
+ * every name, which would double the peak memory of a 200k-key level for no
+ * measurable gain.
+ */
+function compareKeyNames(a: string, b: string): number {
+  const x = a.toLowerCase()
+  const y = b.toLowerCase()
+  if (x < y) return -1
+  if (x > y) return 1
+  // Same folded form: fall back to the exact strings so the order is total
+  // (`a` and `A` must not compare equal, or Array#sort's result is unspecified).
+  if (a < b) return -1
+  if (a > b) return 1
+  return 0
+}
+
+/** Cap for the whole-database {@link RedisDriver.tree} helper (tests, exports). */
+const MAX_TREE_KEYS = 50000
+
+/** SCAN batch size for level and tree scans. */
 const TREE_SCAN_COUNT = 1000
+
+/**
+ * How many keys one TYPE/TTL pipeline batch covers.
+ *
+ * The whole batch travels as one round trip, so this trades request size against
+ * the number of round trips; 1000 keys is 2000 commands per batch, which Redis
+ * handles comfortably while keeping any single reply small.
+ */
+const TREE_PIPELINE_BATCH = 1000
 
 /**
  * Ceiling on keys removed by one folder delete.
@@ -350,17 +417,191 @@ export class RedisDriver implements RedisDriverContract {
   }
 
   /**
-   * Every key in one logical database, for the folder tree.
+   * One folder level of one database — how the tree is built.
    *
-   * A tree needs the whole key set: grouping by prefix from a partial SCAN page
-   * would render a folder that silently lacks members. The traversal is
-   * therefore exhaustive up to {@link MAX_TREE_KEYS}, and the caller is told
-   * when the cap was reached rather than being handed a plausible-looking
-   * half-tree.
+   * The previous design scanned the WHOLE keyspace and grouped it in the
+   * browser, which cannot work on a real dataset: a 480k-key database produced a
+   * capped, incomplete tree, and fetching TYPE and TTL with one round trip per
+   * key meant ~1M round trips before anything rendered.
    *
-   * Types and TTLs are fetched in bounded parallel batches: one round trip per
-   * key across 20k keys would take minutes, while an unbounded Promise.all
-   * would open as many sockets as the server allows.
+   * A level scan reads exactly one level. Its cost is one pass over the keys
+   * under `prefix`, and only that level's immediate children cross the wire, so
+   * a folder nobody opens is never read.
+   *
+   * The pass is inherently O(keys under the prefix) — Redis has no "list
+   * distinct prefixes" command, so SCAN is the only way to discover sub-folders.
+   * What is avoided is paying it per folder: the same pass yields both the
+   * sub-folder set and each sub-folder's key count.
+   *
+   * @param prefix - folder path to list, '' for the database root.
+   * @param withTypes - whether to fetch TYPE/TTL for this level's keys. The root
+   *   level of a large database is all folders, so it usually needs none.
+   */
+  async level(input: { db: number; prefix: string; withTypes: boolean }): Promise<RedisLevelPage> {
+    return this.withDeadline(this.levelUnbounded(input), this.treeDeadlineMs(), 'scanning a key level')
+  }
+
+  /** The actual level scan; callers go through {@link level} for the deadline. */
+  private async levelUnbounded(input: { db: number; prefix: string; withTypes: boolean }): Promise<RedisLevelPage> {
+    const client = await this.client(input.db)
+    // The separator is appended so `prefix` selects only its SUBTREE: without
+    // it, folder `a` would also sweep in folder `ab`.
+    const prefix = input.prefix === '' ? '' : `${input.prefix}${SEPARATOR}`
+    const match = `${escapeGlob(prefix)}*`
+
+    /**
+     * Every key under the prefix, deduplicated.
+     *
+     * Deduplication is a correctness requirement, not tidiness: SCAN is
+     * at-least-once — Redis documents that a key may be returned twice across a
+     * full iteration (it can move between hash-table slots during a rehash) — so
+     * counting as the scan streams would over-report a folder's size.
+     *
+     * The scan ALWAYS runs to completion. A partial pass cannot produce a correct
+     * folder count, and a wrong count is worse than a slow one: it is what made
+     * `goods` (200000 keys) display as 151142.
+     *
+     * Measured at 265k keys / 26.5 MB of names: 631 ms and 38 MiB, which is an
+     * acceptable per-scan cost in the host process and does not accumulate. The
+     * alternative that was actually broken was a per-key TYPE/TTL round trip.
+     */
+    const names = new Set<string>()
+    let cursor = '0'
+
+    do {
+      const [next, found] = await client.scan(cursor, 'MATCH', match, 'COUNT', TREE_SCAN_COUNT)
+      cursor = String(next)
+      for (const name of found) {
+        // A key that IS the prefix is added after the loop: it does not begin
+        // with `prefix + ':'`, so this pattern never matches it.
+        if (name.slice(prefix.length) === '') continue
+        names.add(name)
+      }
+    } while (cursor !== '0')
+
+    /**
+     * A key whose name IS this level's prefix (`a:b` alongside `a:b:c`).
+     *
+     * Two separate questions, answered differently on purpose:
+     *
+     * - WHERE IT IS LISTED: at this level, because `a:b` has no separator after
+     *   the prefix and is therefore a direct child key here. This level is the
+     *   only place it can be clicked to inspect its value.
+     * - HOW IT IS COUNTED: into the `a:b` FOLDER's size, because the folder row
+     *   above this level must show what deleting that folder would destroy —
+     *   and {@link deletePrefix} removes the path itself as well as every
+     *   descendant. Counting it only here made the folder row read one lower
+     *   than the destruction: a misleading number exactly where the user decides
+     *   whether to trust it.
+     */
+    let ownKeyPresent = false
+    if (input.prefix !== '') {
+      ownKeyPresent = await client.type(input.prefix) !== 'none'
+    }
+
+    // One pass over the deduped names yields both this level's keys and the
+    // sub-folder counts, so no folder is scanned twice.
+    const counts = new Map<string, number>()
+    const keysHere: string[] = []
+    for (const name of names) {
+      const rest = name.slice(prefix.length)
+      const at = rest.indexOf(SEPARATOR)
+      if (at === -1) keysHere.push(name)
+      else {
+        const segment = rest.slice(0, at)
+        counts.set(segment, (counts.get(segment) ?? 0) + 1)
+      }
+    }
+    // The names are no longer needed; release them before the TYPE/TTL batch so
+    // the peak does not stack with that batch's replies.
+    names.clear()
+
+    /**
+     * Each child folder's size, made to equal what deleting that folder removes.
+     *
+     * A folder `a:b` whose name is ALSO a key contributes that key to its own
+     * size, because {@link deletePrefix} deletes the path itself as well as its
+     * descendants. Counting them separately made the row read one lower than the
+     * destruction, which is the one number a user is relying on when they confirm
+     * a folder delete.
+     *
+     * Only children of this level are probed, so this is one TYPE per visible
+     * folder — not per key.
+     */
+    const childFolders: RedisLevelPage['folders'] = []
+    for (const [segment, count] of counts) {
+      const path = `${prefix}${segment}`
+      const own = await client.type(path)
+      childFolders.push({ name: segment, path, keys: own === 'none' ? count : count + 1 })
+    }
+    childFolders.sort((a, b) => compareKeyNames(a.name, b.name))
+
+    // This level's own keys, plus the key that shares this level's own name, so
+    // that opening the folder shows it (the only place it can be inspected).
+    const rows = [...keysHere]
+    if (ownKeyPresent) rows.push(input.prefix)
+    rows.sort(compareKeyNames)
+    const keysAtLevel = rows.length
+    const shown = rows.length > MAX_LEVEL_KEYS_RETURNED
+      ? rows.slice(0, MAX_LEVEL_KEYS_RETURNED)
+      : rows
+
+    const keys = input.withTypes
+      ? await this.describeKeys(client, shown)
+      : shown.map(key => ({ key, type: 'unknown', ttl: -1 }) satisfies RedisKeyInfo)
+
+    const dbSize = await client.dbsize().catch(() => 0)
+    return {
+      folders: childFolders,
+      keys,
+      // Only the ROW list can be short here; the counts are exact because the
+      // scan above ran to completion.
+      truncated: keysAtLevel > shown.length,
+      keysAtLevel,
+      dbSize,
+      countsApproximate: false,
+    }
+  }
+
+  /**
+   * Fetch TYPE and TTL for many keys in ONE round trip per batch.
+   *
+   * The per-key version cost two round trips per key, which is what made a large
+   * level unusable. `pipeline()` sends the whole batch and reads the replies
+   * together, so a 10k-key level costs two round trips per batch instead of 20k.
+   */
+  private async describeKeys(client: RedisClient, names: string[]): Promise<RedisKeyInfo[]> {
+    const out: RedisKeyInfo[] = []
+    for (let i = 0; i < names.length; i += TREE_PIPELINE_BATCH) {
+      const slice = names.slice(i, i + TREE_PIPELINE_BATCH)
+      const pipeline = client.pipeline()
+      for (const name of slice) pipeline.type(name)
+      for (const name of slice) pipeline.ttl(name)
+      const replies = await pipeline.exec()
+      // Replies arrive in issue order: all TYPEs, then all TTLs.
+      const half = slice.length
+      for (let index = 0; index < half; index++) {
+        const type = replyValue(replies[index])
+        const ttl = replyValue(replies[index + half])
+        out.push({
+          key: slice[index]!,
+          type: typeof type === 'string' ? type : 'unknown',
+          // A key can vanish between the SCAN and this call; TYPE would then
+          // report 'none'. -2 is Redis's own "key does not exist" TTL, which is
+          // what the value view already renders.
+          ttl: typeof ttl === 'number' ? ttl : -2,
+        })
+      }
+    }
+    return out
+  }
+
+  /**
+   * Every key in one database matching a pattern, for the folder tree.
+   *
+   * Retained for callers that genuinely need a whole-database view (the tests
+   * use it to assert what a folder operation left behind). The TREE does not use
+   * it: see {@link level}. Still capped, and still reports truncation.
    */
   async tree(input: { db: number; pattern?: string }): Promise<RedisTreePage> {
     return this.withDeadline(this.treeUnbounded(input), this.treeDeadlineMs(), 'scanning the key tree')
@@ -385,20 +626,7 @@ export class RedisDriver implements RedisDriverContract {
     } while (cursor !== '0')
 
     const dbSize = await client.dbsize().catch(() => names.length)
-    const keys: RedisKeyInfo[] = []
-    const BATCH = 200
-    for (let i = 0; i < names.length; i += BATCH) {
-      const slice = names.slice(i, i + BATCH)
-      const described = await Promise.all(slice.map(async key => {
-        const [type, ttl] = await Promise.all([
-          client.type(key).catch(() => 'unknown'),
-          client.ttl(key).catch(() => -2),
-        ])
-        return { key, type, ttl } satisfies RedisKeyInfo
-      }))
-      keys.push(...described)
-    }
-    return { keys, dbSize, truncated }
+    return { keys: await this.describeKeys(client, names), dbSize, truncated }
   }
 
   /**
@@ -473,6 +701,171 @@ export class RedisDriver implements RedisDriverContract {
     const client = await this.client(db)
     const removed = await client.del(key)
     return removed > 0
+  }
+
+  /**
+   * Set a string key's value.
+   *
+   * The type is checked first: `SET` on a list would silently REPLACE the whole
+   * key with a string, which is data loss behind a button labelled "save the
+   * value". Refusing with the actual type is the only safe answer.
+   */
+  async setString(key: string, value: string, db: number): Promise<RedisMutationResult> {
+    return this.withDeadline(this.setStringUnbounded(key, value, db), this.deadlineMs(), `writing "${key}"`)
+  }
+
+  /** The actual string write; callers go through {@link setString}. */
+  private async setStringUnbounded(key: string, value: string, db: number): Promise<RedisMutationResult> {
+    const client = await this.client(db)
+    const type = await client.type(key)
+    if (type === 'none') throw new Error(`键「${key}」不存在`)
+    if (type !== 'string') {
+      throw new Error(`键「${key}」的类型是 ${type}，不能用字符串写入；请用元素编辑或命令行`)
+    }
+    // KEEPTTL so saving a value does not quietly clear an expiry the user set.
+    await client.call('SET', key, value, 'KEEPTTL')
+    return { affected: 1, ttl: await client.ttl(key), removed: false }
+  }
+
+  /**
+   * Set or clear a key's TTL.
+   *
+   * `seconds <= 0` means "no expiry" and is applied with PERSIST, not
+   * `EXPIRE 0` — the latter DELETES the key, which is a very different thing
+   * from "make it permanent".
+   */
+  async setTtl(key: string, seconds: number, db: number): Promise<RedisMutationResult> {
+    return this.withDeadline(this.setTtlUnbounded(key, seconds, db), this.deadlineMs(), `setting the TTL of "${key}"`)
+  }
+
+  /** The actual TTL write; callers go through {@link setTtl}. */
+  private async setTtlUnbounded(key: string, seconds: number, db: number): Promise<RedisMutationResult> {
+    const client = await this.client(db)
+    const type = await client.type(key)
+    if (type === 'none') throw new Error(`键「${key}」不存在`)
+
+    let affected: number
+    if (seconds <= 0) {
+      // PERSIST reports 0 when the key already had no expiry; that is success,
+      // not a failure, so the outcome is reported as one change either way.
+      await client.call('PERSIST', key)
+      affected = 1
+    } else {
+      const ok = await client.call('EXPIRE', key, Math.trunc(seconds))
+      affected = Number(ok) === 1 ? 1 : 0
+      if (affected === 0) throw new Error(`键「${key}」在设置过期时间时已不存在`)
+    }
+    return { affected, ttl: await client.ttl(key), removed: false }
+  }
+
+  /**
+   * Apply one element edit to a collection key.
+   *
+   * Each op is checked against the key's real type before it runs, so a
+   * mismatched edit names the problem instead of silently writing a second key
+   * of a different type (Redis would create one on many write commands).
+   */
+  async editElement(key: string, edit: RedisElementEdit, db: number): Promise<RedisMutationResult> {
+    return this.withDeadline(this.editElementUnbounded(key, edit, db), this.deadlineMs(), `editing "${key}"`)
+  }
+
+  /** The actual element edit; callers go through {@link editElement}. */
+  private async editElementUnbounded(key: string, edit: RedisElementEdit, db: number): Promise<RedisMutationResult> {
+    const client = await this.client(db)
+    const type = await client.type(key)
+    if (type === 'none') throw new Error(`键「${key}」不存在`)
+
+    const after = async (affected: number): Promise<RedisMutationResult> => {
+      // A collection that just lost its last element no longer exists; reporting
+      // that lets the panel refresh instead of showing a key that is gone.
+      const stillThere = await client.type(key)
+      return {
+        affected,
+        ttl: stillThere === 'none' ? -2 : await client.ttl(key),
+        removed: stillThere === 'none',
+      }
+    }
+
+    switch (type) {
+      case 'list': {
+        if (edit.op === 'set') {
+          if (edit.index === undefined) throw new Error('list 元素编辑需要 index')
+          const total = Number(await client.call('LLEN', key))
+          if (edit.index < 0 || edit.index >= total) throw new Error(`下标 ${edit.index} 超出范围（列表长度 ${total}）`)
+          await client.call('LSET', key, edit.index, edit.value ?? '')
+          return after(1)
+        }
+        if (edit.op === 'push') {
+          await client.call('RPUSH', key, edit.value ?? '')
+          return after(1)
+        }
+        if (edit.op === 'delete') {
+          if (edit.index === undefined) throw new Error('list 元素删除需要 index')
+          // LSET to a sentinel then LREM is the documented way to remove by
+          // index; a duplicate value elsewhere in the list must not be removed
+          // too, which plain LREM(value) would do.
+          const sentinel = `\u0000dbm-delete-${Date.now()}-${Math.random()}`
+          const total = Number(await client.call('LLEN', key))
+          if (edit.index < 0 || edit.index >= total) throw new Error(`下标 ${edit.index} 超出范围（列表长度 ${total}）`)
+          await client.call('LSET', key, edit.index, sentinel)
+          const removed = Number(await client.call('LREM', key, 1, sentinel))
+          return after(removed)
+        }
+        throw new Error(`list 不支持的操作：${edit.op}`)
+      }
+
+      case 'set': {
+        if (edit.op === 'add') {
+          const added = Number(await client.call('SADD', key, edit.value ?? ''))
+          return after(added)
+        }
+        if (edit.op === 'delete') {
+          if (edit.member === undefined) throw new Error('set 成员删除需要 member')
+          // A set has no "edit in place": the member IS the value, so changing
+          // one means removing it and adding the replacement.
+          if (edit.value !== undefined && edit.value !== edit.member) {
+            await client.call('SREM', key, edit.member)
+            const added = Number(await client.call('SADD', key, edit.value))
+            return after(added)
+          }
+          const removed = Number(await client.call('SREM', key, edit.member))
+          return after(removed)
+        }
+        throw new Error(`set 不支持的操作：${edit.op}`)
+      }
+
+      case 'hash': {
+        if (edit.member === undefined || edit.member === '') throw new Error('hash 编辑需要 field')
+        if (edit.op === 'set') {
+          await client.call('HSET', key, edit.member, edit.value ?? '')
+          return after(1)
+        }
+        if (edit.op === 'delete') {
+          const removed = Number(await client.call('HDEL', key, edit.member))
+          return after(removed)
+        }
+        throw new Error(`hash 不支持的操作：${edit.op}`)
+      }
+
+      case 'zset': {
+        if (edit.member === undefined || edit.member === '') throw new Error('zset 编辑需要 member')
+        if (edit.op === 'set' || edit.op === 'add') {
+          const score = edit.value ?? '0'
+          if (!Number.isFinite(Number(score))) throw new Error(`分值不是数字：${score}`)
+          // ZADD with the same member updates the score in place.
+          const added = Number(await client.call('ZADD', key, score, edit.member))
+          return after(added)
+        }
+        if (edit.op === 'delete') {
+          const removed = Number(await client.call('ZREM', key, edit.member))
+          return after(removed)
+        }
+        throw new Error(`zset 不支持的操作：${edit.op}`)
+      }
+
+      default:
+        throw new Error(`键「${key}」的类型是 ${type}，不支持元素编辑`)
+    }
   }
 
   /**

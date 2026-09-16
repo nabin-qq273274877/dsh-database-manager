@@ -4,29 +4,23 @@ import * as React from 'react'
  * is a root node and each database's keys are grouped into folders by their
  * `:`-separated name segments.
  *
+ * Folders are loaded ONE LEVEL AT A TIME from the host. That is the difference
+ * that makes a production-sized database usable: an earlier version scanned the
+ * whole keyspace up front and grouped it here, which capped a 480k-key database
+ * at 20k keys and paid a TYPE/TTL round trip per key before anything rendered.
+ * Now, expanding a folder costs one bounded scan of that folder, and a folder
+ * nobody opens is never read.
+ *
  * The database level lives in this component rather than in a separate picker
  * because that is what the reference UI does, and because it is the only layout
  * in which a key's full identity — database AND name — is visible at once. The
- * selection therefore carries its database, so an action can never be applied
- * to the wrong one.
- *
- * Kept apart from the view that owns the connection state so the tree's own
- * rules — expand/collapse, filtering, which node is selected, what a folder
- * delete confirms — stay readable without threading the panel's async state
- * through them.
+ * selection therefore carries its database, so an action can never be applied to
+ * the wrong one.
  */
 
 import type { RedisKeyInfo, RedisCreatableType } from '../protocol.ts'
 import { REDIS_CREATABLE_TYPES } from '../protocol.ts'
-import {
-  type RedisFolderNode,
-  type RedisTree,
-  contentPlaceholder,
-  createPrefix,
-  parseElements,
-  parseKeyNames,
-  usesElementLines,
-} from './redis-tree.ts'
+import { contentPlaceholder, createPrefix, parseElements, parseKeyNames, usesElementLines } from './redis-tree.ts'
 import { Modal, t } from './ui.ts'
 
 /** One database root node. */
@@ -34,6 +28,28 @@ export interface RedisDbNode {
   db: number
   /** Keys this database holds (from INFO keyspace; 0 when it holds none). */
   keys: number
+}
+
+/** One folder row, as the host reported it for its level. */
+export interface RedisFolderRow {
+  name: string
+  path: string
+  /** Keys under it, INCLUDING a key that shares its name — i.e. what deleting it removes. */
+  keys: number
+}
+
+/** One loaded level (or the absence of it before it is loaded). */
+export interface RedisLevel {
+  folders: RedisFolderRow[]
+  keys: RedisKeyInfo[]
+  /** True when the row list was cut short. */
+  truncated: boolean
+  /** How many keys live at this level, whether or not all were returned. */
+  keysAtLevel: number
+  /** True while the fetch is in flight. */
+  loading?: boolean
+  /** Set when the fetch failed. */
+  error?: string
 }
 
 /**
@@ -68,26 +84,22 @@ export function leafName(key: string): string {
   return at === -1 ? key : key.slice(at + 1)
 }
 
-/** How many keys a folder holds in total, including nested folders. */
-function countFolderKeys(folder: RedisFolderNode): number {
-  let total = folder.keys.length
-  for (const child of folder.folders) total += countFolderKeys(child)
-  return total
-}
-
 /** Props for {@link RedisKeyTree}. */
 export interface RedisKeyTreeProps {
   /** Every database the server exposes, in order. */
   databases: RedisDbNode[]
-  /** Loaded trees, per database; absent = never scanned. */
-  trees: Record<number, RedisTree | undefined>
-  /** Databases whose scan is in flight. */
-  loadingDbs: Record<number, boolean>
+  /** Levels by `${db}\u0000${prefix}`; absent = not loaded yet. */
+  levels: Record<string, RedisLevel | undefined>
   /** Expanded databases. */
   openDbs: Record<number, boolean>
-  /** Expanded folders, per database and path. */
+  /** Expanded folder paths, per database. */
   openFolders: Record<number, Record<string, boolean> | undefined>
-  /** The name filter, applied to keys within whichever databases are loaded. */
+  /**
+   * The name filter. Applied host-side is not possible (levels are scanned
+   * independently), so it filters the ROWS already loaded — the tree still opens
+   * folders by hand. Its purpose is narrowing a large level, not searching the
+   * database.
+   */
   filter: string
   selection: RedisSelection
   /** The key whose value is on screen, marked active. */
@@ -102,9 +114,19 @@ export interface RedisKeyTreeProps {
   onDeleteFolder(db: number, path: string): void
 }
 
-/** The key tree, spanning every database. */
+/** The key used to look one level up. */
+export function levelKey(db: number, prefix: string): string {
+  return `${db}\u0000${prefix}`
+}
+
+/** Whether a key name matches the filter (empty filter matches all). */
+function matchesFilter(key: string, filter: string): boolean {
+  return filter === '' || key.toLowerCase().includes(filter.toLowerCase())
+}
+
+/** The key tree, spanning every database and loading one level at a time. */
 export function RedisKeyTree(props: RedisKeyTreeProps): React.ReactElement {
-  const { databases, trees, loadingDbs, openDbs, openFolders, filter, selection, activeKey } = props
+  const { databases, levels, openDbs, openFolders, filter, selection, activeKey } = props
 
   /** One key leaf. */
   const renderKey = (db: number, info: RedisKeyInfo, depth: number): unknown =>
@@ -112,9 +134,10 @@ export function RedisKeyTree(props: RedisKeyTreeProps): React.ReactElement {
       'div',
       {
         key: `key-${db}-${info.key}`,
-        className: `dbm-tree-node dbm-tree-depth-${Math.min(depth, 6)}`,
+        className: `dbm-tree-node dbm-tree-depth-${Math.min(depth, 8)}`,
         'data-active': String(activeKey?.db === db && activeKey.key === info.key),
         'data-kind': 'key',
+        'data-key': info.key,
         title: info.key,
         role: 'treeitem',
         onClick: () => props.onSelectKey(db, info.key),
@@ -145,78 +168,121 @@ export function RedisKeyTree(props: RedisKeyTreeProps): React.ReactElement {
       ),
     )
 
-  /** One folder and, when expanded, its children. */
-  const renderFolder = (db: number, folder: RedisFolderNode, depth: number): unknown[] => {
-    const isOpen = openFolders[db]?.[folder.path] === true
-    const selected = selection?.kind === 'folder' && selection.db === db && selection.path === folder.path
-    const rows: unknown[] = [
-      React.createElement(
-        'div',
-        {
-          key: `folder-${db}-${folder.path}`,
-          className: `dbm-tree-node dbm-tree-depth-${Math.min(depth, 6)}`,
-          'data-active': String(selected),
-          'data-kind': 'folder',
-          title: folder.path,
-          role: 'treeitem',
-          'aria-expanded': isOpen,
-          // A folder row is both "select it" (so an action can target it) and
-          // "open it". The row does both on one click, which is what RDM does.
-          onClick: () => {
-            props.onSelectFolder(db, folder.path, folder.name)
-            props.onToggleFolder(db, folder.path)
-          },
-        },
-        React.createElement('span', { className: 'dbm-tree-caret' }, isOpen ? '▾' : '▸'),
-        React.createElement('span', { className: 'dbm-tree-glyph' }, isOpen ? '📂' : '📁'),
-        React.createElement('span', { className: 'dbm-tree-name dbm-mono' }, folder.name),
-        React.createElement('span', { className: 'dbm-tree-meta' }, t('redisdb.keyCount', { n: countFolderKeys(folder) })),
+  /** One loaded level's folder rows and key rows, at a given depth. */
+  const renderLevel = (db: number, prefix: string, depth: number): unknown[] => {
+    const level = levels[levelKey(db, prefix)]
+    const rows: unknown[] = []
+
+    if (level === undefined) {
+      rows.push(React.createElement('div', {
+        key: `loading-${db}-${prefix}`,
+        className: `dbm-tree-hint dbm-tree-depth-${Math.min(depth, 8)} dbm-hint`,
+      }, t('redisdb.loading')))
+      return rows
+    }
+    if (level.loading === true && level.folders.length === 0 && level.keys.length === 0) {
+      rows.push(React.createElement('div', {
+        key: `loading-${db}-${prefix}`,
+        className: `dbm-tree-hint dbm-tree-depth-${Math.min(depth, 8)} dbm-hint`,
+      }, t('redisdb.loading')))
+      return rows
+    }
+    if (level.error !== undefined) {
+      rows.push(React.createElement('div', {
+        key: `err-${db}-${prefix}`,
+        className: `dbm-tree-hint dbm-tree-depth-${Math.min(depth, 8)} dbm-error`,
+      }, level.error))
+      return rows
+    }
+
+    const folders = level.folders.filter(folder => filter === '' || matchesFilter(folder.name, filter))
+    const keys = level.keys.filter(info => matchesFilter(info.key, filter))
+
+    if (folders.length === 0 && keys.length === 0) {
+      rows.push(React.createElement('div', {
+        key: `empty-${db}-${prefix}`,
+        className: `dbm-tree-hint dbm-tree-depth-${Math.min(depth, 8)} dbm-hint`,
+      }, filter === '' ? t('redisdb.empty') : t('redis.noKeys')))
+      return rows
+    }
+
+    for (const folder of folders) {
+      const isOpen = openFolders[db]?.[folder.path] === true
+      const selected = selection?.kind === 'folder' && selection.db === db && selection.path === folder.path
+      rows.push(
         React.createElement(
-          'span',
-          { className: 'dbm-tree-actions' },
-          React.createElement(
-            'button',
-            {
-              type: 'button',
-              className: 'dbm-icon-btn',
-              title: t('action.newKeyInFolder'),
-              'aria-label': t('action.newKeyInFolder'),
-              onClick: (event: { stopPropagation(): void }) => {
-                event.stopPropagation()
-                props.onCreate(db, folder.path)
-              },
+          'div',
+          {
+            key: `folder-${db}-${folder.path}`,
+            className: `dbm-tree-node dbm-tree-depth-${Math.min(depth, 8)}`,
+            'data-active': String(selected),
+            'data-kind': 'folder',
+            'data-path': folder.path,
+            title: folder.path,
+            role: 'treeitem',
+            'aria-expanded': isOpen,
+            // A folder row is both "select it" (so an action can target it) and
+            // "open it". The row does both on one click, which is what RDM does.
+            onClick: () => {
+              props.onSelectFolder(db, folder.path, folder.name)
+              props.onToggleFolder(db, folder.path)
             },
-            '＋',
-          ),
+          },
+          React.createElement('span', { className: 'dbm-tree-caret' }, isOpen ? '▾' : '▸'),
+          React.createElement('span', { className: 'dbm-tree-glyph' }, isOpen ? '📂' : '📁'),
+          React.createElement('span', { className: 'dbm-tree-name dbm-mono' }, folder.name),
+          React.createElement('span', { className: 'dbm-tree-meta' }, String(folder.keys)),
           React.createElement(
-            'button',
-            {
-              type: 'button',
-              className: 'dbm-icon-btn dbm-icon-btn-danger',
-              title: t('action.deleteFolder'),
-              'aria-label': t('action.deleteFolder'),
-              onClick: (event: { stopPropagation(): void }) => {
-                event.stopPropagation()
-                props.onDeleteFolder(db, folder.path)
+            'span',
+            { className: 'dbm-tree-actions' },
+            React.createElement(
+              'button',
+              {
+                type: 'button',
+                className: 'dbm-icon-btn',
+                title: t('action.newKeyInFolder'),
+                'aria-label': t('action.newKeyInFolder'),
+                onClick: (event: { stopPropagation(): void }) => {
+                  event.stopPropagation()
+                  props.onCreate(db, folder.path)
+                },
               },
-            },
-            '🗑',
+              '＋',
+            ),
+            React.createElement(
+              'button',
+              {
+                type: 'button',
+                className: 'dbm-icon-btn dbm-icon-btn-danger',
+                title: t('action.deleteFolder'),
+                'aria-label': t('action.deleteFolder'),
+                onClick: (event: { stopPropagation(): void }) => {
+                  event.stopPropagation()
+                  props.onDeleteFolder(db, folder.path)
+                },
+              },
+              '🗑',
+            ),
           ),
         ),
-      ),
-    ]
+      )
+      if (isOpen) rows.push(...renderLevel(db, folder.path, depth + 1))
+    }
 
-    if (!isOpen) return rows
-    for (const child of folder.folders) rows.push(...renderFolder(db, child, depth + 1))
-    for (const info of folder.keys) rows.push(renderKey(db, info, depth + 1))
+    for (const info of keys) rows.push(renderKey(db, info, depth))
+
+    if (level.truncated) {
+      rows.push(React.createElement('div', {
+        key: `trunc-${db}-${prefix}`,
+        className: `dbm-tree-hint dbm-tree-depth-${Math.min(depth, 8)} dbm-hint`,
+      }, t('redisdb.levelTruncated', { shown: level.keys.length, total: level.keysAtLevel })))
+    }
     return rows
   }
 
   const rows: unknown[] = []
   for (const node of databases) {
     const isOpen = openDbs[node.db] === true
-    const tree = trees[node.db]
-    const loading = loadingDbs[node.db] === true
     const selected = selection?.kind === 'db' && selection.db === node.db
 
     rows.push(
@@ -227,6 +293,7 @@ export function RedisKeyTree(props: RedisKeyTreeProps): React.ReactElement {
           className: 'dbm-tree-node dbm-tree-depth-0',
           'data-active': String(selected),
           'data-kind': 'db',
+          'data-db': String(node.db),
           title: t('redisdb.dbSummary', { n: node.db, keys: node.keys }),
           role: 'treeitem',
           'aria-expanded': isOpen,
@@ -235,7 +302,7 @@ export function RedisKeyTree(props: RedisKeyTreeProps): React.ReactElement {
         React.createElement('span', { className: 'dbm-tree-caret' }, isOpen ? '▾' : '▸'),
         React.createElement('span', { className: 'dbm-tree-glyph' }, '🗄'),
         React.createElement('span', { className: 'dbm-tree-name' }, `db${node.db}`),
-        React.createElement('span', { className: 'dbm-tree-meta' }, t('redisdb.keyCount', { n: node.keys })),
+        React.createElement('span', { className: 'dbm-tree-meta' }, String(node.keys)),
         React.createElement(
           'span',
           { className: 'dbm-tree-actions' },
@@ -257,33 +324,7 @@ export function RedisKeyTree(props: RedisKeyTreeProps): React.ReactElement {
       ),
     )
 
-    if (!isOpen) continue
-
-    if (tree === undefined) {
-      rows.push(React.createElement('div', {
-        key: `loading-${node.db}`,
-        className: 'dbm-tree-hint dbm-tree-depth-1 dbm-hint',
-      }, loading ? t('redisdb.loading') : t('redisdb.empty')))
-      continue
-    }
-
-    if (tree.folders.length === 0 && tree.keys.length === 0) {
-      rows.push(React.createElement('div', {
-        key: `empty-${node.db}`,
-        className: 'dbm-tree-hint dbm-tree-depth-1 dbm-hint',
-      }, filter === '' ? t('redisdb.empty') : t('redis.noKeys')))
-      continue
-    }
-
-    for (const folder of tree.folders) rows.push(...renderFolder(node.db, folder, 1))
-    for (const info of tree.keys) rows.push(renderKey(node.db, info, 1))
-
-    if (tree.truncated) {
-      rows.push(React.createElement('div', {
-        key: `truncated-${node.db}`,
-        className: 'dbm-tree-hint dbm-tree-depth-1 dbm-hint',
-      }, t('redisdb.truncated', { n: tree.total })))
-    }
+    if (isOpen) rows.push(...renderLevel(node.db, '', 1))
   }
 
   return React.createElement('div', { role: 'tree' }, rows as never)

@@ -2,7 +2,7 @@
  * End-to-end browser check of the Redis panel's tree and its write actions.
  *
  * Drives a live dsh web UI with a headless Edge over CDP and exercises exactly
- * what the folder tree promises: every database is a root node, a key's `:`
+ * what the folder tree promises: every database is a root node, a key's :
  * segments become nested folders, and create/delete work from the tree's own
  * controls. It asserts on the rendered tree structure and on what the server
  * actually holds afterwards, so a tree that merely LOOKS right but deletes the
@@ -63,9 +63,14 @@ const treeRows = () => Array.from(document.querySelectorAll('.dbm-side-body [dat
     label: (el.querySelector('.dbm-tree-name') || {}).textContent?.trim() ?? '',
     depth: (el.className.match(/dbm-tree-depth-(\\d)/) || [])[1] ?? '?',
     active: el.getAttribute('data-active') === 'true',
+    expanded: el.getAttribute('aria-expanded'),
+    path: el.getAttribute('data-path') || el.getAttribute('data-key') || '',
     glyph: glyphs[glyphs.length - 1] ?? '',
   };
 });
+/** A folder row by its full path (unambiguous; labels repeat across levels). */
+const folderByPath = (path) => Array.from(document.querySelectorAll('.dbm-side-body [data-kind="folder"]'))
+  .find((el) => el.getAttribute('data-path') === path) || null;
 /** The folder row whose label matches, at any depth. */
 const folderRow = (label) => Array.from(document.querySelectorAll('.dbm-side-body [data-kind="folder"]'))
   .find((el) => ((el.querySelector('.dbm-tree-name') || {}).textContent || '').trim() === label) || null;
@@ -75,6 +80,16 @@ const keyRow = (label) => Array.from(document.querySelectorAll('.dbm-side-body [
 /** A row action button by its title. */
 const actionIn = (row, title) => Array.from(row.querySelectorAll('button'))
   .find((b) => (b.getAttribute('title') || '').includes(title)) || null;
+/** Open a folder (loading its level) if it is not already open. */
+const ensureOpen = async (path) => {
+  const el = folderByPath(path);
+  if (!el) return null;
+  if (el.getAttribute('aria-expanded') !== 'true') click(el);
+  return waitFor(() => {
+    const now = folderByPath(path);
+    return now && now.getAttribute('aria-expanded') === 'true' ? now : null;
+  }, 20000);
+};
 `
 
 /** Fill the flow with the run's own namespace. */
@@ -113,7 +128,9 @@ ${PRELUDE}
   }
   const dbCount = document.querySelectorAll('.dbm-side-body [data-kind="db"]').length;
   step('database roots', dbCount);
-  report.hasFlatKeyList = document.querySelectorAll('.dbm-side-body .dbm-tree-item').length > 0;
+  // The old design rendered flat key rows at the top level; that class is gone,
+  // so the check is on the SHAPE instead: the tree must start with db nodes.
+  report.firstLevelKinds = treeRows().map((row) => row.depth + ':' + row.kind);
 
   // 4. Open the target database if it is not already open.
   const isOpen = dbRow.getAttribute('aria-expanded') === 'true';
@@ -130,15 +147,15 @@ ${PRELUDE}
   }
   step('namespace folder rendered', NAMESPACE);
 
-  // 5. Folders nest by the ":" segments: namespace > app > config.
-  click(firstFolder);
-  const appFolder = await waitFor(() => folderRow('app'), 10000);
-  if (!appFolder) return JSON.stringify({ ...report, fatal: 'second-level folder missing', tree: treeRows() });
-  click(appFolder);
-  const configFolder = await waitFor(() => folderRow('config'), 10000);
-  if (!configFolder) return JSON.stringify({ ...report, fatal: 'third-level folder missing', tree: treeRows() });
-  click(configFolder);
-  const leaf = await waitFor(() => keyRow('db'), 10000);
+  // 5. Folders nest by the ":" segments, each level fetched on demand. Every
+  //    open is by full path: labels repeat across levels, and clicking the wrong
+  //    row would collapse what was just opened.
+  const ns = NAMESPACE.replace(/:$/, '');
+  if (!(await ensureOpen(ns))) return JSON.stringify({ ...report, fatal: 'namespace folder did not open', tree: treeRows() });
+  if (!(await ensureOpen(ns + ':app'))) return JSON.stringify({ ...report, fatal: 'app folder missing', tree: treeRows() });
+  const configFolder = await ensureOpen(ns + ':app:config');
+  if (!configFolder) return JSON.stringify({ ...report, fatal: 'config folder missing', tree: treeRows() });
+  const leaf = await waitFor(() => keyRow('db'), 20000);
   if (!leaf) return JSON.stringify({ ...report, fatal: 'leaf key missing under nested folders', tree: treeRows() });
   step('nested folders expanded', true);
   report.tree = treeRows();

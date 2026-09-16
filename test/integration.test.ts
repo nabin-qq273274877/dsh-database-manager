@@ -636,5 +636,77 @@ describe.skipIf(!available)('built host half', () => {
       const response = await fetch(`${base}/sources/ghost/redis/prefix?prefix=a&db=0`, { method: 'DELETE' })
       expect(response.status).toBe(404)
     })
+
+    it('rejects a level scan on a SQL source', async () => {
+      const response = await fetch(`${base}/sources/app/redis/level?db=0&prefix=`)
+      expect(response.status).toBe(400)
+      expect(((await response.json()) as { error: string }).error).toMatch(/Redis/)
+    })
+
+    it('requires a key for every value-editing route', async () => {
+      // Each edit route must name the field it is missing rather than reaching
+      // an engine with a half-formed request.
+      for (const action of ['redis/string', 'redis/ttl', 'redis/element']) {
+        const response = await fetch(`${base}/sources/${redisId}/${action}?db=0`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({}),
+        })
+        expect(response.status).toBe(400)
+        expect(((await response.json()) as { error: string }).error).toMatch(/key is required/)
+      }
+    })
+
+    it('requires a string value when writing a string', async () => {
+      const response = await fetch(`${base}/sources/${redisId}/redis/string?db=0`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ key: 'k', value: 42 }),
+      })
+      expect(response.status).toBe(400)
+      expect(((await response.json()) as { error: string }).error).toMatch(/value must be a string/)
+    })
+
+    it('accepts null as "no expiry" and rejects a non-numeric TTL', async () => {
+      // null is the explicit "make permanent"; a bare 0 would be ambiguous with
+      // an empty form field, and EXPIRE 0 would DELETE the key.
+      const bad = await fetch(`${base}/sources/${redisId}/redis/ttl?db=0`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ key: 'k', ttl: 'soon' }),
+      })
+      expect(bad.status).toBe(400)
+      expect(((await bad.json()) as { error: string }).error).toMatch(/ttl must be a number of seconds, or null/)
+    })
+
+    it('rejects an unknown element op and a bad index', async () => {
+      const badOp = await fetch(`${base}/sources/${redisId}/redis/element?db=0`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ key: 'k', op: 'munge' }),
+      })
+      expect(badOp.status).toBe(400)
+      expect(((await badOp.json()) as { error: string }).error).toMatch(/op must be one of/)
+
+      const badIndex = await fetch(`${base}/sources/${redisId}/redis/element?db=0`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ key: 'k', op: 'set', index: -1, value: 'x' }),
+      })
+      expect(badIndex.status).toBe(400)
+      expect(((await badIndex.json()) as { error: string }).error).toMatch(/index must be a non-negative integer/)
+    })
+
+    it('refuses the value-editing routes on a SQL source', async () => {
+      for (const action of ['redis/string', 'redis/ttl', 'redis/element']) {
+        const response = await fetch(`${base}/sources/app/${action}?db=0`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ key: 'k', value: 'v' }),
+        })
+        expect(response.status).toBe(400)
+        expect(((await response.json()) as { error: string }).error).toMatch(/Redis/)
+      }
+    })
   })
 })

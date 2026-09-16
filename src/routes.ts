@@ -25,6 +25,7 @@ import type {
   RedisCreateResult,
   RedisDeletePrefixResult,
   RedisDeleteResult,
+  RedisElementEdit,
   RedisPrefixCount,
 } from './protocol.ts'
 import { REDIS_CREATABLE_TYPES } from './protocol.ts'
@@ -103,6 +104,52 @@ function readStringArray(value: unknown, what: string): string[] | undefined {
 /** Whether an unknown value is one of the creatable Redis key types. */
 function isCreatableType(value: unknown): value is RedisCreatableType {
   return typeof value === 'string' && (REDIS_CREATABLE_TYPES as readonly string[]).includes(value)
+}
+
+/**
+ * Validate one element-edit request.
+ *
+ * The driver re-checks each op against the key's live type; this layer rejects
+ * the shapes that cannot be valid at all, so a malformed request fails with a
+ * field name instead of reaching an engine.
+ *
+ * @param body - the parsed JSON request body.
+ * @returns the edit, or a message naming the first problem.
+ */
+function parseElementEdit(body: Record<string, unknown>): { edit: RedisElementEdit } | { error: string } {
+  const rawOp = body['op']
+  if (rawOp !== 'set' && rawOp !== 'delete' && rawOp !== 'push' && rawOp !== 'add') {
+    return { error: 'op must be one of set, delete, push, add' }
+  }
+
+  let index: number | undefined
+  if (body['index'] !== undefined && body['index'] !== null) {
+    if (typeof body['index'] !== 'number' || !Number.isInteger(body['index']) || body['index'] < 0) {
+      return { error: 'index must be a non-negative integer' }
+    }
+    index = body['index']
+  }
+
+  let member: string | undefined
+  if (body['member'] !== undefined && body['member'] !== null) {
+    if (typeof body['member'] !== 'string') return { error: 'member must be a string' }
+    member = body['member']
+  }
+
+  let value: string | undefined
+  if (body['value'] !== undefined && body['value'] !== null) {
+    if (typeof body['value'] !== 'string') return { error: 'value must be a string' }
+    value = body['value']
+  }
+
+  return {
+    edit: {
+      op: rawOp,
+      ...(index === undefined ? {} : { index }),
+      ...(member === undefined ? {} : { member }),
+      ...(value === undefined ? {} : { value }),
+    },
+  }
 }
 
 /**
@@ -627,6 +674,105 @@ export function makeRoutes(deps: RoutesDeps): { routes: WebRoute[]; upgrade: Web
           ...(queryParam(url, 'pattern') === undefined ? {} : { pattern: queryParam(url, 'pattern')! }),
         })
         writeJson(res, 200, { page })
+        return
+      }
+
+      // The tree's lazy-load endpoint: one folder level, one bounded scan.
+      if (action === 'redis/level' && method === 'GET') {
+        if (!isRedisDriver(driver)) {
+          writeError(res, 400, 'redis/level is only available for Redis data sources')
+          return
+        }
+        const page = await driver.level({
+          db: queryInt(url, 'db', entry.db ?? 0),
+          prefix: queryParam(url, 'prefix') ?? '',
+          // Fetching TYPE/TTL costs a round trip per batch; a caller that only
+          // wants the folder shape (the root of a huge database) can skip it.
+          withTypes: queryParam(url, 'withTypes') !== '0',
+        })
+        writeJson(res, 200, { page })
+        return
+      }
+
+      // ---- Redis value editing (the USER surface) -------------------------
+      // Same authorization model as the row editor: the user pressing 保存 in
+      // the panel is the authorization. Model-initiated writes still go through
+      // the agent tools and the auth gate.
+      if (action === 'redis/string' && method === 'POST') {
+        if (!isRedisDriver(driver)) {
+          writeError(res, 400, 'redis/string is only available for Redis data sources')
+          return
+        }
+        const body = asJsonObject(await readJsonBody(req))
+        if (body === undefined) {
+          writeError(res, 400, 'body must be a JSON object')
+          return
+        }
+        const key = typeof body['key'] === 'string' && body['key'] !== '' ? body['key'] : undefined
+        if (key === undefined) {
+          writeError(res, 400, 'key is required')
+          return
+        }
+        if (typeof body['value'] !== 'string') {
+          writeError(res, 400, 'value must be a string')
+          return
+        }
+        const result = await driver.setString(key, body['value'], queryInt(url, 'db', entry.db ?? 0))
+        writeJson(res, 200, { result })
+        return
+      }
+
+      if (action === 'redis/ttl' && method === 'POST') {
+        if (!isRedisDriver(driver)) {
+          writeError(res, 400, 'redis/ttl is only available for Redis data sources')
+          return
+        }
+        const body = asJsonObject(await readJsonBody(req))
+        if (body === undefined) {
+          writeError(res, 400, 'body must be a JSON object')
+          return
+        }
+        const key = typeof body['key'] === 'string' && body['key'] !== '' ? body['key'] : undefined
+        if (key === undefined) {
+          writeError(res, 400, 'key is required')
+          return
+        }
+        // `null`/absent means "no expiry"; a number is seconds. Both are
+        // explicit, so an empty form field is never silently a delete.
+        let seconds: number
+        if (body['ttl'] === null || body['ttl'] === undefined) seconds = -1
+        else if (typeof body['ttl'] === 'number' && Number.isFinite(body['ttl'])) seconds = body['ttl']
+        else {
+          writeError(res, 400, 'ttl must be a number of seconds, or null for no expiry')
+          return
+        }
+        const result = await driver.setTtl(key, seconds, queryInt(url, 'db', entry.db ?? 0))
+        writeJson(res, 200, { result })
+        return
+      }
+
+      if (action === 'redis/element' && method === 'POST') {
+        if (!isRedisDriver(driver)) {
+          writeError(res, 400, 'redis/element is only available for Redis data sources')
+          return
+        }
+        const body = asJsonObject(await readJsonBody(req))
+        if (body === undefined) {
+          writeError(res, 400, 'body must be a JSON object')
+          return
+        }
+        const key = typeof body['key'] === 'string' && body['key'] !== '' ? body['key'] : undefined
+        if (key === undefined) {
+          writeError(res, 400, 'key is required')
+          return
+        }
+        const edit = parseElementEdit(body)
+        if ('error' in edit) {
+          writeError(res, 400, edit.error)
+          return
+        }
+        const result = await driver.editElement(key, edit.edit, queryInt(url, 'db', entry.db ?? 0))
+        writeJson(res, 200, { result })
         return
       }
 
