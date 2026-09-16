@@ -122,7 +122,7 @@ export function DatabasePanel(props: DatabasePanelProps): React.ReactElement {
       engines,
       reload,
       saveGate,
-      onConnect: (source: DataSourceSummary) => { void connect(source) },
+      onConnect: (source: DataSourceSummary) => connect(source),
       onBack: onClose,
     })
   }

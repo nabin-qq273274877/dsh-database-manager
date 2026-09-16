@@ -26,7 +26,7 @@ export interface SourceListViewProps {
   /** Persist a write-posture patch. */
   saveGate(patch: Partial<GateSettingsView>): Promise<void>
   /** Open one data source's database panel. */
-  onConnect(source: DataSourceSummary): void
+  onConnect(source: DataSourceSummary): Promise<void> | void
   /** Leave the panel and hand the centre column back to the conversation. */
   onBack(): void
 }
@@ -91,6 +91,15 @@ export function SourceListView(props: SourceListViewProps): React.ReactElement {
   const [term, setTerm] = React.useState('')
   const [groupMode, setGroupMode] = React.useState<GroupMode>('none')
   const [tests, setTests] = React.useState<Record<string, TestState>>({})
+  /**
+   * The source whose 连接 request is in flight, if any.
+   *
+   * Connecting is not instant when the server is unreachable: the driver waits
+   * out its deadline (10 s by default) before reporting the failure, and until
+   * now the button looked inert for that whole time — the one control the user
+   * just pressed was the only thing not saying anything.
+   */
+  const [connecting, setConnecting] = React.useState<string | undefined>(undefined)
   const [error, setError] = React.useState<string | undefined>(undefined)
   const [editing, setEditing] = React.useState<DataSourceSummary | undefined>(undefined)
   const [creating, setCreating] = React.useState(false)
@@ -107,6 +116,23 @@ export function SourceListView(props: SourceListViewProps): React.ReactElement {
       setTests(current => ({ ...current, [source.id]: { status: 'done', result } }))
     } catch (failure) {
       setTests(current => ({ ...current, [source.id]: { status: 'done', result: { ok: false, error: failure instanceof Error ? failure.message : String(failure) } } }))
+    }
+  }
+
+  /**
+   * Open one source, showing progress on the button for as long as it takes.
+   *
+   * The promise is awaited so the busy state covers the whole round trip, and
+   * the click is ignored while one is in flight — a second press would open a
+   * second connection attempt for the same row.
+   */
+  const connect = async (source: DataSourceSummary): Promise<void> => {
+    if (connecting !== undefined) return
+    setConnecting(source.id)
+    try {
+      await onConnect(source)
+    } finally {
+      setConnecting(undefined)
     }
   }
 
@@ -181,7 +207,28 @@ export function SourceListView(props: SourceListViewProps): React.ReactElement {
                 { type: 'button', className: 'dbm-btn dbm-btn-sm', disabled: test?.status === 'running', onClick: () => { void runTest(source) } },
                 test?.status === 'running' ? t('action.testing') : t('action.test'),
               ),
-              React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-sm dbm-btn-primary', onClick: () => onConnect(source) }, t('action.connect')),
+              /*
+               * The connect button shows its own progress, in the same way the
+               * 测试 button does. A spinner is added rather than only swapping
+               * the label, because on a dead host the wait is the driver's full
+               * deadline and a word alone reads as a state, not as activity.
+               */
+              React.createElement(
+                'button',
+                {
+                  type: 'button',
+                  className: `dbm-btn dbm-btn-sm dbm-btn-primary${connecting === source.id ? ' dbm-btn-busy' : ''}`,
+                  disabled: connecting !== undefined,
+                  'aria-busy': connecting === source.id ? 'true' : undefined,
+                  onClick: () => { void connect(source) },
+                },
+                connecting === source.id
+                  ? [
+                      React.createElement('span', { key: 'spin', className: 'dbm-spinner' }),
+                      t('db.connecting'),
+                    ]
+                  : t('action.connect'),
+              ),
               React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-sm', onClick: () => setEditing(source) }, t('action.edit')),
               React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-sm dbm-btn-danger', onClick: () => setDeleting(source) }, t('action.delete')),
             ),
