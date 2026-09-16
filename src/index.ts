@@ -16,6 +16,8 @@ import { makeRoutes } from './routes.ts'
 import { ConnectionPool } from './pool.ts'
 import { DataSourceStore } from './store.ts'
 import { makeTools } from './tools.ts'
+import { IndexRegistry } from './index-registry.ts'
+import { isRedisDriver } from './drivers/types.ts'
 import type { HostContext } from './llm-types.ts'
 
 /** Stable cordis plugin name. */
@@ -59,6 +61,21 @@ function applyImpl(ctx: HostContext, config?: Config): void {
   const pool = new ConnectionPool(store)
   ctx.effect(() => () => { pool.dispose() }, 'dsh-database-manager: pool')
 
+  /**
+   * Cached keyspace trees, one per source and database.
+   *
+   * The resolver is lazy and goes through the pool, so the registry holds no client
+   * of its own: a connection change or an idle drop is handled by the pool alone.
+   * Only the Redis driver can be indexed, so anything else is rejected here rather
+   * than surfacing as a confusing failure mid-walk.
+   */
+  const indexes = new IndexRegistry(async sourceId => {
+    const { driver } = pool.acquireById(sourceId)
+    if (!isRedisDriver(driver)) throw new Error(`data source "${sourceId}" is not a Redis source`)
+    return driver
+  })
+  ctx.effect(() => () => { indexes.disposeAll() }, 'dsh-database-manager: indexes')
+
   // The live write posture: the persisted file is the source of truth, and the
   // in-process snapshot keeps a dispatch from touching the disk.
   let gate: GateSettings = { ...DEFAULT_GATE_SETTINGS, ...store.settings() }
@@ -88,7 +105,7 @@ function applyImpl(ctx: HostContext, config?: Config): void {
     'dsh-database-manager: authorization gate',
   )
 
-  const { routes } = makeRoutes({ store, pool, gate: readGate, saveGate })
+  const { routes } = makeRoutes({ store, pool, indexes, gate: readGate, saveGate })
   disposeRoutes = ctx.effect(
     () => {
       const disposers = routes.map(route => ctx.webServer!.register(route))

@@ -24,7 +24,7 @@ import type {
   TestResult,
 } from '../protocol.ts'
 import { toWireValue } from '../sql-util.ts'
-import { SEPARATOR, escapeGlob, keyPattern, prefixPattern } from '../redis-util.ts'
+import { SEPARATOR, compareKeyNames, escapeGlob, keyPattern, prefixPattern } from '../redis-util.ts'
 import type { RedisDriver as RedisDriverContract } from './types.ts'
 
 /** Structural view of the ioredis surface this driver uses. */
@@ -131,34 +131,6 @@ const MAX_LEVEL_KEYS_RETURNED = 5000
  * reported, so a partial list is never presented as the whole answer.
  */
 const MAX_SEARCH_KEYS = 5000
-
-/**
- * Order two key names the way the tree displays them.
- *
- * Deliberately NOT `localeCompare`. Measured on 200k shuffled keys: an ICU
- * collation sort took 23.3 s, versus 166 ms for this — the difference between a
- * level that renders and one that appears hung. `localeCompare` earns its cost
- * on human-language strings; Redis key names are identifiers, and the ordering
- * users expect from them (RedisDesktopManager, redis-cli, a byte-wise `SORT`) is
- * code-unit order.
- *
- * Case is folded first so `App` and `app` group together as they did before this
- * change — dropping that would silently reorder every mixed-case tree. The fold
- * is done inside the comparator rather than by precomputing a lowercase copy of
- * every name, which would double the peak memory of a 200k-key level for no
- * measurable gain.
- */
-function compareKeyNames(a: string, b: string): number {
-  const x = a.toLowerCase()
-  const y = b.toLowerCase()
-  if (x < y) return -1
-  if (x > y) return 1
-  // Same folded form: fall back to the exact strings so the order is total
-  // (`a` and `A` must not compare equal, or Array#sort's result is unspecified).
-  if (a < b) return -1
-  if (a > b) return 1
-  return 0
-}
 
 /** Cap for the whole-database {@link RedisDriver.tree} helper (tests, exports). */
 const MAX_TREE_KEYS = 50000
@@ -946,6 +918,19 @@ export class RedisDriver implements RedisDriverContract {
    * level unusable. `pipeline()` sends the whole batch and reads the replies
    * together, so a 10k-key level costs two round trips per batch instead of 20k.
    */
+  /**
+   * Fetch TYPE and TTL for a list of keys, for a caller that has names but no client.
+   *
+   * The keyspace index route needs this: it holds key names (from the index) and
+   * must add row metadata before rendering. It is a thin wrapper so the pipelining
+   * rule stays in one place — one round trip per batch, never one per key.
+   */
+  async describeKeysPublic(db: number, names: string[]): Promise<RedisKeyInfo[]> {
+    if (names.length === 0) return []
+    const client = await this.client(db)
+    return this.describeKeys(client, names)
+  }
+
   private async describeKeys(client: RedisClient, names: string[]): Promise<RedisKeyInfo[]> {
     const out: RedisKeyInfo[] = []
     for (let i = 0; i < names.length; i += TREE_PIPELINE_BATCH) {

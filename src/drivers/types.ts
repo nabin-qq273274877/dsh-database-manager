@@ -12,6 +12,7 @@ import type {
   RedisDeletePrefixResult,
   RedisElementEdit,
   RedisInfo,
+  RedisKeyInfo,
   RedisKeyPage,
   RedisLevelPage,
   RedisMutationResult,
@@ -24,6 +25,7 @@ import type {
   TestResult,
   DataSourceEntry,
 } from '../protocol.ts'
+import type { AggregateBatch } from './redis.ts'
 
 /** Filters and paging for one table read. */
 export interface RowQuery {
@@ -100,6 +102,23 @@ export interface RedisDriver {
   level(input: { db: number; prefix: string; withTypes: boolean }): Promise<RedisLevelPage>
   /** Search one database with a Redis glob pattern (server-side SCAN MATCH). */
   search(input: { db: number; pattern: string }): Promise<RedisSearchPage>
+  /**
+   * Fold one bounded batch of the keyspace into counts, server-side.
+   *
+   * Null when the server rejects scripting (EVAL), which lets the host fall back to
+   * folding on the host instead of failing outright. See the driver's documentation
+   * for why the fold happens server-side at all.
+   */
+  aggregateBatch(input: {
+    db?: number
+    cursor: string
+    batchKeys: number
+    nameBudget: number
+  }): Promise<AggregateBatch | null>
+  /** One database's key count (DBSIZE), O(1) — used to size an index walk. */
+  keyCount(db: number): Promise<number>
+  /** TYPE and TTL for a list of key names, in batched round trips. */
+  describeKeysPublic(db: number, names: string[]): Promise<RedisKeyInfo[]>
   /** Every key in one database matching a pattern (bounded; reports truncation). */
   tree(input: { db: number; pattern?: string }): Promise<RedisTreePage>
   /** Read one key's full value (bounded by `limit` per collection). */

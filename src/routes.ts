@@ -26,17 +26,29 @@ import type {
   RedisDeletePrefixResult,
   RedisDeleteResult,
   RedisElementEdit,
+  RedisKeyInfo,
   RedisPrefixCount,
 } from './protocol.ts'
 import { REDIS_CREATABLE_TYPES } from './protocol.ts'
 import { isRedisDriver, isSqlDriver, type Driver } from './drivers/types.ts'
 import { isRedisReadCommand } from './drivers/redis.ts'
+import type { IndexRegistry } from './index-registry.ts'
+import { estimateIndexCost, indexProgress, levelFromIndex } from './redis-index.ts'
+import { compareKeyNames } from './redis-util.ts'
 import { looksReadOnly } from './sql-util.ts'
 
 /** Everything the routes need from the plugin. */
 export interface RoutesDeps {
   store: DataSourceStore
   pool: ConnectionPool
+  /**
+   * Cached keyspace trees, one per source and database.
+   *
+   * Optional so an older caller (or a test) can omit it: the index routes then
+   * report "not built" instead of failing, and the panel falls back to the per-level
+   * scan. That keeps the feature additive rather than load-bearing.
+   */
+  indexes?: IndexRegistry
   /** Live agent-write posture, echoed to the panel's settings strip. */
   gate: () => GateSettings
   /** Persist a settings patch. */
@@ -701,6 +713,82 @@ export function makeRoutes(deps: RoutesDeps): { routes: WebRoute[]; upgrade: Web
       }
 
       // The tree's lazy-load endpoint: one folder level, one bounded scan.
+      // ---- Redis keyspace index -------------------------------------------
+      //
+      // A cached tree for one database, built by ONE walk of the keyspace. It
+      // exists because Redis has no prefix index and `SCAN MATCH p:*` still
+      // traverses everything, so listing each level separately would cost a full
+      // traversal per level opened. Three endpoints: estimate the cost, start or
+      // poll the walk, read one level.
+      if (action === 'redis/index/estimate' && method === 'GET') {
+        if (!isRedisDriver(driver)) {
+          writeError(res, 400, 'redis/index/estimate is only available for Redis data sources')
+          return
+        }
+        const db = queryInt(url, 'db', entry.db ?? 0)
+        // DBSIZE is O(1), so asking what a walk would cost does not itself load the
+        // server — which is the point of offering an estimate at all.
+        const dbSize = await driver.keyCount(db)
+        writeJson(res, 200, { estimate: estimateIndexCost(dbSize) })
+        return
+      }
+
+      if (action === 'redis/index/level' && method === 'GET') {
+        if (!isRedisDriver(driver)) {
+          writeError(res, 400, 'redis/index/level is only available for Redis data sources')
+          return
+        }
+        const db = queryInt(url, 'db', entry.db ?? 0)
+        const prefix = queryParam(url, 'prefix') ?? ''
+        const index = deps.indexes?.get(id, db)
+        if (index === undefined) {
+          writeError(res, 409, 'no index has been built for this database yet')
+          return
+        }
+        const level = levelFromIndex(index, prefix, compareKeyNames)
+        // A level reports row METADATA (type/TTL) for the keys it lists. That is one
+        // pipelined round trip per batch over at most a page of keys, and only for a
+        // level the user actually opened — unlike a per-key fetch over the whole
+        // database, which is the cost the index exists to avoid.
+        const keys = queryParam(url, 'withTypes') === '0'
+          ? level.keys.map(key => ({ key, type: 'unknown', ttl: -1 } satisfies RedisKeyInfo))
+          : await driver.describeKeysPublic(db, level.keys)
+        writeJson(res, 200, {
+          level: { folders: level.folders, keys, keysAtLevel: level.keysAtLevel, partial: level.partial },
+        })
+        return
+      }
+
+      if (action === 'redis/index') {
+        if (!isRedisDriver(driver)) {
+          writeError(res, 400, 'redis/index is only available for Redis data sources')
+          return
+        }
+        const db = queryInt(url, 'db', entry.db ?? 0)
+        if (method === 'DELETE') {
+          // Drops the cache, so the next GET rebuilds. Used after a bulk change the
+          // incremental updates cannot express.
+          deps.indexes?.invalidate(id, db)
+          writeJson(res, 200, { invalidated: true })
+          return
+        }
+        if (method !== 'GET') {
+          writeError(res, 405, `${method} is not allowed on ${path}`)
+          return
+        }
+        const indexes = deps.indexes
+        if (indexes === undefined) {
+          writeError(res, 503, 'keyspace indexing is not available in this host')
+          return
+        }
+        const dbSize = await driver.keyCount(db)
+        // Idempotent: a second call while a walk is running returns its progress
+        // rather than starting another traversal of the same database.
+        const index = await indexes.start(id, db, dbSize)
+        writeJson(res, 200, { status: indexProgress(index) })
+        return
+      }
+
       if (action === 'redis/level' && method === 'GET') {
         if (!isRedisDriver(driver)) {
           writeError(res, 400, 'redis/level is only available for Redis data sources')

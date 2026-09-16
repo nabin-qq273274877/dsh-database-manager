@@ -463,3 +463,105 @@ export function indexProgress(index: KeyspaceIndex): {
     ...(index.error === undefined ? {} : { error: index.error }),
   }
 }
+
+/** One aggregated batch, as the walker needs it (structurally the driver's reply). */
+export interface IndexBatchSource {
+  aggregateBatch(input: {
+    db: number
+    cursor: string
+    batchKeys: number
+    nameBudget: number
+  }): Promise<{
+    cursor: string
+    visited: number
+    folderDeltas: Map<string, number>
+    directCounts: Map<string, number>
+    leaves: Map<string, string[]>
+  } | null>
+}
+
+/**
+ * How many keys one aggregation call may examine.
+ *
+ * This is a SAFETY value, not a speed one. Redis executes a script on its single
+ * thread, so every millisecond a call takes is a millisecond every other client of
+ * that server waits. Measured at 100k keys a call blocked for 271-708 ms, which is
+ * already noticeable on a server carrying live traffic; 20k keeps the pause in the
+ * tens of milliseconds while still amortizing the round trip.
+ *
+ * A smaller batch does not make the walk slower in total — the server's traversal
+ * rate is the limit either way — it only divides the same work into more, shorter
+ * pauses.
+ */
+export const INDEX_BATCH_KEYS = 20_000
+
+/** Cap on key names one call returns, so a reply stays small on a huge level. */
+const INDEX_NAME_BUDGET_PER_CALL = 5_000
+
+/** Outcome of one advance of the walk. */
+export interface IndexAdvance {
+  /** Progress after this step. */
+  progress: ReturnType<typeof indexProgress>
+  /** True when this step finished the walk. */
+  done: boolean
+}
+
+/**
+ * Advance a keyspace walk by ONE bounded step.
+ *
+ * The walk is deliberately not a single long call: it is driven from the caller so
+ * the server can be paused between batches, and so a huge database can be built
+ * while the user watches progress instead of waiting on one opaque request.
+ *
+ * Returns whether this step completed the walk, so a caller can loop. A server that
+ * refuses scripting makes `aggregateBatch` return null, which is reported as an
+ * error rather than silently producing an empty tree — a caller must be able to tell
+ * "no folders" from "could not find out".
+ */
+export async function advanceIndex(
+  source: IndexBatchSource,
+  index: KeyspaceIndex,
+): Promise<IndexAdvance> {
+  if (index.done) return { progress: indexProgress(index), done: true }
+
+  const batch = await source.aggregateBatch({
+    db: index.db,
+    cursor: index.cursor,
+    batchKeys: INDEX_BATCH_KEYS,
+    nameBudget: INDEX_NAME_BUDGET_PER_CALL,
+  })
+
+  if (batch === null) {
+    index.error = 'this Redis server does not support scripting (EVAL), so a big database cannot be indexed quickly'
+    // Reported, not thrown: the caller decides whether to fall back or surface it.
+    return { progress: indexProgress(index), done: false }
+  }
+
+  mergeBatch(index, {
+    folderDeltas: batch.folderDeltas,
+    directCounts: batch.directCounts,
+    leaves: batch.leaves,
+    visited: batch.visited,
+  })
+  index.cursor = batch.cursor
+  index.done = batch.cursor === '0'
+  return { progress: indexProgress(index), done: index.done }
+}
+
+/**
+ * Whether a walk is worth starting, and what it will cost.
+ *
+ * Reported before any work happens so the caller can warn instead of surprising the
+ * user with a long, server-loading operation. The traversal rate is measured
+ * (~370k keys/s on a remote link), so this is an informed estimate rather than a
+ * guess, and it is what a confirmation prompt should show.
+ */
+export function estimateIndexCost(dbSize: number): {
+  keys: number
+  estimatedSeconds: number
+  isLarge: boolean
+} {
+  const KEYS_PER_SECOND = 370_000
+  const estimatedSeconds = Math.ceil(dbSize / KEYS_PER_SECOND)
+  return { keys: dbSize, estimatedSeconds, isLarge: estimatedSeconds >= 15 }
+}

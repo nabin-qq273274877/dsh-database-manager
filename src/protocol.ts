@@ -200,6 +200,50 @@ export interface RedisKeyInfo {
   size?: number
 }
 
+/**
+ * A keyspace index's state, as reported to the panel.
+ *
+ * The index is a complete folder tree for one database, built by walking the
+ * keyspace once. It exists because Redis has no prefix index and `SCAN MATCH p:*`
+ * still traverses everything, so listing each level separately would cost one full
+ * traversal per level opened. Building it once makes every later level immediate.
+ *
+ * `visited` against `dbSize` is the progress signal: a 19.5M-key database takes
+ * about a minute to walk, and showing real progress is what makes that tolerable
+ * instead of a spinner of unknown length.
+ */
+export interface RedisIndexStatus {
+  db: number
+  /** Keys the database holds (DBSIZE), i.e. the walk's total work. */
+  dbSize: number
+  /** Keys examined so far. */
+  visited: number
+  /** How many folders have been found. */
+  folders: number
+  /** True once the walk has covered the whole keyspace. */
+  done: boolean
+  /** Set when the walk cannot proceed (for example the server rejects EVAL). */
+  error?: string
+}
+
+/** One level of the index: its child folders and its own keys. */
+export interface RedisIndexLevel {
+  folders: Array<{ name: string; path: string; keys: number }>
+  /** Full key names sitting directly at this level. */
+  keys: RedisKeyInfo[]
+  /** How many keys sit at this level, which may exceed `keys.length`. */
+  keysAtLevel: number
+  /** True while the walk is still running, so this level may gain rows. */
+  partial: boolean
+}
+
+/** What a keyspace walk is expected to cost, so a caller can warn before starting. */
+export interface RedisIndexEstimate {
+  keys: number
+  estimatedSeconds: number
+  isLarge: boolean
+}
+
 /** A page of Redis keys (SCAN cursor based). */
 export interface RedisKeyPage {
   keys: RedisKeyInfo[]
@@ -476,6 +520,16 @@ export const DB_API = {
   redisLevel: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/level?${params}`,
   /** Search one database with a Redis glob pattern (server-side SCAN MATCH). */
   redisSearch: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/search?${params}`,
+  /**
+   * The cached keyspace index for one database: start a walk, read its progress, or
+   * read one level of it. `/redis/index` (POST) begins or resumes; `/redis/index`
+   * (DELETE) drops the cache after writes that cannot be applied incrementally.
+   */
+  redisIndex: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/index?${params}`,
+  /** One indexed level: `/redis/index/level`. */
+  redisIndexLevel: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/index/level?${params}`,
+  /** What a walk would cost, before anything is scanned: `/redis/index/estimate`. */
+  redisIndexEstimate: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/index/estimate?${params}`,
   /** Replace a string key's value. */
   redisString: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/string`,
   /** Set or clear a key's TTL. */
