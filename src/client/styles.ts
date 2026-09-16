@@ -245,6 +245,41 @@ export const PANEL_CSS = `
   flex: none;
 }
 .dbm-tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/*
+ * The caret and the label on a database row.
+ *
+ * The row is now a div with a caret button inside it (see the component for
+ * why), so the label is a plain span carrying the ellipsis and the caret is
+ * stripped back to its glyph — the row itself owns the hover and active
+ * backgrounds, and a control that painted its own would break that up.
+ *
+ * The caret gets a wider hit area than its 14px glyph because a small triangle
+ * is fiddly to hit. Stretching it to the row's full height keeps it reachable
+ * without aiming at the baseline.
+ */
+.dbm-caret-btn {
+  font: inherit;
+  border: none;
+  background: none;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+  padding: 0;
+  width: 16px;
+  flex: none;
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  align-self: stretch;
+}
+.dbm-caret-btn:hover { color: var(--dsw-alias-label-primary); }
+.dbm-node-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
 .dbm-tree-meta { margin-left: auto; color: var(--dsw-alias-label-secondary); font-size: 11px; }
 
 /* ---- Redis key tree ----------------------------------------------------- */

@@ -109,9 +109,23 @@ export interface TableInfo {
   name: string
   /** 'table' | 'view' | 'system' — engine-normalized. */
   type: string
-  /** Approximate row count when the engine reports one cheaply. */
+  /**
+   * Row count.
+   *
+   * MySQL reads it from `information_schema.TABLES`, which is an estimate the
+   * server keeps; SQLite has no such statistic, so it is a real `COUNT(*)` and
+   * is only filled in when the caller asked for stats AND the walk stayed
+   * inside its budget. ABSENT MEANS UNKNOWN, not zero — the panel renders that
+   * as `—` rather than claiming a table is empty.
+   */
   rows?: number
+  /** On-disk size in bytes, when it is cheap for the engine to report. */
+  size?: number
   comment?: string
+  /** Storage engine (MySQL `ENGINE`); absent on SQLite, which has only one. */
+  engine?: string
+  /** Default collation, MySQL `TABLE_COLLATION`. */
+  collation?: string
 }
 
 /** One column description (the 结构 tab). */
@@ -517,6 +531,7 @@ export const DB_API = {
   indexes: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/indexes?${params}`,
   rows: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/rows`,
   row: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/row`,
+  table: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/table`,
   query: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/query`,
   redisInfo: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/info`,
   redisKeys: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/keys?${params}`,

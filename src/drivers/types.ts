@@ -61,6 +61,21 @@ export interface RowValue {
   value: string | number | boolean | null
 }
 
+/** Options for a table listing. */
+export interface TableListOptions {
+  /**
+   * Also fill in each table's row count and size.
+   *
+   * Off by default because it is not free: MySQL reads estimates from
+   * `information_schema` (cheap but still a second column set), while SQLite
+   * walks the database's btree page map through `dbstat`, whose cost grows with
+   * the FILE size — measured 86 ms on a 26 MB database, so roughly 3.4 s on a
+   * 1 GB one. The tree expands a database on every click and must not pay that;
+   * the overview pane asks for it explicitly and shows a loading state.
+   */
+  stats?: boolean
+}
+
 /** SQL engine driver. */
 export interface SqlDriver {
   readonly kind: 'sqlite' | 'mysql'
@@ -71,7 +86,7 @@ export interface SqlDriver {
   /** Databases/schemas visible to this connection. */
   schemas(): Promise<SchemaInfo[]>
   /** Tables and views in one schema. */
-  tables(schema?: string): Promise<TableInfo[]>
+  tables(schema?: string, options?: TableListOptions): Promise<TableInfo[]>
   /** Column metadata for one table. */
   columns(schema: string | undefined, table: string): Promise<ColumnInfo[]>
   /** Index metadata for one table. */
@@ -88,6 +103,15 @@ export interface SqlDriver {
   updateRow(schema: string | undefined, table: string, values: RowValue[], keys: RowKey[]): Promise<QueryResult>
   /** Delete rows matched by `keys`. */
   deleteRow(schema: string | undefined, table: string, keys: RowKey[]): Promise<QueryResult>
+  /**
+   * Remove every row of a table, keeping the table itself.
+   *
+   * `isView` picks the engine-legal form: a view has no rows of its own, so
+   * emptying it is refused rather than silently reported as "0 rows removed".
+   */
+  truncateTable(schema: string | undefined, table: string, isView?: boolean): Promise<QueryResult>
+  /** Drop a table or a view, whichever `isView` says this object is. */
+  dropTable(schema: string | undefined, table: string, isView?: boolean): Promise<QueryResult>
 }
 
 /** Redis-specific driver surface. */

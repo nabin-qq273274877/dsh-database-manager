@@ -9,7 +9,7 @@ import * as React from 'react'
 
 import type { ColumnInfo, DataSourceSummary, IndexInfo, TableInfo, TablePage } from '../protocol.ts'
 import type { DbApi } from './api.ts'
-import { BackButton, ErrorBanner, Empty, Modal, TabStrip, isNull, renderCell, t } from './ui.ts'
+import { BackButton, ErrorBanner, Empty, Modal, TabStrip, formatBytes, isNull, renderCell, t } from './ui.ts'
 
 /** The right-hand tabs of a SQL database panel. */
 type SqlTab = 'browse' | 'structure' | 'sql' | 'search' | 'insert'
@@ -69,6 +69,19 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
   const [columns, setColumns] = React.useState<ColumnInfo[]>([])
   const [indexes, setIndexes] = React.useState<IndexInfo[]>([])
 
+  /**
+   * Table statistics for the overview pane, per database.
+   *
+   * Separate from `tablesBySchema` because it is a different, more expensive
+   * request (`stats=1` walks the file's page map on SQLite). The tree keeps its
+   * cheap name-only list; the overview asks for the counts when it is opened.
+   */
+  const [statsBySchema, setStatsBySchema] = React.useState<Record<string, TableInfo[] | undefined>>({})
+  const [statsLoading, setStatsLoading] = React.useState(false)
+  /** Which destructive action is awaiting confirmation. */
+  const [confirming, setConfirming] = React.useState<{ table: TableInfo; schema: string; op: 'truncate' | 'drop' } | undefined>(undefined)
+  const [acting, setActing] = React.useState(false)
+
   /** Refresh the schema list. */
   const loadSchemas = React.useCallback(async (): Promise<void> => {
     if (source.kind === 'sqlite') return
@@ -123,11 +136,92 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     void loadTables(only)
   }, [schemas, loadTables])
 
-  /** Expand or collapse one database, loading its tables on first open. */
+  /**
+   * Load one database's table statistics for the overview pane.
+   *
+   * `force` re-reads after a change that can move the numbers (a truncate, a
+   * drop, an insert), because a cached count would then be a stale answer to
+   * the question the user just asked.
+   */
+  const loadStats = React.useCallback(async (schema: string, force = false): Promise<void> => {
+    if (!force && statsBySchema[schema] !== undefined) return
+    setStatsLoading(true)
+    try {
+      const list = await api.tables(source.id, schema, true)
+      setStatsBySchema(current => ({ ...current, [schema]: list }))
+      setError(undefined)
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : String(failure))
+      // An empty list keeps a failing database from retrying on every render;
+      // the refresh button clears the cache.
+      setStatsBySchema(current => ({ ...current, [schema]: [] }))
+    } finally {
+      setStatsLoading(false)
+    }
+  }, [api, source.id, statsBySchema])
+
+  /**
+   * Select a database, which is what puts its table list on the right.
+   *
+   * Also expands it, so the tree and the overview agree: selecting a collapsed
+   * database would otherwise show its tables on the right while the tree
+   * continued to claim it held none.
+   *
+   * It deliberately does NOT clear `activeTable` when the database is
+   * unchanged — re-clicking the current database should not throw away the open
+   * table. Switching to a different database does clear it, since that table is
+   * not in the new one.
+   */
+  const selectSchema = (schema: string): void => {
+    if (activeSchema !== schema) setActiveTable(undefined)
+    setActiveSchema(schema)
+    setOpenSchemas(current => (current[schema] === true ? current : { ...current, [schema]: true }))
+    setError(undefined)
+    void loadTables(schema)
+    void loadStats(schema)
+  }
+
+  /**
+   * Expand or collapse one database.
+   *
+   * Deliberately does NOT select it — selecting is the name click's job. The
+   * two are separate acts so collapsing a database you are browsing does not
+   * throw the right pane back to its placeholder.
+   */
   const toggleSchema = (schema: string): void => {
     const next = !(openSchemas[schema] ?? false)
     setOpenSchemas(current => ({ ...current, [schema]: next }))
     if (next) void loadTables(schema)
+  }
+
+  /**
+   * Run a destructive table action, then refresh everything it invalidated.
+   *
+   * A dropped table must not linger in the tree, and a truncated one must not
+   * keep its old row count, so both the name list and the statistics are
+   * re-read rather than patched in place.
+   */
+  const runTableAction = async (schema: string, table: TableInfo, op: 'truncate' | 'drop'): Promise<void> => {
+    setActing(true)
+    try {
+      await api.tableAction(source.id, {
+        schema,
+        table: table.name,
+        op,
+        isView: table.type === 'view',
+      })
+      if (op === 'drop' && activeTable === table.name && activeSchema === schema) setActiveTable(undefined)
+      setConfirming(undefined)
+      setNotice(t(op === 'truncate' ? 'db.truncate.done' : 'db.drop.done', { table: table.name }))
+      setError(undefined)
+      await loadTables(schema, true)
+      await loadStats(schema, true)
+    } catch (failure) {
+      setError(t('db.action.failed', { error: failure instanceof Error ? failure.message : String(failure) }))
+      setConfirming(undefined)
+    } finally {
+      setActing(false)
+    }
   }
 
   /**
@@ -227,19 +321,64 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     const isOpen = openSchemas[schema] ?? false
     const tables = tablesBySchema[schema]
     const loading = loadingSchemas[schema] === true
+    /*
+     * The row is a div, not a button, so the caret can be a real button inside
+     * it. A button nested in a button is invalid HTML that browsers re-parent
+     * unpredictably, which is why the Redis tree's rows are divs too.
+     *
+     * Clicking anywhere on the row selects the database — the whole row being a
+     * target is what users expect from a tree. The caret is the one exception:
+     * it expands or collapses without changing the selection, which is the
+     * whole reason a database can be collapsed while still being the one shown
+     * on the right.
+     *
+     * The previous single-button row did neither properly. It only toggled
+     * expansion, so on SQLite — whose one schema is auto-expanded — clicking the
+     * name collapsed it and never selected anything, leaving the right pane on
+     * "pick a database" with no way past it.
+     *
+     * `role`/`tabIndex`/`onKeyDown` keep the row keyboard-operable, which a bare
+     * div would not be.
+     */
     tree.push(
       React.createElement(
-        'button',
+        'div',
         {
           key: `schema-${schema}`,
-          type: 'button',
           className: 'dbm-tree-item',
-          'data-active': String(activeSchema === schema && activeTable === undefined),
+          // Active whenever the database is the selected one, regardless of
+          // whether a table inside it is open: the right pane shows this
+          // database's overview until a table is picked, so the node has to
+          // stay lit across both.
+          'data-active': String(activeSchema === schema),
           title: schema,
-          onClick: () => toggleSchema(schema),
+          role: 'button',
+          tabIndex: 0,
+          onClick: () => selectSchema(schema),
+          onKeyDown: (event: { key: string; preventDefault(): void }) => {
+            if (event.key !== 'Enter' && event.key !== ' ') return
+            event.preventDefault()
+            selectSchema(schema)
+          },
         },
-        React.createElement('span', { className: 'dbm-tree-caret' }, isOpen ? '▾' : '▸'),
-        React.createElement('span', { className: 'dbm-tree-name' }, schema),
+        React.createElement(
+          'button',
+          {
+            type: 'button',
+            className: 'dbm-caret-btn',
+            'aria-label': isOpen ? t('db.collapse') : t('db.expand'),
+            'aria-expanded': isOpen,
+            onClick: (event: { stopPropagation(): void }) => {
+              // Without this the row's own handler also fires, so expanding
+              // would select as well — and collapsing would select, which is
+              // the behaviour being fixed.
+              event.stopPropagation()
+              toggleSchema(schema)
+            },
+          },
+          isOpen ? '▾' : '▸',
+        ),
+        React.createElement('span', { className: 'dbm-node-name' }, schema),
         tables === undefined
           ? null
           : React.createElement('span', { className: 'dbm-tree-meta' }, String(tables.filter(table => matchesFilter(table.name)).length)),
@@ -314,15 +453,38 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
   )
 
   // ---- right area --------------------------------------------------------
-  // The right pane exists only once a database AND a table are both chosen:
-  // every operation below is scoped to that pair.
+  // The right pane has three states, in this order:
+  //
+  //   1. nothing selected           -> prompt to pick a database
+  //   2. a database, no table       -> that database's TABLE LIST (phpMyAdmin's
+  //                                    structure page), with per-table actions
+  //   3. a database and a table     -> that table's tabs
+  //
+  // State 2 is the one that was missing: clicking a database in the tree used
+  // to leave the right pane empty, so the only way to learn what a database
+  // contained was to expand the tree node and count rows by eye.
   const selection = activeSchema !== undefined && activeTable !== undefined
     ? { schema: activeSchema, table: activeTable }
     : undefined
 
   const body: unknown[] = []
-  if (selection === undefined) {
-    body.push(React.createElement(Empty, { key: 'empty', message: t('db.selectTable') }))
+  if (activeSchema === undefined) {
+    body.push(React.createElement(Empty, { key: 'empty', message: t('db.selectSchema') }))
+  } else if (selection === undefined) {
+    body.push(
+      React.createElement(TableOverview, {
+        key: 'overview',
+        schema: activeSchema,
+        tables: statsBySchema[activeSchema],
+        filter: tableFilter,
+        onFilter: setTableFilter,
+        loading: statsLoading,
+        onOpen: (table, nextTab) => openTable(activeSchema, table.name, nextTab),
+        onTruncate: table => setConfirming({ table, schema: activeSchema, op: 'truncate' }),
+        onDrop: table => setConfirming({ table, schema: activeSchema, op: 'drop' }),
+        onRefresh: () => { void loadTables(activeSchema, true); void loadStats(activeSchema, true) },
+      }),
+    )
   } else {
     body.push(
       React.createElement(TabStrip, {
@@ -440,6 +602,233 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     error === undefined ? null : React.createElement(ErrorBanner, { message: error }),
     notice === undefined ? null : React.createElement('div', { className: 'dbm-ok', style: { padding: '6px 14px' } }, notice),
     React.createElement('div', { className: 'dbm-split' }, left as never, React.createElement('div', { className: 'dbm-main' }, body as never)),
+    confirming === undefined
+      ? null
+      : React.createElement(TableActionDialog, {
+          key: 'confirm',
+          state: confirming,
+          busy: acting,
+          onCancel: () => setConfirming(undefined),
+          onConfirm: () => { void runTableAction(confirming.schema, confirming.table, confirming.op) },
+        }),
+  )
+}
+
+/** The state a destructive table action is confirmed from. */
+interface TableActionState {
+  table: TableInfo
+  schema: string
+  op: 'truncate' | 'drop'
+}
+
+/**
+ * The confirmation for 清空 / 删除.
+ *
+ * A separate dialog from the row-editing one because the blast radius is
+ * different: these are the only actions in the panel that destroy data without
+ * a way back, so the table name is repeated in the body and the confirm button
+ * is the danger variant rather than the primary one.
+ */
+function TableActionDialog(props: {
+  state: TableActionState
+  busy: boolean
+  onCancel(): void
+  onConfirm(): void
+}): React.ReactElement {
+  const { state, busy, onCancel, onConfirm } = props
+  const isView = state.table.type === 'view'
+  const truncate = state.op === 'truncate'
+  // A view has no rows of its own, so emptying one is not a thing to confirm —
+  // say why instead of offering a button that would fail.
+  const body = truncate
+    ? isView
+      ? t('db.truncate.bodyView', { table: state.table.name })
+      : t('db.truncate.body', { table: state.table.name })
+    : isView
+      ? t('db.drop.bodyView', { table: state.table.name })
+      : t('db.drop.body', { table: state.table.name })
+
+  return React.createElement(Modal, {
+    title: t(truncate ? 'db.truncate.title' : 'db.drop.title'),
+    onClose: onCancel,
+    footer: [
+      React.createElement('button', { key: 'cancel', type: 'button', className: 'dbm-btn', disabled: busy, onClick: onCancel }, t('common.cancel')),
+      React.createElement(
+        'button',
+        {
+          key: 'ok',
+          type: 'button',
+          className: 'dbm-btn dbm-btn-danger',
+          // Refused before it is attempted when the engine cannot do it at all.
+          disabled: busy || (truncate && isView),
+          onClick: onConfirm,
+        },
+        busy ? t('common.loading') : t(truncate ? 'db.action.truncate' : 'db.action.drop'),
+      ),
+    ],
+    children: React.createElement('div', null, body),
+  })
+}
+
+/** Format a byte count without a "—" fallback of its own (the caller decides). */
+/**
+ * The database overview: one row per table, phpMyAdmin's structure page.
+ *
+ * This is what a click on a database shows. It exists because the tree can only
+ * answer "what is this table called" — the row count, the size, and the actions
+ * that operate on a whole table had no home.
+ */
+function TableOverview(props: {
+  schema: string
+  /** Loaded statistics, or undefined while the first read is in flight. */
+  tables: TableInfo[] | undefined
+  filter: string
+  onFilter(value: string): void
+  loading: boolean
+  onOpen(table: TableInfo, tab: SqlTab): void
+  onTruncate(table: TableInfo): void
+  onDrop(table: TableInfo): void
+  onRefresh(): void
+}): React.ReactElement {
+  const { schema, tables, filter, onFilter, loading, onOpen, onTruncate, onDrop, onRefresh } = props
+
+  if (tables === undefined) {
+    return React.createElement(
+      'div',
+      { className: 'dbm-tab-body' },
+      React.createElement('div', { className: 'dbm-pad dbm-hint' }, t('db.loadingStats')),
+    )
+  }
+
+  const needle = filter.trim().toLowerCase()
+  const list = needle === '' ? tables : tables.filter(table => table.name.toLowerCase().includes(needle))
+
+  /** One action button in the 操作 cell. */
+  const action = (key: string, label: string, onClick: () => void, danger = false): React.ReactElement =>
+    React.createElement(
+      'button',
+      {
+        key,
+        type: 'button',
+        className: `dbm-btn dbm-btn-sm${danger ? ' dbm-btn-danger' : ''}`,
+        onClick,
+      },
+      label,
+    )
+
+  return React.createElement(
+    'div',
+    { className: 'dbm-tab-body' },
+    React.createElement(
+      'div',
+      { className: 'dbm-toolbar' },
+      React.createElement('span', { className: 'dbm-hint' }, t('db.filterPlaceholder')),
+      React.createElement('input', {
+        className: 'dbm-input',
+        value: filter,
+        // No placeholder here: the tree's own filter box already says
+        // "search table names", and two identical hints a column apart read as
+        // a duplicated control rather than two different ones.
+        onChange: (event: { target: { value: string } }) => onFilter(event.target.value),
+      }),
+      React.createElement('span', { className: 'dbm-hint' }, t('db.overviewFor', { schema, n: tables.length })),
+      React.createElement('span', { className: 'dbm-spacer' }),
+      loading ? React.createElement('span', { className: 'dbm-hint' }, t('common.loading')) : null,
+      React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-sm', onClick: onRefresh }, t('common.refresh')),
+    ),
+    list.length === 0
+      ? React.createElement(Empty, { message: tables.length === 0 ? t('db.overviewEmpty') : t('list.emptyFiltered') })
+      : React.createElement(
+          'div',
+          { className: 'dbm-scroll' },
+          React.createElement(
+            'table',
+            { className: 'dbm-table' },
+            React.createElement(
+              'thead',
+              null,
+              React.createElement(
+                'tr',
+                null,
+                ...[t('db.col.table'), t('db.col.actions'), t('db.col.rows'), t('db.col.type'), t('db.col.collation'), t('db.col.size'), t('db.col.comment')].map(label =>
+                  React.createElement('th', { key: label }, label),
+                ),
+              ),
+            ),
+            React.createElement(
+              'tbody',
+              null,
+              list.map(table =>
+                React.createElement(
+                  'tr',
+                  { key: table.name },
+                  React.createElement(
+                    'td',
+                    null,
+                    React.createElement(
+                      'button',
+                      { type: 'button', className: 'dbm-link', onClick: () => onOpen(table, 'browse') },
+                      table.name,
+                    ),
+                  ),
+                  React.createElement(
+                    'td',
+                    null,
+                    React.createElement(
+                      'div',
+                      { className: 'dbm-actions' },
+                      action('browse', t('db.action.browse'), () => onOpen(table, 'browse')),
+                      action('structure', t('db.action.structure'), () => onOpen(table, 'structure')),
+                      action('search', t('db.action.search'), () => onOpen(table, 'search')),
+                      action('insert', t('db.action.insert'), () => onOpen(table, 'insert')),
+                      // A view has no rows of its own, so 清空 would be a lie;
+                      // it stays visible but disabled, with the dialog saying why.
+                      React.createElement(
+                        'button',
+                        {
+                          key: 'truncate',
+                          type: 'button',
+                          className: 'dbm-btn dbm-btn-sm',
+                          disabled: table.type === 'view',
+                          title: table.type === 'view' ? t('db.truncate.bodyView', { table: table.name }) : undefined,
+                          onClick: () => onTruncate(table),
+                        },
+                        t('db.action.truncate'),
+                      ),
+                      action('drop', t('db.action.drop'), () => onDrop(table), true),
+                    ),
+                  ),
+                  /*
+                   * An absent count means UNKNOWN, not zero. SQLite keeps no
+                   * row-count statistic until ANALYZE runs, and this panel does
+                   * not run it — that would write to the user's database as a
+                   * side effect of listing it. Rendering 0 there would state
+                   * something false about a table that may hold millions.
+                   */
+                  React.createElement(
+                    'td',
+                    { className: 'dbm-mono' },
+                    table.rows === undefined
+                      ? React.createElement('span', { className: 'dbm-hint', title: t('db.rowsUnknown.hint') }, t('db.rowsUnknown'))
+                      : table.rows.toLocaleString(),
+                  ),
+                  React.createElement(
+                    'td',
+                    null,
+                    // phpMyAdmin's 类型 column is the storage engine (InnoDB,
+                    // MyISAM). SQLite has exactly one storage engine and
+                    // reports none, so it falls back to the object kind — which
+                    // is the distinction that actually varies there.
+                    table.engine ?? (table.type === 'view' ? t('db.type.view') : t('db.type.table')),
+                  ),
+                  React.createElement('td', { className: 'dbm-mono' }, table.collation ?? t('common.none')),
+                  React.createElement('td', { className: 'dbm-mono' }, formatBytes(table.size)),
+                  React.createElement('td', { title: table.comment ?? '' }, table.comment ?? ''),
+                ),
+              ),
+            ),
+          ),
+        ),
   )
 }
 

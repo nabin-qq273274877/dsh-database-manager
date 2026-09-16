@@ -471,7 +471,12 @@ export function makeRoutes(deps: RoutesDeps): { routes: WebRoute[]; upgrade: Web
           return
         }
         const schema = queryParam(url, 'schema')
-        writeJson(res, 200, { tables: await driver.tables(schema) })
+        // Statistics are opt-in because they are not free — SQLite walks the
+        // file's page map. The tree expands a database on every click and gets
+        // names only; the overview pane asks for stats and shows a loading
+        // state while it waits.
+        const stats = queryParam(url, 'stats') === '1'
+        writeJson(res, 200, { tables: await driver.tables(schema, { stats }) })
         return
       }
 
@@ -566,6 +571,43 @@ export function makeRoutes(deps: RoutesDeps): { routes: WebRoute[]; upgrade: Web
           return
         }
         writeError(res, 405, `${method} is not allowed on ${path}`)
+        return
+      }
+
+      if (action === 'table') {
+        if (!isSqlDriver(driver)) {
+          writeError(res, 400, 'table is only available for SQL data sources')
+          return
+        }
+        if (method !== 'POST') {
+          writeError(res, 405, `${method} is not allowed on ${path}`)
+          return
+        }
+        const body = asJsonObject(await readJsonBody(req))
+        if (body === undefined) {
+          writeError(res, 400, 'body must be a JSON object')
+          return
+        }
+        const table = typeof body['table'] === 'string' ? body['table'] : undefined
+        if (table === undefined || table === '') {
+          writeError(res, 400, 'table is required')
+          return
+        }
+        const schema = typeof body['schema'] === 'string' && body['schema'] !== '' ? body['schema'] : undefined
+        const isView = body['isView'] === true
+        const op = body['op']
+        // Both operations destroy data and neither is undoable, so the caller
+        // has to say which one it means. Defaulting would turn a malformed
+        // request into a dropped table.
+        if (op === 'truncate') {
+          writeJson(res, 200, { result: await driver.truncateTable(schema, table, isView) })
+          return
+        }
+        if (op === 'drop') {
+          writeJson(res, 200, { result: await driver.dropTable(schema, table, isView) })
+          return
+        }
+        writeError(res, 400, 'op must be "truncate" or "drop"')
         return
       }
 

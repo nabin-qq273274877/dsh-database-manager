@@ -184,9 +184,10 @@ export class DbApi {
     return (await readJson<{ schemas: SchemaInfo[] }>(await fetch(DB_API.schemas(id)))).schemas
   }
 
-  /** Tables and views of one schema. */
-  async tables(id: string, schema?: string): Promise<TableInfo[]> {
-    return (await readJson<{ tables: TableInfo[] }>(await fetch(DB_API.tables(id, query({ schema }))))).tables
+  /** Tables and views of one schema. `stats` also fills in row counts and sizes. */
+  async tables(id: string, schema?: string, stats?: boolean): Promise<TableInfo[]> {
+    const params = query({ schema, stats: stats === true ? '1' : undefined })
+    return (await readJson<{ tables: TableInfo[] }>(await fetch(DB_API.tables(id, params)))).tables
   }
 
   /** Columns of one table. */
@@ -228,6 +229,17 @@ export class DbApi {
   /** Delete rows matched by keys. */
   async deleteRow(id: string, body: { schema?: string; table: string; keys: Array<{ column: string; value: string | number | boolean | null }> }): Promise<QueryResult> {
     return (await send<{ result: QueryResult }>(DB_API.row(id), 'DELETE', body)).result
+  }
+
+  /**
+   * Empty a table or drop it.
+   *
+   * `op` is explicit rather than inferred from the HTTP method: both actions
+   * are destructive and irreversible, so a malformed request must not be able
+   * to become a dropped table by omission.
+   */
+  async tableAction(id: string, body: { schema?: string; table: string; op: 'truncate' | 'drop'; isView?: boolean }): Promise<QueryResult> {
+    return (await send<{ result: QueryResult }>(DB_API.table(id), 'POST', body)).result
   }
 
   /** Run one SQL statement. `allowWrite` is the 允许写入 checkbox. */

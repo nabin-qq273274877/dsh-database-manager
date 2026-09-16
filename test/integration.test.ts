@@ -401,6 +401,169 @@ describe.skipIf(!available)('built host half', () => {
     expect(((await response.json()) as { error: string }).error).toMatch(/Redis/)
   })
 
+  /**
+   * The overview pane's two additions to the tables route.
+   *
+   * `stats=1` is what fills in the row-count and size columns. It is opt-in
+   * because it is not free on SQLite, so both halves matter: without the flag
+   * the cheap name list must stay cheap, and with it the statistics must
+   * actually arrive.
+   */
+  it('reports table statistics only when they are asked for', async () => {
+    const plain = (await (await fetch(`${base}/sources/app/tables?schema=main`)).json()) as {
+      tables: Array<{ name: string; rows?: number; size?: number }>
+    }
+    const plainRow = plain.tables.find(table => table.name === 't')
+    expect(plainRow).toBeDefined()
+    // The cheap read carries no statistics at all.
+    expect(plainRow?.rows).toBeUndefined()
+    expect(plainRow?.size).toBeUndefined()
+
+    const withStats = (await (await fetch(`${base}/sources/app/tables?schema=main&stats=1`)).json()) as {
+      tables: Array<{ name: string; rows?: number; size?: number }>
+    }
+    const statsRow = withStats.tables.find(table => table.name === 't')
+    // Size comes from dbstat and is always available for a real table.
+    expect(statsRow?.size).toBeGreaterThan(0)
+  })
+
+  /**
+   * 清空 / 删除 on the overview pane.
+   *
+   * These are the only two actions in the panel that destroy data with no way
+   * back, so the test pins both the happy path and the two refusals that keep a
+   * malformed or nonsensical request from becoming a dropped table.
+   */
+  describe('table actions (/sources/:id/table)', () => {
+    /** Create a throwaway table with `n` rows and return its name. */
+    const seed = async (name: string, n: number): Promise<void> => {
+      await fetch(`${base}/sources/app/query`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sql: `CREATE TABLE ${name} (id INTEGER PRIMARY KEY, v TEXT)`, allowWrite: true }),
+      })
+      for (let i = 0; i < n; i++) {
+        await fetch(`${base}/sources/app/row`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ table: name, values: [{ column: 'v', value: `v${i}` }] }),
+        })
+      }
+    }
+
+    /** How many rows a table currently holds, through the browse route. */
+    const countOf = async (name: string): Promise<number> => {
+      const body = (await (await fetch(`${base}/sources/app/rows?table=${name}&page=1&pageSize=50&mode=browse`)).json()) as {
+        page: { total: number }
+      }
+      return body.page.total
+    }
+
+    it('empties a table but keeps the table itself', async () => {
+      await seed('trunc_me', 3)
+      expect(await countOf('trunc_me')).toBe(3)
+
+      const response = await fetch(`${base}/sources/app/table`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ schema: 'main', table: 'trunc_me', op: 'truncate' }),
+      })
+      expect(response.status).toBe(200)
+      expect(await countOf('trunc_me')).toBe(0)
+
+      // The table must still be listed: emptying is not dropping.
+      const tables = (await (await fetch(`${base}/sources/app/tables?schema=main`)).json()) as {
+        tables: Array<{ name: string }>
+      }
+      expect(tables.tables.map(table => table.name)).toContain('trunc_me')
+    })
+
+    it('drops a table for real', async () => {
+      await seed('drop_me', 1)
+      const response = await fetch(`${base}/sources/app/table`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ schema: 'main', table: 'drop_me', op: 'drop' }),
+      })
+      expect(response.status).toBe(200)
+
+      const tables = (await (await fetch(`${base}/sources/app/tables?schema=main`)).json()) as {
+        tables: Array<{ name: string }>
+      }
+      expect(tables.tables.map(table => table.name)).not.toContain('drop_me')
+      // Reading it must now fail rather than return an empty result set.
+      expect((await fetch(`${base}/sources/app/rows?table=drop_me&page=1&pageSize=10&mode=browse`)).status).toBe(500)
+    })
+
+    it('drops a view with DROP VIEW, which is the only statement that works', async () => {
+      // SQLite rejects `DROP TABLE` on a view, so a caller that forgets the
+      // kind gets an engine error instead of a dropped view.
+      await fetch(`${base}/sources/app/query`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sql: 'CREATE VIEW v_drop AS SELECT 1 AS one', allowWrite: true }),
+      })
+      const response = await fetch(`${base}/sources/app/table`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ schema: 'main', table: 'v_drop', op: 'drop', isView: true }),
+      })
+      expect(response.status).toBe(200)
+      const tables = (await (await fetch(`${base}/sources/app/tables?schema=main`)).json()) as {
+        tables: Array<{ name: string }>
+      }
+      expect(tables.tables.map(table => table.name)).not.toContain('v_drop')
+    })
+
+    it('refuses to empty a view, which holds no rows of its own', async () => {
+      await fetch(`${base}/sources/app/query`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sql: 'CREATE VIEW v_keep AS SELECT 1 AS one', allowWrite: true }),
+      })
+      const response = await fetch(`${base}/sources/app/table`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ schema: 'main', table: 'v_keep', op: 'truncate', isView: true }),
+      })
+      expect(response.status).toBe(500)
+      expect(((await response.json()) as { error: string }).error).toMatch(/view/)
+      // And it must still be there afterwards.
+      const tables = (await (await fetch(`${base}/sources/app/tables?schema=main`)).json()) as {
+        tables: Array<{ name: string }>
+      }
+      expect(tables.tables.map(table => table.name)).toContain('v_keep')
+    })
+
+    it('refuses an action that does not name what it wants to do', async () => {
+      // Defaulting here would turn a malformed request into a dropped table.
+      await seed('safe_from_typo', 1)
+      const response = await fetch(`${base}/sources/app/table`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ schema: 'main', table: 'safe_from_typo' }),
+      })
+      expect(response.status).toBe(400)
+      expect(((await response.json()) as { error: string }).error).toMatch(/truncate.*drop/)
+
+      // The table must be untouched.
+      const tables = (await (await fetch(`${base}/sources/app/tables?schema=main`)).json()) as {
+        tables: Array<{ name: string }>
+      }
+      expect(tables.tables.map(table => table.name)).toContain('safe_from_typo')
+    })
+
+    it('requires a table name', async () => {
+      const response = await fetch(`${base}/sources/app/table`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ op: 'drop' }),
+      })
+      expect(response.status).toBe(400)
+      expect(((await response.json()) as { error: string }).error).toMatch(/table is required/)
+    })
+  })
+
   it('serves the write posture and persists a change', async () => {
     const patched = await fetch(`${base}/settings`, {
       method: 'PATCH',
