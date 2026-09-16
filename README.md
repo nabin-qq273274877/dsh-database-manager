@@ -146,9 +146,11 @@ agent 侧对 Redis 走同一套工具：`db_query` 只接受读命令，`db_exec
 
 ```bash
 npm run build                                   # 先产出 lib/index.js + lib/client.js
-pwsh -File scripts/install-into-profile.ps1 -DshHome "$DSH_HOME"            # 只安装
-pwsh -File scripts/install-into-profile.ps1 -DshHome "$DSH_HOME" -Port 3080 # 安装并重启 + 验证
+pwsh -File scripts/install-into-profile.ps1 -DshHome "$env:USERPROFILE\.dsh"            # 只安装
+pwsh -File scripts/install-into-profile.ps1 -DshHome "$env:USERPROFILE\.dsh" -Port 3080 # 安装并重启 + 验证
 ```
+
+> **本项目的调试目标只有命令行那个 dsh**（监听 3080、home 为 `~/.dsh`），所以上面的 `-DshHome` 是 `~/.dsh` 而**不是** `$DSH_HOME`。`$DSH_HOME` 指向的是 dsh desktop 的数据目录，而 desktop 的 dsh 端口是随机挑的——拿 `-DshHome "$DSH_HOME"` 配 `-Port 3080` 会让安装和重启落在两个不同的实例上。完整操作见 `AGENTS.md` 的「调试本项目只用命令行起的 3080 dsh」（该文件记录本机工作约定，不入版本控制）。
 
 脚本做的只有两件事——都是 loader 真正需要的：
 
@@ -185,7 +187,7 @@ cmd /c mklink /J "<profile>\node_modules\dsh-database-manager" "D:\Project\nabin
 
 重启后在浏览器打开该 dsh 的地址，侧边栏「新建会话」下方会出现「数据库管理」入口。
 
-> **注意 `DSH_HOME`**：同一台机器上可以有多个 dsh（例如桌面版用 `…\com.dsh.desktop\dsh-desktop\dsh-home`，命令行版默认用 `~/.dsh`）。要装进哪个，`-DshHome` 就得指向哪个。重启那一步会**主动清空 `DSH_HOME`**，让新进程按自身默认规则解析 home，而不是继承调用方进程的环境——否则会把插件的 home 装错到另一个 dsh 上。
+> **注意 `DSH_HOME`**：同一台机器上可以有多个 dsh（例如桌面版用 `…\com.dsh.desktop\dsh-desktop\dsh-home`，命令行版默认用 `~/.dsh`）。要装进哪个，`-DshHome` 就得指向哪个。重启那一步会**主动清空 `DSH_HOME`**，让新进程按自身默认规则解析 home，而不是继承调用方进程的环境——否则会把插件的 home 装错到另一个 dsh 上；从 agent shell（派生自 desktop 的 dsh、继承了 `DSH_HOME`）直接跑 `dsh web` 就会踩到这个坑。
 
 ### 验证安装
 
@@ -193,14 +195,16 @@ cmd /c mklink /J "<profile>\node_modules\dsh-database-manager" "D:\Project\nabin
 node scripts/probe-surface.mjs lib/index.js   # 离线：列出注册的工具 / 路由 / prompt section
 ```
 
-在线（服务已在运行）：
+在线（命令行 dsh 已在 3080 上运行）：
 
 ```bash
-curl "http://127.0.0.1:<port>/api/dsh-database/sources"     # 期望 200 + allowAgentWrite 字段
-curl "http://127.0.0.1:<port>/api/dsh-database/engines"     # 期望三个引擎的可用性
+curl "http://127.0.0.1:3080/api/dsh-database/sources"     # 期望 200 + allowAgentWrite 字段
+curl "http://127.0.0.1:3080/api/dsh-database/engines"     # 期望三个引擎的可用性
 ```
 
-`dsh --profile <name> --dump-config` 会在真正启动前把整棵 loader 树打印出来；若插件无法解析，这里就会报错。安装脚本用它做启动前守卫。
+**不要拿别的端口去验。** desktop 的 dsh 端口是随机挑的，在它上面验等于在测另一份部署（另一个 home、另一份 `dsh-database.json`）。
+
+`dsh --profile web --dump-config` 会在真正启动前把整棵 loader 树打印出来；若插件无法解析，这里就会报错。安装脚本用它做启动前守卫。它同时是判断"连的是哪个 home"的可靠手段——输出的 `profiles\web\cordis.patch.yml` 路径必须是 `C:\Users\Lenovo\.dsh\profiles\web\…`。注意它读的是**调用方进程**的 `DSH_HOME`，所以从 agent shell 里直接跑会打印 desktop 的路径，得先 `Remove-Item Env:DSH_HOME`（见 `AGENTS.md`）。
 
 ### 也可以作为 bundle patch 层
 
