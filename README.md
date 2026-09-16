@@ -55,6 +55,11 @@ DSH（DeepSeek Harness）数据库管理插件：侧边栏「数据库管理」�
 
 TTL 可改可清：填秒数设置过期，「设为永久」走 `PERSIST`。**清空不等于删除**——`EXPIRE key 0` 会删掉整个键，所以"永久"是独立按钮，不是把输入框留空。
 
+带过期时间的键，TTL 那一行**每秒递减**，且只显示这一个值（早先的实现把服务端读数和倒计时并排显示，两个数字会差几秒，看的人只会困惑该信哪个）。倒计时归零时标出「已过期」并提供重新读取。
+
+倒计时的实现要点：**记录"读数 + 取数时刻"，每次重绘按墙上时间差算剩余**，而不是自己每秒减一。浏览器会节流后台标签页的定时器（Chrome 压到约每分钟一次），自减的计数器会落后于服务器，继续给一个 Redis 已经删掉的键显示剩余时间。按时间戳派生则只影响重绘频率，不影响显示的数字。编辑框也用实时余量预填，而不是加载时的读数——否则面板开着几分钟后再点「改 TTL」，输入框里的数会比键真实的剩余寿命大，一保存就把它的寿命延长了。
+
+
 改动先在本地暂存，点**保存**才写；有未保存修改会标出来。`保存` 在无改动时是禁用的。
 
 写操作直接走面板自己的接口（用户面），与 agent 的写入门无关——和 SQL 的行编辑器同一套授权模型。类型不匹配会被拒绝而不是"顺手续写"：`SET` 一个 list 键会把整个键替换成字符串，那是数据丢失，所以在 host 侧就直接挡住并报出真实类型。
@@ -203,6 +208,8 @@ npm run build       # lib/index.js（host）+ lib/client.js（browser）
 | `scripts/e2e-panel.mjs` / `measure-panel.mjs` / `measure-sidebar.mjs` | 面板端到端与布局度量 |
 | `scripts/e2e-redis-tree.mjs` | 真实浏览器里走完 Redis 树的展开 / 新建 / 删除，并核对服务端实际状态 |
 | `scripts/e2e-redis-edit.mjs` | 真实浏览器里改值 / 改 TTL / 追加元素 / 改 hash 字段，并核对服务端实际状态 |
+| `scripts/e2e-ttl-countdown.mjs` | 真实浏览器里确认 TTL 倒计时随时间递减、重设后重新锚定、编辑框预填实时余量 |
+| `scripts/shot-ttl-row.mjs` | 截取 TTL 那一行，供视觉复核 |
 | `scripts/bench-tree-e2e.mjs` | 大库上量树的交互耗时（点开到首屏可见） |
 | `scripts/bench-redis-level.mts` / `seed-bench.sh` | 层级扫描的回归基准与造数（26 万键级） |
 | `scripts/dump-redis-level.mts` / `dump-value-pane.mjs` | 打印某层扫描结果 / 值面板的真实 DOM，用于核对 |

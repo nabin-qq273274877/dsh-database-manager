@@ -6,6 +6,7 @@ import * as React from 'react'
  */
 
 import { en, zh, type DbKey } from './locales.ts'
+import { formatDuration } from './ttl.ts'
 
 /** Template values accepted by the interpolator. */
 export type TranslateValues = Record<string, string | number>
@@ -48,11 +49,18 @@ export function formatBytes(bytes: number | undefined): string {
 export function formatTtl(seconds: number): string {
   if (seconds === -1) return t('redis.ttl.none')
   if (seconds === -2) return t('common.none')
-  if (seconds < 60) return `${seconds}s`
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`
-  return `${Math.floor(seconds / 86400)}d ${Math.floor((seconds % 86400) / 3600)}h`
+  return formatDuration(seconds)
 }
+
+/**
+ * The TTL countdown helpers, re-exported so call sites keep one import.
+ *
+ * They live in `ttl.ts` (no React, no i18n) because the arithmetic needs tests
+ * that run without a DOM — see that module for why the reading is anchored
+ * rather than decremented.
+ */
+export { countsDown, formatDuration, readTtl, remainingSeconds, type TtlReading } from './ttl.ts'
+
 
 /** Format an uptime in seconds. */
 export function formatUptime(seconds: number | undefined): string {

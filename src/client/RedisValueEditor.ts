@@ -23,7 +23,8 @@ import * as React from 'react'
 
 import type { DataSourceSummary, RedisValue } from '../protocol.ts'
 import type { DbApi } from './api.ts'
-import { Empty, Modal, formatBytes, formatTtl, t } from './ui.ts'
+import { Empty, Modal, countsDown, formatBytes, formatTtl, readTtl, t } from './ui.ts'
+import { useTtlCountdown } from './useTtlCountdown.ts'
 
 /** Props for {@link RedisValueEditor}. */
 export interface RedisValueEditorProps {
@@ -95,7 +96,15 @@ export function RedisValueEditor(props: RedisValueEditorProps): React.ReactEleme
   return React.createElement('div', { className: 'dbm-tab-body' }, head, body)
 }
 
-/** The TTL control: shows the current expiry and lets it be changed or cleared. */
+/**
+ * The TTL control: shows the current expiry, counts it down, and lets it be
+ * changed or cleared.
+ *
+ * The countdown is derived from the reading the server gave plus the instant it
+ * arrived (see {@link TtlReading}), never by decrementing a local copy: a
+ * backgrounded tab has its timers throttled, so a self-decrementing counter
+ * drifts behind Redis and keeps showing time on a key that is already gone.
+ */
 function TtlEditor(props: {
   api: DbApi
   source: DataSourceSummary
@@ -109,6 +118,19 @@ function TtlEditor(props: {
   const [editing, setEditing] = React.useState(false)
   const [seconds, setSeconds] = React.useState('')
   const [busy, setBusy] = React.useState(false)
+
+  /**
+   * The TTL as the server reported it, re-anchored whenever a fresh reading
+   * arrives.
+   *
+   * Keyed on the `value` OBJECT, not on `value.ttl`: the parent replaces the
+   * whole object on every fetch, so its identity is exactly "a new reading
+   * arrived". Keying on the number instead would miss a re-read that returns the
+   * SAME ttl (setting 600 over an existing 600), leaving the anchor at the old
+   * instant and the countdown short by however long ago that was.
+   */
+  const reading = React.useMemo(() => readTtl(value.ttl), [value])
+  const left = useTtlCountdown(reading)
 
   const apply = async (ttl: number | null): Promise<void> => {
     setBusy(true)
@@ -126,24 +148,64 @@ function TtlEditor(props: {
   }
 
   if (!editing) {
+    const expiring = countsDown(reading)
+    const expired = expiring && left === 0
     return React.createElement(
       'span',
       { className: 'dbm-row', style: { gap: '6px' } },
-      React.createElement('span', { className: 'dbm-hint' }, `${t('redis.ttl')}: ${formatTtl(value.ttl)}`),
+      // ONE number, and it is the live remainder.
+      //
+      // Showing the load-time reading next to the countdown ("TTL: 29m 57s
+      // 倒计时 29m 55s") put two different values for the same fact side by side,
+      // which only invites the question of which one is true. The countdown IS
+      // the TTL; a permanent key says so instead of counting.
+      React.createElement(
+        'span',
+        { className: 'dbm-hint' },
+        `${t('redis.ttl')}: `,
+        // One value, and it is the live remainder. An expired key shows the
+        // badge alone rather than also printing "0s": the badge already says it.
+        expired
+          ? null
+          : expiring
+            ? React.createElement('span', { className: 'dbm-countdown' }, formatTtl(left))
+            : React.createElement('span', null, formatTtl(reading.seconds)),
+      ),
+      expired
+        ? React.createElement(
+            React.Fragment,
+            null,
+            React.createElement('span', { className: 'dbm-badge dbm-badge-err' }, t('redisedit.ttl.expired')),
+            React.createElement('span', { className: 'dbm-hint' }, t('redisedit.ttl.expired.hint')),
+          )
+        : null,
       React.createElement(
         'button',
         {
           type: 'button',
           className: 'dbm-btn dbm-btn-sm',
           onClick: () => {
-            // Seed the box with the remaining seconds so "change" starts from
-            // the real value, and an immediate 保存 does not clear the expiry.
-            setSeconds(value.ttl > 0 ? String(value.ttl) : '')
+            // Seed with the seconds remaining NOW, not the ones the server
+            // reported when the key was loaded: a panel left open for a few
+            // minutes would otherwise pre-fill a larger number than the key
+            // actually has, and an immediate 保存 would extend its life.
+            setSeconds(countsDown(reading) && left > 0 ? String(left) : '')
             setEditing(true)
           },
         },
         t('redisedit.ttl.edit'),
       ),
+      expired
+        ? React.createElement(
+            'button',
+            {
+              type: 'button',
+              className: 'dbm-btn dbm-btn-sm',
+              onClick: props.onReload,
+            },
+            t('redisedit.ttl.expired.reload'),
+          )
+        : null,
     )
   }
 

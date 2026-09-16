@@ -23,6 +23,7 @@ const here = dirname(fileURLToPath(import.meta.url))
 const files = [
   'e2e-redis-tree.mjs',
   'e2e-redis-edit.mjs',
+  'e2e-ttl-countdown.mjs',
   'e2e-panel.mjs',
   'shot-redis-tree.mjs',
   'bench-tree-e2e.mjs',
@@ -42,12 +43,19 @@ for (const name of files) {
 
   // A backtick inside a COMMENT line of the embedded code is always a mistake:
   // the template literal's own delimiters are not comments, and no comment needs
-  // a backtick. This is the exact shape that broke the scripts.
+  // a backtick.
+  //
+  // This is a FAILURE, not a warning. `node --check` cannot be relied on to catch
+  // it: a pair of stray backticks in comments still parses (they open and close a
+  // second template literal), and the damage only shows at RUNTIME as a bogus
+  // "X is not defined". That is exactly how this defect slipped through once
+  // already, so it is reported as a hard error here.
   const commentHits = source.split('\n')
     .map((line, index) => ({ line, number: index + 1 }))
     .filter(entry => /^\s*(\*|\/\/)/.test(entry.line) && entry.line.includes('`'))
 
-  // The authoritative check: does Node parse the file at all?
+  // Does Node parse the file at all? Catches an odd number of backticks, and any
+  // other syntax error.
   let parseError = null
   try {
     execFileSync(process.execPath, ['--check', path], { stdio: 'pipe' })
@@ -55,14 +63,13 @@ for (const name of files) {
     parseError = String(error.stderr ?? error.message).split('\n').slice(0, 3).join(' ').trim()
   }
 
-  console.log(`${name}: ${parseError === null ? 'ok' : 'PARSE FAILED'}`)
+  const ok = parseError === null && commentHits.length === 0
+  console.log(`${name}: ${ok ? 'ok' : 'FAILED'}`)
   for (const hit of commentHits) {
     console.log(`  L${hit.number}: comment contains a backtick -> ${hit.line.trim()}`)
   }
-  if (parseError !== null) {
-    console.log(`  ${parseError}`)
-    failed = true
-  }
+  if (parseError !== null) console.log(`  ${parseError}`)
+  if (!ok) failed = true
 }
 
 process.exitCode = failed ? 1 : 0

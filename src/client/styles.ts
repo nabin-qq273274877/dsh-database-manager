@@ -400,6 +400,18 @@ export const PANEL_CSS = `
 }
 /* An edited-but-unsaved cell is called out, so 保存 is never a guess. */
 .dbm-dirty { color: #c1720a; }
+
+/*
+ * The TTL countdown. Tabular figures so a ticking number does not make the row
+ * jitter as digits change width, and the code font so it reads as a value rather
+ * than as prose.
+ */
+.dbm-countdown {
+  font-family: var(--ds-font-family-code);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--dsw-alias-label-secondary);
+}
 .dbm-pager {
   display: flex;
   align-items: center;
