@@ -15,8 +15,8 @@ import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { expandHome } from '../dsh-home.ts'
 import type { ColumnInfo, DataSourceEntry, IndexInfo, QueryResult, SchemaInfo, TableInfo, TablePage, TestResult } from '../protocol.ts'
-import { assertSingleStatement, looksReadOnly, qualifySqlite, quoteSqlite, requireIdentifier, toWireValue } from '../sql-util.ts'
-import type { RowKey, RowQuery, RowValue, SqlDriver } from './types.ts'
+import { assertSingleStatement, looksReadOnly, pushDownLimit, qualifySqlite, quoteSqlite, requireIdentifier, toWireValue } from '../sql-util.ts'
+import type { RowKey, RowQuery, RowValue, SqlDriver, TableListOptions } from './types.ts'
 
 /** Minimal structural view of the `node:sqlite` surface this driver uses. */
 interface SqliteStatement {
@@ -170,21 +170,33 @@ export class SqliteDriver implements SqlDriver {
     })
   }
 
-  async tables(schema?: string): Promise<TableInfo[]> {
+  async tables(schema?: string, options?: TableListOptions): Promise<TableInfo[]> {
     const target = schema === undefined || schema === '' ? 'main' : schema
     requireIdentifier(target, 'schema name', quoteSqlite)
+    const wantStats = options?.stats === true
     return this.run(db => {
       const statement = db.prepare(
         `SELECT name, type FROM ${quoteSqlite(target)}.sqlite_master ` +
           `WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY type, name`,
       )
       const rows = statement.all() as Array<{ name?: unknown; type?: unknown }>
+      // Both statistics are opt-in: the tree expands a database on every click
+      // and must stay cheap even when the file is large.
+      const sizes = wantStats ? readTableSizes(db, target) : undefined
+      const counts = wantStats ? readTableRowCounts(db, target) : undefined
       return rows
         .filter(row => typeof row.name === 'string')
-        .map(row => ({
-          name: String(row.name),
-          type: row.type === 'view' ? 'view' : 'table',
-        }) satisfies TableInfo)
+        .map(row => {
+          const name = String(row.name)
+          const size = sizes?.get(name)
+          const count = counts?.get(name)
+          return {
+            name,
+            type: row.type === 'view' ? 'view' : 'table',
+            ...(size === undefined ? {} : { size }),
+            ...(count === undefined ? {} : { rows: count }),
+          } satisfies TableInfo
+        })
     })
   }
 
@@ -304,7 +316,18 @@ export class SqliteDriver implements SqlDriver {
     if (!looksReadOnly(sql)) {
       throw new Error('only read-only statements (SELECT / WITH / PRAGMA / EXPLAIN) are allowed on this surface')
     }
-    return this.exec(sql, params, schema, limit)
+    // Ask the engine to stop at the cap instead of materialising the whole
+    // result set and slicing it here. Left uncapped, a `SELECT *` over a large
+    // table pulls every row into the host's memory and then discards all but
+    // the first page. The statement is run verbatim when the rewrite is not
+    // safe — see `pushDownLimit` for the cases that disqualify it.
+    //
+    // One row PAST the cap is requested on purpose: `exec` decides `truncated`
+    // by comparing the row count against the cap, so a statement capped at
+    // exactly `limit` rows would report "complete" while rows were being
+    // withheld. The extra row is what proves there was more.
+    const pushed = limit >= 1 ? pushDownLimit(sql, limit + 1) : undefined
+    return this.exec(pushed ?? sql, params, schema, limit)
   }
 
   async exec(sql: string, params: unknown[], schema?: string, limit?: number): Promise<QueryResult> {
@@ -382,6 +405,78 @@ export class SqliteDriver implements SqlDriver {
     const sql = `DELETE FROM ${qualified} WHERE ${where}`
     return this.exec(sql, keys.map(item => item.value), schema)
   }
+
+  /**
+   * Empty a table, keeping its schema.
+   *
+   * SQLite has no TRUNCATE, so this is `DELETE FROM`. Two consequences the
+   * caller should know about, and which are why this is not presented as a
+   * TRUNCATE:
+   *
+   * - `sqlite_sequence` is NOT reset, so an AUTOINCREMENT column keeps counting
+   *   up from where it was. Measured: two rows inserted, deleted, then the next
+   *   insert got id 3. That is the documented SQLite behaviour and matches what
+   *   `DELETE FROM` does in MySQL too, so it is left alone rather than papered
+   *   over — silently resetting a primary key would break foreign references
+   *   held elsewhere.
+   * - It is a row-by-row delete, so it is slower than MySQL's TRUNCATE on a
+   *   large table.
+   */
+  async truncateTable(schema: string | undefined, table: string, isView = false): Promise<QueryResult> {
+    if (isView) throw new Error('a view has no rows of its own to delete')
+    const qualified = qualifySqlite(schema, table)
+    return this.exec(`DELETE FROM ${qualified}`, [], schema)
+  }
+
+  /**
+   * Drop a table or a view.
+   *
+   * The object's kind decides the statement: SQLite refuses `DROP TABLE` on a
+   * view ("use DROP VIEW to delete view v"), so collapsing both into one
+   * DROP TABLE makes dropping a view fail with an engine error the user cannot
+   * act on.
+   */
+  async dropTable(schema: string | undefined, table: string, isView = false): Promise<QueryResult> {
+    const qualified = qualifySqlite(schema, table)
+    return this.exec(`DROP ${isView ? 'VIEW' : 'TABLE'} ${qualified}`, [], schema)
+  }
+}
+
+/**
+ * Per-table row counts, from the `sqlite_stat1` table `ANALYZE` writes.
+ *
+ * SQLite keeps no row-count statistic of its own, so the only two options are
+ * a real `COUNT(*)` per table — a full scan each, 49 ms for a single 1M-row
+ * table and proportionally worse across many — or reading the estimate
+ * `ANALYZE` already stored. This reads the estimate.
+ *
+ * `ANALYZE` is deliberately NOT run here. It writes to the user's database
+ * file, so running it behind a "list the tables" click would mutate a
+ * production database as a side effect of looking at it. A file that has never
+ * been analysed therefore reports no counts, and the panel shows `—` rather
+ * than a made-up zero.
+ *
+ * The statistic is an estimate for a multi-column index and can lag a table's
+ * real contents until the next ANALYZE. It is presented as a count, not as a
+ * guarantee.
+ */
+function readTableRowCounts(db: SqliteDatabase, schema: string): Map<string, number> {
+  const counts = new Map<string, number>()
+  try {
+    const rows = db.prepare(`SELECT tbl, stat FROM ${quoteSqlite(schema)}.sqlite_stat1`).all() as Array<Record<string, unknown>>
+    for (const row of rows) {
+      const table = row['tbl']
+      // `stat` is "rowcount" or "rowcount avg-per-index-key …" — the first
+      // number is the table's row count.
+      const first = typeof row['stat'] === 'string' ? String(row['stat']).trim().split(/\s+/)[0] : undefined
+      const count = first === undefined ? Number.NaN : Number(first)
+      if (typeof table === 'string' && Number.isFinite(count) && count >= 0) counts.set(table, count)
+    }
+  } catch {
+    // `sqlite_stat1` only exists after the first ANALYZE. Its absence is the
+    // normal state, not an error.
+  }
+  return counts
 }
 
 /** Project one raw SQLite row onto the wire shape. */
@@ -389,6 +484,37 @@ function projectRow(row: Record<string, unknown>): Record<string, string | numbe
   const out: Record<string, string | number | boolean | null> = {}
   for (const [key, value] of Object.entries(row)) out[key] = toWireValue(value)
   return out
+}
+
+/**
+ * Per-table on-disk size, from the `dbstat` virtual table.
+ *
+ * A single aggregate pass, so the cost is one walk of the database's page map
+ * rather than one query per table. `dbstat` is a compile-time option; a build
+ * without it (or an older file) makes this throw, and the caller then reports
+ * no sizes at all instead of failing the table list.
+ *
+ * Only tables appear here — a view owns no pages of its own, so it is absent
+ * from the map and the caller renders no size for it.
+ */
+function readTableSizes(db: SqliteDatabase, schema: string): Map<string, number> {
+  const sizes = new Map<string, number>()
+  try {
+    const rows = db
+      .prepare(
+        'SELECT name, SUM(pgsize) AS bytes FROM dbstat ' +
+          "WHERE schema = ? AND name NOT LIKE 'sqlite_%' GROUP BY name",
+      )
+      .all(schema) as Array<Record<string, unknown>>
+    for (const row of rows) {
+      const name = row['name']
+      const bytes = Number(row['bytes'] ?? 0)
+      if (typeof name === 'string' && Number.isFinite(bytes) && bytes > 0) sizes.set(name, bytes)
+    }
+  } catch {
+    // No dbstat in this build: sizes are simply unavailable.
+  }
+  return sizes
 }
 
 /** Whether a filesystem path exists and looks like a SQLite database. */

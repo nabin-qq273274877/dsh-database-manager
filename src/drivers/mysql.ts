@@ -9,8 +9,8 @@
  */
 
 import type { ColumnInfo, DataSourceEntry, IndexInfo, QueryResult, SchemaInfo, TableInfo, TablePage, TestResult } from '../protocol.ts'
-import { assertSingleStatement, looksReadOnly, qualifyMysql, quoteMysql, requireIdentifier, toWireValue } from '../sql-util.ts'
-import type { RowKey, RowQuery, RowValue, SqlDriver } from './types.ts'
+import { assertSingleStatement, looksReadOnly, pushDownLimit, qualifyMysql, quoteMysql, requireIdentifier, toWireValue } from '../sql-util.ts'
+import type { RowKey, RowQuery, RowValue, SqlDriver, TableListOptions } from './types.ts'
 
 /** Structural view of the mysql2/promise surface this driver uses. */
 interface MysqlConnection {
@@ -167,12 +167,19 @@ export class MysqlDriver implements SqlDriver {
     return target
   }
 
-  async tables(schema?: string): Promise<TableInfo[]> {
+  async tables(schema?: string, options?: TableListOptions): Promise<TableInfo[]> {
     const target = this.requireSchema(schema)
+    const wantStats = options?.stats === true
+    // The statistics columns are a wide, cheap read from information_schema, but
+    // the tree calls this on every expand and only needs names — so they are
+    // requested only when the overview pane asks for them.
     const [rows] = await (await this.open()).query({
-      sql:
-        'SELECT TABLE_NAME AS name, TABLE_TYPE AS type, TABLE_ROWS AS rows_count, TABLE_COMMENT AS comment ' +
-        'FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_TYPE, TABLE_NAME',
+      sql: wantStats
+        ? 'SELECT TABLE_NAME AS name, TABLE_TYPE AS type, TABLE_ROWS AS rows_count, TABLE_COMMENT AS comment, ' +
+          'ENGINE AS engine, TABLE_COLLATION AS collation, DATA_LENGTH AS data_bytes, INDEX_LENGTH AS index_bytes ' +
+          'FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_TYPE, TABLE_NAME'
+        : 'SELECT TABLE_NAME AS name, TABLE_TYPE AS type, TABLE_COMMENT AS comment ' +
+          'FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_TYPE, TABLE_NAME',
       values: [target],
     })
     const list = Array.isArray(rows) ? rows : []
@@ -181,11 +188,26 @@ export class MysqlDriver implements SqlDriver {
       const type = String(record['type'] ?? '')
       const comment = toWireValue(record['comment'])
       const rowCount = toWireValue(record['rows_count'])
+      const engine = toWireValue(record['engine'])
+      const collation = toWireValue(record['collation'])
+      // DATA_LENGTH and INDEX_LENGTH are the engine's own byte figures, so this
+      // costs nothing extra to read. A view reports NULL for both, which is why
+      // the sum is only emitted when at least one of them is a number —
+      // otherwise a view would be shown as 0 bytes.
+      const dataBytes = toWireValue(record['data_bytes'])
+      const indexBytes = toWireValue(record['index_bytes'])
+      const size =
+        typeof dataBytes === 'number' || typeof indexBytes === 'number'
+          ? (typeof dataBytes === 'number' ? dataBytes : 0) + (typeof indexBytes === 'number' ? indexBytes : 0)
+          : undefined
       return {
         name: String(record['name'] ?? ''),
         type: type.includes('VIEW') ? 'view' : 'table',
         ...(typeof rowCount === 'number' ? { rows: rowCount } : {}),
+        ...(size === undefined ? {} : { size }),
         ...(typeof comment === 'string' && comment !== '' ? { comment } : {}),
+        ...(typeof engine === 'string' && engine !== '' ? { engine } : {}),
+        ...(typeof collation === 'string' && collation !== '' ? { collation } : {}),
       } satisfies TableInfo
     })
   }
@@ -288,7 +310,18 @@ export class MysqlDriver implements SqlDriver {
     if (!looksReadOnly(sql)) {
       throw new Error('only read-only statements (SELECT / WITH / SHOW / DESCRIBE / EXPLAIN) are allowed on this surface')
     }
-    return this.runQuery(sql, params, limit, schema)
+    // Push the cap into the statement so the server stops sending rows, rather
+    // than reading the whole result set and slicing it here. `pushDownLimit`
+    // returns undefined for the shapes it cannot rewrite safely (SHOW,
+    // DESCRIBE, EXPLAIN, a statement with its own LIMIT), which then run as
+    // written and are still capped on this side.
+    //
+    // One row PAST the cap is requested on purpose: `shape` decides `truncated`
+    // by comparing the row count against the cap, so a statement capped at
+    // exactly `limit` rows would report "complete" while rows were being
+    // withheld. The extra row is what proves there was more.
+    const pushed = limit >= 1 ? pushDownLimit(sql, limit + 1) : undefined
+    return this.runQuery(pushed ?? sql, params, limit, schema)
   }
 
   async exec(sql: string, params: unknown[], schema?: string): Promise<QueryResult> {
@@ -398,6 +431,37 @@ export class MysqlDriver implements SqlDriver {
     const qualified = qualifyMysql(target, table)
     const where = keys.map(item => `${requireIdentifier(item.column, 'column name', quoteMysql)} <=> ?`).join(' AND ')
     return this.exec(`DELETE FROM ${qualified} WHERE ${where}`, keys.map(item => item.value), target)
+  }
+
+  /**
+   * Empty a table, keeping its schema.
+   *
+   * TRUNCATE rather than DELETE: it is a metadata operation that drops and
+   * recreates the table's data pages instead of removing rows one at a time,
+   * which is the difference between instant and minutes on a large InnoDB
+   * table. It also resets AUTO_INCREMENT, which is the behaviour users expect
+   * from the phpMyAdmin 清空 button this mirrors.
+   *
+   * A view has no rows of its own, so it is refused rather than reported as
+   * "0 rows affected".
+   */
+  async truncateTable(schema: string | undefined, table: string, isView = false): Promise<QueryResult> {
+    if (isView) throw new Error('a view has no rows of its own to delete')
+    const target = this.requireSchema(schema)
+    const qualified = qualifyMysql(target, table)
+    return this.exec(`TRUNCATE TABLE ${qualified}`, [], target)
+  }
+
+  /**
+   * Drop a table or a view.
+   *
+   * The object's kind picks the statement, since MySQL rejects `DROP TABLE` on
+   * a view ("'db.v' is a view").
+   */
+  async dropTable(schema: string | undefined, table: string, isView = false): Promise<QueryResult> {
+    const target = this.requireSchema(schema)
+    const qualified = qualifyMysql(target, table)
+    return this.exec(`DROP ${isView ? 'VIEW' : 'TABLE'} ${qualified}`, [], target)
   }
 }
 

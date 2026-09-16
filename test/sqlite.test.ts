@@ -151,6 +151,78 @@ describe('SqliteDriver', () => {
     expect(result.truncated).toBe(true)
   })
 
+  /**
+   * The cap must reach the engine, not just the host.
+   *
+   * `truncated` is decided by comparing the row count against the cap, so a
+   * statement capped at exactly `limit` rows would report "complete" while rows
+   * were being withheld. That is why the driver asks for one row PAST the cap.
+   * Both sides of that boundary are asserted here.
+   *
+   * The table is built inside this test rather than reusing the shared one:
+   * other tests in this file insert and delete rows, so a shared row count
+   * would make "exactly the cap" mean different things depending on test order.
+   */
+  it('pushes the cap into the statement and gets the truncation boundary right', async () => {
+    if (!available) return
+    await driver.exec('CREATE TABLE cap_test (n INTEGER)', [])
+    await driver.exec('INSERT INTO cap_test (n) VALUES (1),(2),(3),(4)', [])
+
+    // Exactly the cap: no row is withheld, so it must NOT claim truncation.
+    const exact = await driver.query('SELECT * FROM cap_test ORDER BY n', [], 4, 'main')
+    expect(exact.rows).toHaveLength(4)
+    expect(exact.truncated).toBe(false)
+
+    // One over: 3 rows are returned and the flag has to fire.
+    const over = await driver.query('SELECT * FROM cap_test ORDER BY n', [], 3, 'main')
+    expect(over.rows).toHaveLength(3)
+    expect(over.truncated).toBe(true)
+  })
+
+  it('caps a statement that already paginates itself, keeping the inner LIMIT', async () => {
+    if (!available) return
+    await driver.exec('CREATE TABLE inner_limit (n INTEGER)', [])
+    await driver.exec('INSERT INTO inner_limit (n) VALUES (1),(2),(3),(4),(5)', [])
+
+    // An inner LIMIT is not the outer one: the inner cap still decides what the
+    // subquery produces, and the outer cap does not disturb it.
+    const result = await driver.query(
+      'SELECT n FROM (SELECT n FROM inner_limit ORDER BY n LIMIT 2)',
+      [],
+      100,
+      'main',
+    )
+    expect(result.rows.map(row => row[0])).toEqual([1, 2])
+    expect(result.truncated).toBe(false)
+  })
+
+  it('runs a PRAGMA read, which cannot take a pushed-down LIMIT', async () => {
+    if (!available) return
+    // The rewrite must decline here; an appended LIMIT would be a syntax error,
+    // so this test fails loudly if `pushDownLimit` ever starts accepting PRAGMA.
+    const result = await driver.query('PRAGMA table_info(users)', [], 100, 'main')
+    expect(result.columns).toContain('name')
+  })
+
+  it('bounds the work a large SELECT does, not just what it returns', async () => {
+    if (!available) return
+    // The real point of the push-down: the engine stops early. Without it, this
+    // reads and serialises all 20000 rows and then throws 19990 of them away.
+    await driver.exec(
+      'CREATE TABLE big AS WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 20000) SELECT n FROM seq',
+      [],
+    )
+    const started = Date.now()
+    const result = await driver.query('SELECT * FROM big', [], 10, 'main')
+    const elapsed = Date.now() - started
+
+    expect(result.rows).toHaveLength(10)
+    expect(result.truncated).toBe(true)
+    // Loose on purpose: this only needs to catch a regression back to
+    // "materialise everything, then slice", not to benchmark SQLite.
+    expect(elapsed).toBeLessThan(1000)
+  })
+
   it('inserts, updates and deletes through the row helpers', async () => {
     if (!available) return
     const inserted = await driver.insertRow('main', 'users', [

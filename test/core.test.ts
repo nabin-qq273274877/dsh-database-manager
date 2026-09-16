@@ -11,7 +11,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { DataSourceStore } from '../src/store.ts'
 import { decideCall, DEFAULT_GATE_SETTINGS, isWriteTool, sourceIdOf } from '../src/auth.ts'
-import { assertSingleStatement, isSafeIdentifier, looksReadOnly, qualifyMysql, quoteMysql, quoteSqlite, toWireValue } from '../src/sql-util.ts'
+import { assertSingleStatement, isSafeIdentifier, looksReadOnly, pushDownLimit, qualifyMysql, quoteMysql, quoteSqlite, toWireValue } from '../src/sql-util.ts'
 import { isRedisReadCommand } from '../src/drivers/redis.ts'
 import { splitCommand } from '../src/client/command.ts'
 
@@ -231,6 +231,80 @@ describe('SQL identifier and statement guards', () => {
     // A semicolon inside a literal or a comment is not a separator.
     expect(() => assertSingleStatement("SELECT ';' AS s")).not.toThrow()
     expect(() => assertSingleStatement('SELECT 1 -- ; not a separator')).not.toThrow()
+  })
+})
+
+/**
+ * The SQL editor's row cap used to be applied only on the host: a driver read
+ * the whole result set and then sliced it, so a `SELECT *` over a large table
+ * still pulled every row into memory before discarding all but the first page.
+ * These cases pin the rewrite that moves the cap into the statement, and just
+ * as importantly pin the shapes it must REFUSE — a `LIMIT` appended to a PRAGMA
+ * or an EXPLAIN is a syntax error, and appending a second LIMIT to a statement
+ * that already has one silently changes what the user asked for.
+ */
+describe('LIMIT push-down', () => {
+  it('appends a LIMIT to a plain read', () => {
+    expect(pushDownLimit('SELECT * FROM users', 100)).toBe('SELECT * FROM users\nLIMIT 100')
+    expect(pushDownLimit('SELECT a FROM t WHERE b = 1', 10)).toBe('SELECT a FROM t WHERE b = 1\nLIMIT 10')
+  })
+
+  it('caps a CTE and a set operation, which both accept a trailing LIMIT', () => {
+    expect(pushDownLimit('WITH c AS (SELECT 1 AS a) SELECT a FROM c', 5)).toContain('LIMIT 5')
+    expect(pushDownLimit('SELECT a FROM t UNION SELECT a FROM t', 5)).toContain('LIMIT 5')
+  })
+
+  it('replaces a trailing terminator or blank line rather than appending after it', () => {
+    expect(pushDownLimit('SELECT a FROM t;', 3)).toBe('SELECT a FROM t\nLIMIT 3')
+    expect(pushDownLimit('SELECT a FROM t\n\n  ', 3)).toBe('SELECT a FROM t\nLIMIT 3')
+    // A trailing comment stays attached; the clause goes after it.
+    expect(pushDownLimit('SELECT a FROM t -- note', 3)).toBe('SELECT a FROM t -- note\nLIMIT 3')
+  })
+
+  it('refuses a statement that already has an outer LIMIT', () => {
+    // The author's own budget is not ours to shrink.
+    expect(pushDownLimit('SELECT a FROM t LIMIT 2', 100)).toBeUndefined()
+    expect(pushDownLimit('SELECT a FROM t LIMIT 2 OFFSET 1', 100)).toBeUndefined()
+    expect(pushDownLimit('SELECT a FROM t ORDER BY a LIMIT 1', 100)).toBeUndefined()
+  })
+
+  it('does not mistake an inner LIMIT for the outer one', () => {
+    // A subquery's LIMIT is at depth 1 and does not stop the outer rewrite.
+    expect(pushDownLimit('SELECT a FROM (SELECT a FROM t LIMIT 1)', 100)).toContain('\nLIMIT 100')
+    expect(pushDownLimit('SELECT a FROM t WHERE a IN (SELECT a FROM t LIMIT 1)', 100)).toContain('\nLIMIT 100')
+  })
+
+  it('ignores a LIMIT that only appears inside a literal, identifier or comment', () => {
+    expect(pushDownLimit("SELECT b FROM t WHERE b <> 'limit 1'", 100)).toContain('\nLIMIT 100')
+    expect(pushDownLimit('SELECT "limit" FROM t', 100)).toContain('\nLIMIT 100')
+    expect(pushDownLimit('SELECT a FROM t /* limit 1 */', 100)).toContain('\nLIMIT 100')
+  })
+
+  it('refuses the shapes where a trailing LIMIT is a syntax error or means something else', () => {
+    // Verified against SQLite 3.50: each of these rejects the appended clause.
+    expect(pushDownLimit('PRAGMA table_info(t)', 100)).toBeUndefined()
+    expect(pushDownLimit('EXPLAIN SELECT * FROM t', 100)).toBeUndefined()
+    expect(pushDownLimit('SHOW TABLES', 100)).toBeUndefined()
+    expect(pushDownLimit('DESCRIBE t', 100)).toBeUndefined()
+    expect(pushDownLimit('VALUES (1),(2)', 100)).toBeUndefined()
+    expect(pushDownLimit('TABLE t', 100)).toBeUndefined()
+  })
+
+  it('refuses a clause that has to stay last', () => {
+    expect(pushDownLimit('SELECT a FROM t FOR UPDATE', 100)).toBeUndefined()
+    expect(pushDownLimit('SELECT a INTO OUTFILE "/tmp/x" FROM t', 100)).toBeUndefined()
+  })
+
+  it('refuses writes and a non-positive cap', () => {
+    expect(pushDownLimit('DELETE FROM t', 100)).toBeUndefined()
+    expect(pushDownLimit('INSERT INTO t VALUES (1)', 100)).toBeUndefined()
+    expect(pushDownLimit('SELECT a FROM t', 0)).toBeUndefined()
+    expect(pushDownLimit('SELECT a FROM t', -1)).toBeUndefined()
+    expect(pushDownLimit('SELECT a FROM t', Number.NaN)).toBeUndefined()
+  })
+
+  it('truncates a fractional cap instead of emitting invalid syntax', () => {
+    expect(pushDownLimit('SELECT a FROM t', 2.9)).toBe('SELECT a FROM t\nLIMIT 2')
   })
 })
 

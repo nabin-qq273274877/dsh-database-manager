@@ -95,22 +95,18 @@ export function looksReadOnly(sql: string): boolean {
 }
 
 /**
- * Reject a multi-statement payload. Every engine here executes one statement
- * per call unless explicitly told otherwise; refusing semicolons in the middle
- * keeps a "single statement" contract honest. A trailing semicolon is fine.
+ * Visit every character of `sql` that is real code — that is, outside string
+ * literals, quoted identifiers, and comments. `depth` is the bracket nesting
+ * level at that character.
+ *
+ * Returning `true` from `visit` stops the walk. This is a lexical guard rather
+ * than a parser: it exists so a `;` or a keyword sitting inside a literal or a
+ * comment cannot be mistaken for syntax. Where the text is ambiguous it errs
+ * toward treating it as non-code, which makes a caller refuse a statement
+ * rather than rewrite the wrong one.
  */
-export function assertSingleStatement(sql: string): void {
-  const withoutTrailing = sql.replace(/;\s*$/, '')
-  if (containsStatementSeparator(withoutTrailing)) {
-    throw new Error('only one statement per call is allowed')
-  }
-}
-
-/**
- * Whether the text contains a `;` outside of a string literal, a quoted
- * identifier, or a comment.
- */
-function containsStatementSeparator(sql: string): boolean {
+function forEachCodeChar(sql: string, visit: (char: string, index: number, depth: number) => boolean | void): void {
+  let depth = 0
   let i = 0
   const n = sql.length
   while (i < n) {
@@ -143,10 +139,112 @@ function containsStatementSeparator(sql: string): boolean {
       }
       continue
     }
-    if (ch === ';') return true
+    if (ch === '(') { depth++; i++; continue }
+    if (ch === ')') { depth = depth > 0 ? depth - 1 : 0; i++; continue }
+    if (visit(ch, i, depth) === true) return
     i++
   }
-  return false
+}
+
+/** One word character — the grammar a keyword is matched against. */
+const WORD_CHAR_RE = /[A-Za-z0-9_$]/
+
+/**
+ * Whether a keyword occurs at bracket depth 0, outside literals and comments.
+ *
+ * Depth matters because a subquery's own `LIMIT` is not the statement's: the
+ * append in {@link pushDownLimit} is only illegal when the OUTER statement
+ * already carries one.
+ */
+function hasTopLevelKeyword(sql: string, keyword: string): boolean {
+  const target = keyword.toLowerCase()
+  let found = false
+  forEachCodeChar(sql, (char, index, depth) => {
+    if (depth !== 0 || !/[A-Za-z_]/.test(char)) return
+    // Match at a word start only, so a word is not tested once per letter.
+    const previous = index === 0 ? '' : sql[index - 1]!
+    if (previous !== '' && WORD_CHAR_RE.test(previous)) return
+    let end = index + 1
+    while (end < sql.length && WORD_CHAR_RE.test(sql[end]!)) end++
+    if (sql.slice(index, end).toLowerCase() === target) {
+      found = true
+      return true
+    }
+  })
+  return found
+}
+
+/**
+ * Clauses that must stay at the very end of a statement. Appending `LIMIT`
+ * after one of them is a syntax error, and each also marks a statement whose
+ * row budget is not really ours to change.
+ */
+const TRAILING_CLAUSES = ['into', 'for', 'lock', 'procedure'] as const
+
+/**
+ * Move a row cap into the statement itself, as `LIMIT n`, so the engine — not
+ * this process — is what stops reading.
+ *
+ * The cap has been applied on the host until now: a driver reads the whole
+ * result set and only then slices it. That bounds what the browser receives but
+ * not what the host materialises, so `SELECT * FROM` over a large table still
+ * pulls every row into memory and discards all but the first page afterwards.
+ * Rewriting the statement bounds the work at the source.
+ *
+ * Returns `undefined` — meaning "run it exactly as written" — whenever the cap
+ * cannot be expressed safely:
+ *
+ * - its leading keyword is not SELECT/WITH, which also excludes writes. PRAGMA,
+ *   EXPLAIN, SHOW, DESCRIBE, TABLE and a bare VALUES either reject a trailing
+ *   LIMIT outright or mean something else by it;
+ * - it already carries an outer LIMIT, which is the author's own budget;
+ * - it ends in a clause that has to stay last.
+ *
+ * A subquery's inner LIMIT is not an outer one and does not block the rewrite.
+ *
+ * @param sql - one statement, as typed by the user or the model.
+ * @param limit - the row cap; a value below 1 disables the rewrite.
+ * @returns the capped statement, or `undefined` to leave it alone.
+ */
+export function pushDownLimit(sql: string, limit: number): string | undefined {
+  if (!Number.isFinite(limit) || limit < 1) return undefined
+  const keyword = leadingKeyword(sql)
+  if (keyword !== 'select' && keyword !== 'with') return undefined
+  if (hasTopLevelKeyword(sql, 'limit')) return undefined
+  for (const clause of TRAILING_CLAUSES) {
+    if (hasTopLevelKeyword(sql, clause)) return undefined
+  }
+  // A trailing terminator or blank line would otherwise sit between the
+  // statement and the clause we append.
+  const body = sql.replace(/[\s;]+$/, '')
+  if (body === '') return undefined
+  return `${body}\nLIMIT ${Math.trunc(limit)}`
+}
+
+/**
+ * Reject a multi-statement payload. Every engine here executes one statement
+ * per call unless explicitly told otherwise; refusing semicolons in the middle
+ * keeps a "single statement" contract honest. A trailing semicolon is fine.
+ */
+export function assertSingleStatement(sql: string): void {
+  const withoutTrailing = sql.replace(/;\s*$/, '')
+  if (containsStatementSeparator(withoutTrailing)) {
+    throw new Error('only one statement per call is allowed')
+  }
+}
+
+/**
+ * Whether the text contains a `;` outside of a string literal, a quoted
+ * identifier, or a comment.
+ */
+function containsStatementSeparator(sql: string): boolean {
+  let found = false
+  forEachCodeChar(sql, char => {
+    if (char !== ';') return
+    found = true
+    return true
+  })
+  return found
 }
 
 /**
