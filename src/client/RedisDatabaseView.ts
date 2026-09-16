@@ -832,13 +832,18 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
  *
  * The percentage is `visited / dbSize` — a real measure of work done, not a spinner
  * of unknown length. It also names the database, because several may be walked.
+ *
+ * It carries only `.dbm-index-progress`: that class owns the padding, the colour
+ * and the column layout. It used to also carry `.dbm-ok` for the green text, which
+ * brought `display: block` with it and — at equal specificity, later in the sheet —
+ * flattened the layout, leaving the bar to overflow its box and sit on the tree.
  */
 function IndexProgressBanner(props: { db: number; status: RedisIndexStatus }): React.ReactElement {
   const { db, status } = props
   const pct = status.dbSize === 0 ? 0 : Math.min(100, Math.round((status.visited / status.dbSize) * 100))
   return React.createElement(
     'div',
-    { className: 'dbm-ok dbm-index-progress', style: { padding: '6px 14px' } },
+    { className: 'dbm-index-progress' },
     React.createElement('span', null, t('redis.index.building', {
       db,
       visited: status.visited.toLocaleString(),
