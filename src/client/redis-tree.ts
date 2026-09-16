@@ -115,40 +115,19 @@ export function countFolderKeys(folder: RedisFolderNode): number {
   return total
 }
 
-/** Whether a key name matches the tree filter (empty filter matches all). */
-export function matchesFilter(key: string, filter: string): boolean {
-  if (filter === '') return true
-  return key.toLowerCase().includes(filter.toLowerCase())
-}
-
-/**
- * Prune a tree to the keys matching a filter.
+/*
+ * A local `filterTree`/`matchesFilter` pair used to live here: a client-side
+ * substring match over the rows already loaded. It was REMOVED, not fixed,
+ * because its premise was wrong for the feature people wanted. It could not
+ * evaluate a Redis glob — `includes('jd:*')` never matches anything, since `*`
+ * is not a wildcard to String#includes — and it could not see keys under folders
+ * that were never expanded, so it reported "no matches" for keys that plainly
+ * existed.
  *
- * A folder is kept when any key beneath it matches, so filtering narrows the
- * tree instead of flattening it — the folder structure stays visible while the
- * user types, which is the point of having one.
+ * Searching is now a server operation (SCAN MATCH, see RedisDriver.search) whose
+ * results are regrouped with `buildRedisTree` below. Keeping a lookalike helper
+ * here would invite the next reader to reintroduce the broken behaviour.
  */
-export function filterTree(tree: RedisTree, filter: string): RedisTree {
-  if (filter === '') return tree
-  const prune = (node: RedisFolderNode): RedisFolderNode | undefined => {
-    const folders: RedisFolderNode[] = []
-    for (const child of node.folders) {
-      const kept = prune(child)
-      if (kept !== undefined) folders.push(kept)
-    }
-    const keys = node.keys.filter(info => matchesFilter(info.key, filter))
-    if (folders.length === 0 && keys.length === 0) return undefined
-    return { ...node, folders, keys }
-  }
-  const root: RedisFolderNode = { name: '', path: '', folders: tree.folders, keys: tree.keys }
-  const kept = prune(root)
-  return {
-    folders: kept?.folders ?? [],
-    keys: kept?.keys ?? [],
-    total: tree.total,
-    truncated: tree.truncated,
-  }
-}
 
 /** One parsed line of the elements textarea. */
 export interface ParsedElements {

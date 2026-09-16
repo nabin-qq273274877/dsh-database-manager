@@ -16,7 +16,6 @@ import {
   countFolderKeys,
   createPrefix,
   escapeGlob,
-  filterTree,
   isUnderPrefix,
   keyPattern,
   parseElements,
@@ -136,31 +135,80 @@ describe('isUnderPrefix', () => {
   })
 })
 
-describe('filterTree', () => {
-  it('keeps the folder path to a match instead of flattening the tree', () => {
-    const tree = buildRedisTree([key('a:b:orders'), key('a:b:users'), key('c:d:orders')])
-    const filtered = filterTree(tree, 'orders')
+describe('grouping search results into a tree', () => {
+  /**
+   * A search returns a FLAT list of matches from the whole database. The panel
+   * regroups them with `buildRedisTree` and draws them with the same rows as the
+   * normal tree, so what matters is that the grouping restores the structure the
+   * matches actually have.
+   */
+  it('rebuilds nested folders from matches that came from anywhere', () => {
+    // Matches of `jd:*` from three different depths of the keyspace.
+    const tree = buildRedisTree([key('jd:order:1'), key('jd:order:2'), key('jd:deep:nested:key'), key('jd:top')])
 
-    expect(filtered.folders.map(folder => folder.name)).toEqual(['a', 'c'])
-    const a = filtered.folders[0]!
-    expect(a.folders.map(folder => folder.name)).toEqual(['b'])
-    expect(a.folders[0]!.keys.map(item => item.key)).toEqual(['a:b:orders'])
+    expect(tree.folders.map(folder => folder.name)).toEqual(['jd'])
+    const jd = tree.folders[0]!
+    expect(jd.folders.map(folder => folder.name)).toEqual(['deep', 'order'])
+    // `jd:top` has no further separator, so it is a key at jd's own level.
+    expect(jd.keys.map(item => item.key)).toEqual(['jd:top'])
+    expect(jd.folders[1]!.keys.map(item => item.key)).toEqual(['jd:order:1', 'jd:order:2'])
   })
 
-  it('returns the tree unchanged for an empty filter', () => {
-    const tree = buildRedisTree([key('a:b')])
-    expect(filterTree(tree, '')).toBe(tree)
+  it('counts each folder by the MATCHES below it, not by the keyspace', () => {
+    // A search result's folder holds only the matches under it. Reporting the
+    // server's total for that prefix would show a number far larger than the
+    // rows on screen, which reads as missing results.
+    const tree = buildRedisTree([key('jd:order:1'), key('jd:order:2'), key('jd:user:9')])
+    const jd = tree.folders[0]!
+    expect(countFolderKeys(jd)).toBe(3)
+    expect(jd.folders.find(folder => folder.name === 'order')!.keys).toHaveLength(2)
   })
 
-  it('drops folders with nothing left under them', () => {
-    const tree = buildRedisTree([key('a:b:1'), key('c:d:2')])
-    const filtered = filterTree(tree, 'd:2')
-    expect(filtered.folders.map(folder => folder.name)).toEqual(['c'])
+  it('handles matches with no separator at all', () => {
+    // `*` and `?` searches routinely match top-level keys, which belong at the
+    // root of the regrouped tree rather than under any folder.
+    const tree = buildRedisTree([key('plain'), key('jd:a')])
+    expect(tree.keys.map(item => item.key)).toEqual(['plain'])
+    expect(tree.folders.map(folder => folder.name)).toEqual(['jd'])
   })
 
-  it('matches case-insensitively', () => {
-    const tree = buildRedisTree([key('App:Sessions')])
-    expect(filterTree(tree, 'app').folders).toHaveLength(1)
+  it('carries the truncation flag through, so a partial result is not shown as complete', () => {
+    const tree = buildRedisTree([key('jd:a')], true)
+    expect(tree.truncated).toBe(true)
+  })
+
+  it('produces an empty tree for no matches, without inventing folders', () => {
+    const tree = buildRedisTree([])
+    expect(tree.folders).toEqual([])
+    expect(tree.keys).toEqual([])
+    expect(tree.total).toBe(0)
+  })
+
+  it('a search folder\'s count is the matches below it, which is NOT its delete scope', () => {
+    // The reason search-result folder rows carry no write controls. A folder in
+    // search results is built from the matches alone, so its count says how many
+    // matched — while deleting the same prefix removes every key under it. A row
+    // reading "order (1)" would destroy three keys:
+    //
+    //   jd:order:1  jd:order:2  jd:order:3     (server)
+    //   match of `*1` -> jd:order:1            (search)
+    //
+    // This test states the invariant the UI depends on, so that if the delete
+    // control is ever re-added to search results, the mismatch is on record.
+    const all = [key('jd:order:1'), key('jd:order:2'), key('jd:order:3')]
+    const matched = all.filter(item => item.key.endsWith('1'))
+
+    const fullTree = buildRedisTree(all)
+    const searchTree = buildRedisTree(matched)
+
+    const orderOf = (tree: ReturnType<typeof buildRedisTree>): number =>
+      countFolderKeys(tree.folders[0]!.folders.find(folder => folder.name === 'order')!)
+
+    expect(orderOf(fullTree)).toBe(3)
+    expect(orderOf(searchTree)).toBe(1)
+    // They disagree by design; the UI must not offer an action whose scope is
+    // the larger of the two from a view that displays the smaller.
+    expect(orderOf(searchTree)).not.toBe(orderOf(fullTree))
   })
 })
 

@@ -42,10 +42,14 @@ const FLOW = `(async () => {
   click(sidebar);
   await waitFor(() => document.querySelector('.dbm-root'), 10000);
 
-  const cell = await waitFor(() => byIncludes('.dbm-table td', ${JSON.stringify(sourceId)}), 10000)
-    || await waitFor(() => document.querySelector('.dbm-table tbody tr'), 5000);
-  const dataRow = cell ? cell.closest('tr') : null;
-  const connect = dataRow ? (byText('.dbm-actions .dbm-btn', '连接') || byText('.dbm-actions .dbm-btn', 'Connect')) : null;
+  // Locate the source's own row. No fallback to the first row: doing that
+  // silently connected to whichever source sorted first and reported "no key
+  // row" for keys that were plainly present in the intended database.
+  const sourceRow = await waitFor(() => Array.from(document.querySelectorAll('.dbm-table tbody tr'))
+    .find((row) => (row.textContent || '').includes(${JSON.stringify(sourceId)})) ?? null, 15000);
+  if (!sourceRow) return JSON.stringify({ fatal: 'source row not found', wanted: ${JSON.stringify(sourceId)} });
+  const connect = Array.from(sourceRow.querySelectorAll('.dbm-actions .dbm-btn'))
+    .find((b) => ['连接', 'Connect'].includes((b.textContent || '').trim())) || null;
   if (!connect) return JSON.stringify({ fatal: 'no connect' });
   click(connect);
 

@@ -72,7 +72,19 @@ TTL 可改可清：填秒数设置过期，「设为永久」走 `PERSIST`。**�
 
 实现上的一个坑：`refreshAll` 原先用 `void` 并发发起各层重载后**立刻返回**，于是调用方的 busy 标记在树还在取数时就撤掉了——那正是"有一下没反应"的来源。现在它 `await` 全部重载；同时把受影响的层级显式传入（新建时是目标目录，删除时是父层与被删目录本身），因为这些层可能尚未加载、不在 `levels` 里，只"重载已加载的层"会让新建的键或删除结果不可见。
 
+### 搜索
 
+搜索框里填 **Redis 通配符**（`jd:*`、`*session*`、`?` 等），回车或点 🔍 执行，**在选定的那个库上**做服务端 `SCAN MATCH`。库下拉框就在搜索框右边，因为搜索前必须能看清作用范围。
+
+结果**按目录归组成树**，与左侧原树同一套行渲染，而不是另做一个扁平列表——匹配项本身带有层级（`jd:order:1`），摊平就丢掉了这个信息。匹配到的目录**全部展开**：搜索已经定位到它们了，再让人一层层点开是反过来的。
+
+清空搜索框（或按 Esc）回到原来的目录树。
+
+> 早先的实现是**本地子串过滤**，它有两个无法修的问题：`includes('jd:*')` 永远匹配不到任何东西（`*` 对 `includes` 不是通配符），且它只看已加载的层，未展开目录里的键一概搜不到——于是对明明存在的键报告"没有匹配"。这不是被修好的，是被**删除并改为服务端搜索**的；`filterTree`/`matchesFilter` 已从代码里移除，以免后人照着它把旧行为带回来。
+
+**搜索结果的目录行不提供写操作**，这是安全性决定而非简化：搜索构建的目录只统计**匹配项**，而删除该前缀会移除其下**全部**键。一个显示「order (1)」的行可能会删掉三个键——分组视图不是提供破坏性操作的地方。
+
+搜索范围限定单个库：把模式跑遍 16 个逻辑库会扫过整个实例，慢到无法在输入时使用。
 
 改动先在本地暂存，点**保存**才写；有未保存修改会标出来。`保存` 在无改动时是禁用的。
 
@@ -224,15 +236,20 @@ npm run build       # lib/index.js（host）+ lib/client.js（browser）
 | `scripts/e2e-redis-edit.mjs` | 真实浏览器里改值 / 改 TTL / 追加元素 / 改 hash 字段，并核对服务端实际状态 |
 | `scripts/e2e-ttl-countdown.mjs` | 真实浏览器里确认 TTL 倒计时随时间递减、重设后重新锚定、编辑框预填实时余量 |
 | `scripts/e2e-tree-loading.mjs` | 用 MutationObserver 确认新增 / 删除期间的忙碌标记确实出现、且随后清除 |
+| `scripts/e2e-search-tree.mjs` | 确认搜索结果是树形、目录全展开、目录行无写操作、清空搜索框回到原树 |
 | `scripts/shot-ttl-row.mjs` | 截取 TTL 那一行，供视觉复核 |
 | `scripts/shot-tree-loading.mjs` | 截取忙碌态（用 CDP 网络限速把毫秒级窗口拉长到可拍） |
+| `scripts/shot-search.mjs` | 截取搜索结果，供视觉复核 |
 | `scripts/bench-tree-e2e.mjs` | 大库上量树的交互耗时（点开到首屏可见） |
 | `scripts/bench-redis-level.mts` / `seed-bench.sh` | 层级扫描的回归基准与造数（26 万键级） |
 | `scripts/dump-redis-level.mts` / `dump-value-pane.mjs` | 打印某层扫描结果 / 值面板的真实 DOM，用于核对 |
 | `scripts/shot-redis-tree.mjs` | 截取 Redis 树，供视觉复核（输出到 `.shots/`，不入库） |
 | `scripts/check-template-literals.mjs` | 校验"模板字面量里嵌代码"的文件（样式表、E2E 页面代码）没有裸反引号 |
+| `scripts/check-locale-placeholders.mjs` | 校验 `t('key', {...})` 提供的占位符与模板一致（防 `db{n}` 渲染成字面量） |
 
 > E2E 脚本把页面代码放在模板字面量里，样式表也把 CSS 放在模板字面量里，注释中出现反引号会直接破坏解析，且报错信息指向被嵌入的语言而非反引号本身（在样式表里尤其误导）。改完这些文件请跑一次 `node scripts/check-template-literals.mjs`。
+>
+> 改完界面文案请跑一次 `node scripts/check-locale-placeholders.mjs`：插值器会原样保留未知占位符，所以 `t('k', { db: 3 })` 配上模板 `'db{n}'` 不会报错，只会渲染出字面量 `db{n}`——只有读渲染结果才能发现。
 
 ### 架构
 

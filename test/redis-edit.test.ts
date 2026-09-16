@@ -353,6 +353,129 @@ describe.skipIf(!up)('Redis key editing (live server)', () => {
     })
   })
 
+  describe('search', () => {
+    beforeAll(async () => {
+      await driver.deletePrefix(`${ROOT}srch`, DB)
+      await driver.createKey({ key: `${PREFIX}srch:jd:order:1`, type: 'string', value: 'v' }, DB)
+      await driver.createKey({ key: `${PREFIX}srch:jd:order:2`, type: 'string', value: 'v' }, DB)
+      await driver.createKey({ key: `${PREFIX}srch:jd:user:1`, type: 'string', value: 'v' }, DB)
+      await driver.createKey({ key: `${PREFIX}srch:other:1`, type: 'string', value: 'v' }, DB)
+      await driver.createKey({ key: `${PREFIX}srch:top`, type: 'string', value: 'v' }, DB)
+      // Deliberately not a string, so the type in the results is exercised.
+      await driver.createKey({ key: `${PREFIX}srch:jd:hash`, type: 'hash', fields: [{ field: 'f', value: 'v' }] }, DB)
+    })
+
+    it('evaluates a Redis glob, not a literal substring', async () => {
+      // The regression: a client-side `includes('jd:*')` never matches anything,
+      // because `*` is not a wildcard to String#includes. Only the server's
+      // SCAN MATCH gives the pattern its Redis meaning.
+      const page = await driver.search({ db: DB, pattern: `${PREFIX}srch:jd:*` })
+      const keys = page.keys.map(item => item.key).sort()
+      expect(keys).toEqual([
+        `${PREFIX}srch:jd:hash`,
+        `${PREFIX}srch:jd:order:1`,
+        `${PREFIX}srch:jd:order:2`,
+        `${PREFIX}srch:jd:user:1`,
+      ])
+      expect(page.truncated).toBe(false)
+    })
+
+    it('finds keys that no level scan has loaded', async () => {
+      // A search is answered from the whole database, so it reaches keys under
+      // folders that were never expanded — the other half of the regression.
+      const page = await driver.search({ db: DB, pattern: `${PREFIX}srch:jd:user:*` })
+      expect(page.keys.map(item => item.key)).toEqual([`${PREFIX}srch:jd:user:1`])
+    })
+
+    it('supports the other glob metacharacters', async () => {
+      const middle = await driver.search({ db: DB, pattern: `${PREFIX}srch:*:order:*` })
+      expect(middle.keys.map(item => item.key).sort()).toEqual([
+        `${PREFIX}srch:jd:order:1`,
+        `${PREFIX}srch:jd:order:2`,
+      ])
+
+      // `?` matches exactly one character.
+      const single = await driver.search({ db: DB, pattern: `${PREFIX}srch:other:?` })
+      expect(single.keys.map(item => item.key)).toEqual([`${PREFIX}srch:other:1`])
+
+      // A character class.
+      const klass = await driver.search({ db: DB, pattern: `${PREFIX}srch:jd:order:[12]` })
+      expect(klass.keys).toHaveLength(2)
+    })
+
+    it('carries the type and TTL of each match', async () => {
+      const page = await driver.search({ db: DB, pattern: `${PREFIX}srch:jd:hash` })
+      expect(page.keys[0]?.type).toBe('hash')
+      expect(page.keys[0]?.ttl).toBe(-1)
+    })
+
+    it('sorts results by name', async () => {
+      const page = await driver.search({ db: DB, pattern: `${PREFIX}srch:jd:order:*` })
+      expect(page.keys.map(item => item.key)).toEqual([
+        `${PREFIX}srch:jd:order:1`,
+        `${PREFIX}srch:jd:order:2`,
+      ])
+    })
+
+    it('reports how many matches the scan returned, and the database size', async () => {
+      const page = await driver.search({ db: DB, pattern: `${PREFIX}srch:jd:*` })
+      // SCAN MATCH filters SERVER-side, so the scan only ever hands back
+      // matching keys: `scanned` counts those, not the whole keyspace it walked.
+      // dbSize is what gives the "N of M" context in the UI.
+      expect(page.scanned).toBe(page.keys.length)
+      expect(page.dbSize).toBeGreaterThan(page.keys.length)
+    })
+
+    it('reports a truncated result rather than passing off a partial list', async () => {
+      // Past the cap the UI must be able to say "showing the first N". This is
+      // asserted structurally (the flag exists and is false for a small result)
+      // because seeding 5000+ keys to trip it would dominate the suite.
+      const page = await driver.search({ db: DB, pattern: `${PREFIX}srch:jd:*` })
+      expect(page.truncated).toBe(false)
+    })
+
+    it('returns nothing for a pattern that matches nothing, without erroring', async () => {
+      const page = await driver.search({ db: DB, pattern: `${PREFIX}srch:nope:*` })
+      expect(page.keys).toEqual([])
+      expect(page.truncated).toBe(false)
+    })
+
+    it('treats an empty pattern as match-all', async () => {
+      const page = await driver.search({ db: DB, pattern: '' })
+      expect(page.keys.length).toBeGreaterThan(0)
+      expect(page.dbSize).toBeGreaterThan(0)
+    })
+
+    it('searches only the database it is told to', async () => {
+      // Scoping matters: a pattern run against the wrong db silently returns the
+      // wrong keys, which is worse than an error.
+      const other = 11
+      await driver.createKey({ key: `${PREFIX}srch:jd:elsewhere`, type: 'string', value: 'v' }, other)
+      try {
+        const inNine = await driver.search({ db: DB, pattern: `${PREFIX}srch:jd:elsewhere` })
+        const inEleven = await driver.search({ db: other, pattern: `${PREFIX}srch:jd:elsewhere` })
+        expect(inNine.keys).toHaveLength(0)
+        expect(inEleven.keys).toHaveLength(1)
+      } finally {
+        await driver.deletePrefix(`${PREFIX}srch:jd:elsewhere`, other)
+      }
+    })
+
+    it('escaped metacharacters in a literal pattern are honoured', async () => {
+      // A user searching for a literal `*` in a key name must be able to say so,
+      // and the server's own escaping is what makes that work.
+      await driver.createKey({ key: `${PREFIX}srch:lit*eral`, type: 'string', value: 'v' }, DB)
+      await driver.createKey({ key: `${PREFIX}srch:litXeral`, type: 'string', value: 'v' }, DB)
+      try {
+        const escaped = await driver.search({ db: DB, pattern: `${PREFIX}srch:lit\\*eral` })
+        expect(escaped.keys.map(item => item.key)).toEqual([`${PREFIX}srch:lit*eral`])
+      } finally {
+        await driver.deleteKey(`${PREFIX}srch:lit*eral`, DB)
+        await driver.deleteKey(`${PREFIX}srch:litXeral`, DB)
+      }
+    })
+  })
+
   describe('database isolation', () => {
     it('does not see or delete keys in another database', async () => {
       // The tree spans databases in the UI, so a crossed wire here would show

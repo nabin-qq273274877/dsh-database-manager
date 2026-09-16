@@ -21,6 +21,7 @@ import {
   type RedisLevelPage,
   type RedisMutationResult,
   type RedisPrefixCount,
+  type RedisSearchPage,
   type RedisValue,
   type SchemaInfo,
   type ColumnInfo,
@@ -38,8 +39,22 @@ export class DbApiError extends Error {
   }
 }
 
-/** Parse a JSON response or throw a DbApiError carrying the server's message. */
+/**
+ * Parse a JSON response or throw a DbApiError carrying the server's message.
+ *
+ * A non-Response argument is reported as such instead of as a status code. That
+ * is not hypothetical: a double-parse bug (calling this on an already-parsed
+ * object) produced "HTTP undefined: invalid JSON response" for requests the
+ * server had answered with 200, which sent the investigation to the host when
+ * the fault was entirely in the client.
+ */
 async function readJson<T>(response: Response): Promise<T> {
+  if (typeof (response as { json?: unknown } | null | undefined)?.json !== 'function') {
+    throw new DbApiError(
+      'internal error: readJson was given a value that is not a Response ' +
+      '(the response was most likely already parsed)',
+    )
+  }
   let body: unknown
   try {
     body = await response.json()
@@ -92,9 +107,17 @@ export class DbApi {
     return (await readJson<{ settings: GateSettingsView }>(await fetch(`${DB_API_BASE}/settings`))).settings
   }
 
-  /** Patch the write posture. */
+  /**
+   * Patch the write posture.
+   *
+   * `send` already parses the response, so the result is destructured directly.
+   * Wrapping it in another `readJson` (as this did) called `.json()` on a plain
+   * object: the throw was then reported as "HTTP undefined: invalid JSON
+   * response", because the caught value had no `status` — a misleading message
+   * for a request the server had in fact answered with 200.
+   */
   async setSettings(patch: Partial<GateSettingsView>): Promise<GateSettingsView> {
-    return (await readJson<{ settings: GateSettingsView }>(await send(`${DB_API_BASE}/settings`, 'PATCH', patch))).settings
+    return (await send<{ settings: GateSettingsView }>(`${DB_API_BASE}/settings`, 'PATCH', patch)).settings
   }
 
   /** Create a data source. */
@@ -219,6 +242,19 @@ export class DbApi {
       args: body.args,
       allowWrite: body.allowWrite,
     })).result
+  }
+
+  /**
+   * Search one database for keys matching a Redis glob pattern.
+   *
+   * Server-side `SCAN MATCH`, so the pattern is real Redis glob syntax and the
+   * search covers folders that are not expanded. Distinct from
+   * {@link redisLevel}, which reads one level of the tree.
+   */
+  async redisSearch(id: string, options: { db: number; pattern: string }): Promise<RedisSearchPage> {
+    return (await readJson<{ page: RedisSearchPage }>(
+      await fetch(DB_API.redisSearch(id, query({ db: options.db, pattern: options.pattern }))),
+    )).page
   }
 
   /**

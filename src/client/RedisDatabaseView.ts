@@ -23,6 +23,7 @@ import {
   type RedisCreatePayload,
   type RedisDbNode,
   type RedisLevel,
+  type RedisSearchState,
   type RedisSelection,
 } from './RedisKeyTree.ts'
 import { RedisValueEditor } from './RedisValueEditor.ts'
@@ -50,7 +51,16 @@ export interface RedisDatabaseViewProps {
 export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactElement {
   const { api, source, initialInfo, onBack, onClose } = props
   const [info, setInfo] = React.useState<RedisInfo>(initialInfo)
-  const [filter, setFilter] = React.useState('')
+  /**
+   * The search box's contents. Typing does NOT search: the pattern is sent when
+   * the user asks for it (Enter or the button), because a search scans the whole
+   * database server-side and firing one per keystroke would hammer the server.
+   */
+  const [pattern, setPattern] = React.useState('')
+  /** The database a search applies to. */
+  const [searchDb, setSearchDb] = React.useState<number>(source.db ?? 0)
+  /** The active search, or undefined when the tree shows its structure. */
+  const [search, setSearch] = React.useState<RedisSearchState | undefined>(undefined)
   /**
    * Loaded levels, keyed by `${db}\0${prefix}`.
    *
@@ -301,7 +311,12 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
       }
       setError(undefined)
       setDeleteFor(undefined)
-      await refreshAll(affected)
+      // Which view needs updating depends on what is on screen. In search mode
+      // the tree's levels are not what the user is looking at, so reloading them
+      // would leave the just-deleted key still listed. Re-running the same search
+      // is what keeps the visible rows true.
+      if (search !== undefined) await runSearch(searchDb, search.pattern)
+      else await refreshAll(affected)
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure))
     } finally {
@@ -309,7 +324,49 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
     }
   }
 
+  /**
+   * Run a search against ONE database.
+   *
+   * The pattern is evaluated by the server (`SCAN MATCH`), so a Redis glob works
+   * and keys inside unexpanded folders are found. Scoped to `db` because a
+   * pattern applied across all 16 logical databases would sweep the whole
+   * instance — far too slow to be useful.
+   *
+   * @param db - the database to search.
+   * @param pattern - the Redis glob to match.
+   */
+  const runSearch = React.useCallback(async (db: number, pattern: string): Promise<void> => {
+    const trimmed = pattern.trim()
+    if (trimmed === '') return
+    setSearch({ pattern: trimmed, loading: true })
+    setSearchDb(db)
+    try {
+      const page = await api.redisSearch(source.id, { db, pattern: trimmed })
+      setSearch({
+        pattern: trimmed,
+        loading: false,
+        keys: page.keys,
+        truncated: page.truncated,
+        scanned: page.scanned,
+      })
+      setError(undefined)
+    } catch (failure) {
+      setSearch({
+        pattern: trimmed,
+        loading: false,
+        error: failure instanceof Error ? failure.message : String(failure),
+      })
+    }
+  }, [api, source.id])
+
+  /** Leave search mode and go back to the tree. */
+  const clearSearch = (): void => {
+    setSearch(undefined)
+    setPattern('')
+  }
+
   // ---- left: the tree ----------------------------------------------------
+  const searching = search !== undefined
   const left = React.createElement(
     'div',
     { className: 'dbm-side' },
@@ -319,22 +376,72 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
       React.createElement('input', {
         className: 'dbm-input',
         style: { flex: 1 },
-        value: filter,
+        value: pattern,
         placeholder: t('redisdb.filter'),
+        title: t('redisdb.search.hint'),
         spellcheck: false,
-        onChange: (event: { target: { value: string } }) => setFilter(event.target.value),
+        onChange: (event: { target: { value: string } }) => {
+          const next = event.target.value
+          setPattern(next)
+          // Emptying the box returns to the tree. Leaving a stale result set on
+          // screen with an empty box gave no way back to the normal view except
+          // a separate control, and the box being empty reads as "no search".
+          if (next.trim() === '') setSearch(undefined)
+        },
+        // Enter runs the search. Typing alone does not: a search scans the whole
+        // database on the server, so one request per keystroke would be abusive.
+        onKeyDown: (event: { key: string }) => {
+          if (event.key === 'Enter') void runSearch(searchDb, pattern)
+          // Esc clears, matching the usual convention for a search field.
+          if (event.key === 'Escape') {
+            setPattern('')
+            setSearch(undefined)
+          }
+        },
       }),
+      // Which database to search. A compact select rather than a separate
+      // control per db row: the scope must be visible BEFORE running the search,
+      // and the tree's db rows are replaced by results while searching.
+      React.createElement(
+        'select',
+        {
+          className: 'dbm-select',
+          value: String(searchDb),
+          title: t('redisdb.search.scope.db', { n: searchDb }),
+          'aria-label': t('redisdb.search.scope.db', { n: searchDb }),
+          onChange: (event: { target: { value: string } }) => setSearchDb(Number(event.target.value)),
+        },
+        databases.map(node =>
+          React.createElement('option', { key: node.db, value: String(node.db) }, `db${node.db}`),
+        ),
+      ),
       React.createElement('button', {
         type: 'button',
-        className: `dbm-btn dbm-btn-sm${refreshing ? ' dbm-btn-busy' : ''}`,
-        title: t('redisdb.refresh'),
-        'aria-label': t('redisdb.refresh'),
-        // A second press while a refresh is running would stack another round of
-        // scans on the same levels.
-        disabled: refreshing,
-        'aria-busy': refreshing ? 'true' : undefined,
-        onClick: () => { void refreshAll() },
-      }, refreshing ? React.createElement('span', { className: 'dbm-spinner' }) : '⟳'),
+        className: 'dbm-btn dbm-btn-sm',
+        title: t('redisdb.search.run'),
+        'aria-label': t('redisdb.search.run'),
+        disabled: pattern.trim() === '' || search?.loading === true,
+        onClick: () => { void runSearch(searchDb, pattern) },
+      }, '🔍'),
+      searching
+        ? React.createElement('button', {
+            type: 'button',
+            className: 'dbm-btn dbm-btn-sm',
+            title: t('redisdb.search.clear'),
+            'aria-label': t('redisdb.search.clear'),
+            onClick: clearSearch,
+          }, '✕')
+        : React.createElement('button', {
+            type: 'button',
+            className: `dbm-btn dbm-btn-sm${refreshing ? ' dbm-btn-busy' : ''}`,
+            title: t('redisdb.refresh'),
+            'aria-label': t('redisdb.refresh'),
+            // A second press while a refresh is running would stack another round
+            // of scans on the same levels.
+            disabled: refreshing,
+            'aria-busy': refreshing ? 'true' : undefined,
+            onClick: () => { void refreshAll() },
+          }, refreshing ? React.createElement('span', { className: 'dbm-spinner' }) : '⟳'),
     ),
     React.createElement(
       'div',
@@ -344,14 +451,23 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
         levels,
         openDbs,
         openFolders,
-        filter,
+        search,
+        searchDb,
         selection,
         activeKey,
         onToggleDb: toggleDb,
         onToggleFolder: toggleFolder,
         onSelectKey: selectKey,
         onSelectFolder: (db, path, name) => setSelection({ kind: 'folder', db, path, name }),
-        onCreate: (db, folderPath) => setCreateFor({ db, folderPath }),
+        // Opening a dialog clears the previous outcome. Without this, the
+        // notice from an EARLIER create ("已创建 1 个键") stayed on screen while
+        // this one failed — success and failure shown at once, which reads as
+        // "the create silently did nothing".
+        onCreate: (db, folderPath) => {
+          setNotice(undefined)
+          setError(undefined)
+          setCreateFor({ db, folderPath })
+        },
         onDeleteKey: askDeleteKey,
         onDeleteFolder: askDeleteFolder,
       }),

@@ -318,6 +318,19 @@ export const PANEL_CSS = `
 .dbm-icon-btn:hover { background: var(--dsw-alias-button-floating-hover); color: var(--dsw-alias-label-primary); }
 .dbm-icon-btn-danger:hover { color: var(--dsw-alias-label-danger, #d33); border-color: currentColor; }
 
+/* ---- search results ---------------------------------------------------- */
+/*
+ * The search header states the scope (which database) and the pattern, because
+ * the results replace the tree: without it, a flat list of keys gives no clue
+ * that it came from db3 rather than the db the user was just browsing.
+ */
+.dbm-search-header {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--dsw-alias-border-l3);
+  background: var(--dsw-alias-interactive-bg-hover);
+  word-break: break-all;
+}
+
 /* ---- busy / refresh feedback ------------------------------------------- */
 /*
  * Rows kept on screen while their level is re-fetched.

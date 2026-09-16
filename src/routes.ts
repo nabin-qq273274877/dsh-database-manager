@@ -620,6 +620,29 @@ export function makeRoutes(deps: RoutesDeps): { routes: WebRoute[]; upgrade: Web
         return
       }
 
+      // A server-side search for keys matching a Redis glob, within ONE
+      // database. Distinct from the tree's per-level loads: a search must see
+      // keys inside folders that were never expanded, which only the server can
+      // do. Scoped to one db because evaluating a pattern across all 16 would
+      // sweep the whole instance.
+      if (action === 'redis/search' && method === 'GET') {
+        if (!isRedisDriver(driver)) {
+          writeError(res, 400, 'redis/search is only available for Redis data sources')
+          return
+        }
+        const pattern = queryParam(url, 'pattern')
+        if (pattern === undefined) {
+          writeError(res, 400, 'pattern is required')
+          return
+        }
+        const page = await driver.search({
+          db: queryInt(url, 'db', entry.db ?? 0),
+          pattern,
+        })
+        writeJson(res, 200, { page })
+        return
+      }
+
       if (action === 'redis/value' && method === 'GET') {
         if (!isRedisDriver(driver)) {
           writeError(res, 400, 'redis/value is only available for Redis data sources')

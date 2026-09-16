@@ -15,6 +15,7 @@ import type {
   RedisKeyPage,
   RedisLevelPage,
   RedisMutationResult,
+  RedisSearchPage,
   RedisTreePage,
   RedisValue,
   SchemaInfo,
@@ -97,6 +98,8 @@ export interface RedisDriver {
   keys(input: { pattern: string; cursor: string; count: number; db: number }): Promise<RedisKeyPage>
   /** One folder level of one database — what the tree lazily loads. */
   level(input: { db: number; prefix: string; withTypes: boolean }): Promise<RedisLevelPage>
+  /** Search one database with a Redis glob pattern (server-side SCAN MATCH). */
+  search(input: { db: number; pattern: string }): Promise<RedisSearchPage>
   /** Every key in one database matching a pattern (bounded; reports truncation). */
   tree(input: { db: number; pattern?: string }): Promise<RedisTreePage>
   /** Read one key's full value (bounded by `limit` per collection). */

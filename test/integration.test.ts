@@ -643,6 +643,16 @@ describe.skipIf(!available)('built host half', () => {
       expect(((await response.json()) as { error: string }).error).toMatch(/Redis/)
     })
 
+    it('requires a pattern to search, and refuses search on a SQL source', async () => {
+      const noPattern = await fetch(`${base}/sources/${redisId}/redis/search?db=0`)
+      expect(noPattern.status).toBe(400)
+      expect(((await noPattern.json()) as { error: string }).error).toMatch(/pattern is required/)
+
+      const onSql = await fetch(`${base}/sources/app/redis/search?db=0&pattern=jd:*`)
+      expect(onSql.status).toBe(400)
+      expect(((await onSql.json()) as { error: string }).error).toMatch(/Redis/)
+    })
+
     it('requires a key for every value-editing route', async () => {
       // Each edit route must name the field it is missing rather than reaching
       // an engine with a half-formed request.

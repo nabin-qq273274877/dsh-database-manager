@@ -18,6 +18,7 @@ import type {
   RedisKeyPage,
   RedisLevelPage,
   RedisMutationResult,
+  RedisSearchPage,
   RedisTreePage,
   RedisValue,
   TestResult,
@@ -114,6 +115,16 @@ const MAX_ELEMENTS = 1000
  * because a partial scan cannot produce a correct folder count.
  */
 const MAX_LEVEL_KEYS_RETURNED = 5000
+
+/**
+ * Ceiling on keys returned by one search.
+ *
+ * A search runs to completion so that no match is silently omitted, but the
+ * RESULT is capped: a pattern like `*` against a large database would otherwise
+ * put hundreds of thousands of rows into the browser. Hitting the cap is
+ * reported, so a partial list is never presented as the whole answer.
+ */
+const MAX_SEARCH_KEYS = 5000
 
 /**
  * Order two key names the way the tree displays them.
@@ -414,6 +425,54 @@ export class RedisDriver implements RedisDriverContract {
     const [name, ...rest] = args
     const result = await client.call(name!, ...rest)
     return shapeRedisReply(result, Date.now() - started)
+  }
+
+  /**
+   * Search one database for keys matching a Redis glob pattern.
+   *
+   * Runs `SCAN MATCH` on the server, so the pattern is Redis glob syntax and the
+   * search sees every key in the database — including keys inside folders that
+   * are not expanded in the tree. A client-side filter over already-loaded rows
+   * can do neither, which is why a pattern like `jd:*` found nothing.
+   *
+   * The traversal runs to completion (a partial scan would silently omit
+   * matches); {@link MAX_SEARCH_KEYS} caps the RESULT so a pattern like `*` on a
+   * huge database cannot return millions of rows to the browser, and hitting it
+   * is reported rather than passed off as the complete answer.
+   *
+   * @param pattern - Redis glob pattern; empty is treated as `*`.
+   */
+  async search(input: { db: number; pattern: string }): Promise<RedisSearchPage> {
+    return this.withDeadline(this.searchUnbounded(input), this.treeDeadlineMs(), 'searching Redis keys')
+  }
+
+  /** The actual search; callers go through {@link search} for the deadline. */
+  private async searchUnbounded(input: { db: number; pattern: string }): Promise<RedisSearchPage> {
+    const client = await this.client(input.db)
+    const pattern = input.pattern === '' ? '*' : input.pattern
+    const names: string[] = []
+    let cursor = '0'
+    let scanned = 0
+    let truncated = false
+
+    do {
+      const [next, found] = await client.scan(cursor, 'MATCH', pattern, 'COUNT', TREE_SCAN_COUNT)
+      cursor = String(next)
+      scanned += found.length
+      for (const name of found) {
+        names.push(name)
+        if (names.length >= MAX_SEARCH_KEYS) { truncated = true; break }
+      }
+      if (truncated) break
+    } while (cursor !== '0')
+
+    // Type and TTL per match, batched: a search result that omits the type is
+    // far less useful, and one round trip per key would be the mistake this
+    // whole design avoids.
+    const keys = await this.describeKeys(client, names)
+    keys.sort((a, b) => compareKeyNames(a.key, b.key))
+    const dbSize = await client.dbsize().catch(() => scanned)
+    return { keys, truncated, scanned, dbSize }
   }
 
   /**

@@ -208,6 +208,30 @@ export interface RedisKeyPage {
 }
 
 /**
+ * One database's search results for a Redis glob pattern.
+ *
+ * A SEARCH, not a filter: the pattern is evaluated by the server with
+ * `SCAN MATCH`, so it understands Redis glob syntax (`jd:*`, `*session*`, `?`)
+ * and finds keys inside folders that were never expanded. A client-side
+ * substring match over loaded rows can do neither — it reads `jd:*` as literal
+ * text and cannot see keys it never fetched.
+ *
+ * Scoped to ONE database on purpose: a pattern evaluated across all 16 logical
+ * databases would sweep the whole instance, which is far too slow to run while
+ * someone is typing.
+ */
+export interface RedisSearchPage {
+  /** Matching keys, with type and TTL, sorted by name. */
+  keys: RedisKeyInfo[]
+  /** True when the scan stopped at the cap, so `keys` is incomplete. */
+  truncated: boolean
+  /** How many keys the scan visited, so "scanned N" can be shown. */
+  scanned: number
+  /** Total keys the database holds (DBSIZE), for context. */
+  dbSize: number
+}
+
+/**
  * Every key in one database matching a pattern, with type and TTL.
  *
  * NOT what the tree loads — the tree loads one level at a time
@@ -434,6 +458,8 @@ export const DB_API = {
   redisTree: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/tree?${params}`,
   /** One folder level of one database (the tree's lazy-load endpoint). */
   redisLevel: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/level?${params}`,
+  /** Search one database with a Redis glob pattern (server-side SCAN MATCH). */
+  redisSearch: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/search?${params}`,
   /** Replace a string key's value. */
   redisString: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/string`,
   /** Set or clear a key's TTL. */
