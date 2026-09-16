@@ -381,6 +381,17 @@ export interface IndexLevel {
   keysAtLevel: number
   /** True when the walk has not finished, so this level may be incomplete. */
   partial: boolean
+  /**
+   * Keys walked so far, and the database's total, for a partial level's notice.
+   *
+   * Present ONLY when `partial` is true. The notice states how much of the level
+   * was covered, and these are the honest numbers for an unfinished walk — the
+   * scan path supplies its own equivalents (`scannedKeys`/`dbSize`). Without
+   * them the UI fell back to zeroes and read "该库共 0 个键，此处仅扫描了 0 个",
+   * which is worse than saying nothing: it states a wrong database size.
+   */
+  visited?: number
+  dbSize?: number
 }
 
 /**
@@ -436,7 +447,15 @@ export function levelFromIndex(index: KeyspaceIndex, prefix: string, compare: (a
   }
   keys.sort(compare)
 
-  return { folders, keys, keysAtLevel, partial: !index.done }
+  return {
+    folders,
+    keys,
+    keysAtLevel,
+    partial: !index.done,
+    // Only meaningful while the walk is unfinished; a finished index has covered
+    // everything, so the UI shows no notice at all and these would be redundant.
+    ...(index.done ? {} : { visited: index.visited, dbSize: index.dbSize }),
+  }
 }
 
 /**

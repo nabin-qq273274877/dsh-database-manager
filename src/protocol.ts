@@ -235,6 +235,14 @@ export interface RedisIndexLevel {
   keysAtLevel: number
   /** True while the walk is still running, so this level may gain rows. */
   partial: boolean
+  /**
+   * Keys walked so far and the database's total, present only while `partial`.
+   *
+   * The "counts are lower bounds" notice needs them; without them a mid-walk
+   * level announced a database size of zero.
+   */
+  visited?: number
+  dbSize?: number
 }
 
 /** What a keyspace walk is expected to cost, so a caller can warn before starting. */

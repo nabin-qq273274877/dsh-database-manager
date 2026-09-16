@@ -754,7 +754,16 @@ export function makeRoutes(deps: RoutesDeps): { routes: WebRoute[]; upgrade: Web
           ? level.keys.map(key => ({ key, type: 'unknown', ttl: -1 } satisfies RedisKeyInfo))
           : await driver.describeKeysPublic(db, level.keys)
         writeJson(res, 200, {
-          level: { folders: level.folders, keys, keysAtLevel: level.keysAtLevel, partial: level.partial },
+          level: {
+            folders: level.folders,
+            keys,
+            keysAtLevel: level.keysAtLevel,
+            partial: level.partial,
+            // Present only for an unfinished walk; the UI's "counts are lower
+            // bounds" notice needs them to state how much was covered.
+            visited: level.visited,
+            dbSize: level.dbSize,
+          },
         })
         return
       }

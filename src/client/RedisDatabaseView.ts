@@ -150,7 +150,37 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
    * that callback). A database joins it as soon as a walk is started, so levels open
    * from the index while it is still filling in.
    */
-  const [indexDbs, setIndexDbs] = React.useState<Set<number>>(() => new Set())
+  /**
+   * Databases whose levels are served from a cached keyspace index.
+   *
+   * A REF, not state, and deliberately so. The level loader reads it to choose
+   * its source; `loadLevel` is a useCallback, so it would close over the
+   * `indexDbs` of the render that created it. `buildIndex` marks the database
+   * and then, in the SAME invocation, asks for its root level — but a state
+   * update has not produced a new render yet, so the loader still saw the old
+   * set, concluded no index existed and fell back to a scan. Measured on db1
+   * (2M keys) with the walk already `done`: the tree was answered by
+   * `/redis/level` and reported its counts as lower bounds ("此处仅扫描了
+   * 200,010 个") — the one notice a finished index is supposed to eliminate.
+   *
+   * A ref is updated synchronously, so the loader cannot read a set that
+   * predates the walk it was just told about. There is no matching state
+   * variable: nothing renders from this set, and keeping a state copy would
+   * only suggest a re-render dependency that does not exist.
+   */
+  const indexDbsRef = React.useRef<Set<number>>(new Set())
+
+  /** Mark one database as index-served. */
+  const addIndexDb = React.useCallback((db: number): void => {
+    indexDbsRef.current = new Set(indexDbsRef.current).add(db)
+  }, [])
+
+  /** Undo {@link addIndexDb}, e.g. when a walk failed and must fall back. */
+  const dropIndexDb = React.useCallback((db: number): void => {
+    const next = new Set(indexDbsRef.current)
+    next.delete(db)
+    indexDbsRef.current = next
+  }, [])
 
   /**
    * Index walk progress, per database, while a walk is running.
@@ -207,7 +237,9 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
       countsApproximate?: boolean
       scannedKeys?: number
       dbSize?: number
+      visited?: number
     }): void => {
+      const partial = level.countsApproximate ?? level.partial === true
       setLevels(current => ({
         ...current,
         [key]: {
@@ -218,15 +250,26 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
           // An index still being built is the same situation the scan reports with
           // `countsApproximate`: the level may gain rows, and saying so is what stops
           // a partial tree from looking complete.
-          countsApproximate: level.countsApproximate ?? level.partial === true,
-          scannedKeys: level.scannedKeys,
+          countsApproximate: partial,
+          /*
+           * The notice's two numbers, from whichever path answered.
+           *
+           * The scan reports `scannedKeys`/`dbSize`; an unfinished index reports
+           * `visited`/`dbSize`. Both mean "this much of the database was covered",
+           * and the notice reads one pair. Leaving the index's pair unset made the
+           * renderer fall back to zeroes, so a mid-walk level announced
+           * "该库共 0 个键，此处仅扫描了 0 个" — a wrong database size, stated
+           * confidently, on the very screen whose purpose is to say the numbers
+           * may be short.
+           */
+          scannedKeys: level.scannedKeys ?? level.visited,
           dbSize: level.dbSize,
         },
       }))
     }
 
     try {
-      if (indexDbs.has(db)) {
+      if (indexDbsRef.current.has(db)) {
         try {
           const level = await api.redisIndexLevel(source.id, { db, prefix, withTypes: prefix !== '' })
           apply(level)
@@ -251,7 +294,7 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
         },
       }))
     }
-  }, [api, source.id, indexDbs])
+  }, [api, source.id])
 
   /**
    * Refresh the server overview and every loaded level.
@@ -307,13 +350,13 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
    * asking for progress is a cheap request, and polling keeps the client free of any
    * assumption about how long the walk takes.
    *
-   * The database is added to `indexDbs` FIRST, so levels opened while the walk is
+   * The database is marked index-served FIRST, so levels opened while the walk is
    * still running read from whatever has been indexed instead of falling back to a
    * full traversal — that is what makes the tree appear immediately on a huge
    * database rather than after the walk.
    */
   const buildIndex = React.useCallback(async (db: number): Promise<void> => {
-    setIndexDbs(current => new Set(current).add(db))
+    addIndexDb(db)
     setIndexPrompt(undefined)
     try {
       const first = await api.redisIndexStart(source.id, { db })
@@ -347,15 +390,11 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
     } catch (failure) {
       // A failed walk must not leave the database stuck on the index path, or every
       // level would keep failing instead of falling back to the scan.
-      setIndexDbs(current => {
-        const next = new Set(current)
-        next.delete(db)
-        return next
-      })
+      dropIndexDb(db)
       setIndexProgress(current => ({ ...current, [db]: undefined }))
       setError(failure instanceof Error ? failure.message : String(failure))
     }
-  }, [api, source.id, refreshAll, loadLevel])
+  }, [api, source.id, refreshAll, loadLevel, addIndexDb, dropIndexDb])
 
   /**
    * Expand one database, deciding whether to index it first.
@@ -371,7 +410,7 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
     if (next) setSelection({ kind: 'db', db })
     if (!next) return
 
-    if (indexDbs.has(db)) {
+    if (indexDbsRef.current.has(db)) {
       if (levels[levelKey(db, '')] === undefined) void loadLevel(db, '')
       return
     }
@@ -845,7 +884,11 @@ function IndexProgressBanner(props: { db: number; status: RedisIndexStatus }): R
     'div',
     { className: 'dbm-index-progress' },
     React.createElement('span', null, t('redis.index.building', {
-      db,
+      // The template names the database as {n}, so the value must be supplied
+      // under that name. Passing `db` left {n} untouched — the interpolator
+      // keeps unknown placeholders verbatim — and the banner read
+      // "正在为 db{n} 建立索引".
+      n: db,
       visited: status.visited.toLocaleString(),
       total: status.dbSize.toLocaleString(),
       folders: status.folders.toLocaleString(),

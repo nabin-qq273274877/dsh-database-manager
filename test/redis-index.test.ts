@@ -166,6 +166,31 @@ describe('incremental merging', () => {
     expect(indexProgress(index).done).toBe(true)
   })
 
+  it('carries the coverage numbers a partial level needs to state its basis', () => {
+    /*
+     * The UI's notice says "该库共 N 个键，此处仅扫描了 M 个：计数是下限". For an
+     * unfinished walk it read the scan path's fields, which the index reply did not
+     * carry, so both numbers rendered as 0 — a confidently wrong database size on
+     * the one screen whose job is to warn that the numbers are short. The index
+     * knows both counts; they must travel with the level.
+     */
+    const index = createIndex(0, 100)
+    mergeBatch(index, foldNames(['a:1', 'b:2', 'b:3']))
+
+    const partial = levelFromIndex(index, '', compare)
+    expect(partial.partial).toBe(true)
+    expect(partial.visited).toBe(3)
+    expect(partial.dbSize).toBe(100)
+
+    // A finished walk has covered everything, so the notice is gone and the
+    // numbers with it — a level is then exact and says nothing about coverage.
+    index.done = true
+    const complete = levelFromIndex(index, '', compare)
+    expect(complete.partial).toBe(false)
+    expect(complete.visited).toBeUndefined()
+    expect(complete.dbSize).toBeUndefined()
+  })
+
   it('reports progress against DBSIZE so a long build can be shown as a percentage', () => {
     const index = createIndex(3, 1000)
     mergeBatch(index, foldNames(['a:1', 'b:2']))

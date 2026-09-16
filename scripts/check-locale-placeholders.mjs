@@ -45,28 +45,87 @@ function sourceFiles(dir) {
   return out
 }
 
+/**
+ * Blank out comments, preserving every other character and every newline.
+ *
+ * Without this the scan reads braces that live in prose. The banner's own doc
+ * comment explains the bug by quoting "{n}" and "db{n}", and since `[^}]*` stops
+ * at the first `}`, the call below it parsed as an argument list containing none
+ * of its real names — a false "missing 'n'" on correct code. A checker that cries
+ * wolf is worse than no checker, because the next real report gets ignored. A
+ * false alarm also costs the reader time to disprove, every time.
+ *
+ * Offsets are preserved (comment bytes become spaces, newlines stay) so the line
+ * number derived from the match index still points at the real call site.
+ *
+ * This is a scanner, not a parser: string and template contents are skipped so a
+ * URL's `//` is not read as a comment. A regex literal containing a quote could
+ * still confuse it, and that risk is only ever to UNDER-report, never to invent a
+ * finding — the direction that matters for a guard.
+ */
+function maskComments(source) {
+  const out = source.split('')
+  let i = 0
+  let state = 'code'
+  while (i < source.length) {
+    const c = source[i]
+    const next = source[i + 1]
+    if (state === 'code') {
+      if (c === '/' && next === '/') { state = 'line'; out[i] = out[i + 1] = ' '; i += 2; continue }
+      if (c === '/' && next === '*') { state = 'block'; out[i] = out[i + 1] = ' '; i += 2; continue }
+      if (c === "'" || c === '"' || c === '`') { state = c; i += 1; continue }
+      i += 1
+      continue
+    }
+    if (state === 'line') {
+      if (c === '\n') { state = 'code' } else { out[i] = ' ' }
+      i += 1
+      continue
+    }
+    if (state === 'block') {
+      if (c === '*' && next === '/') { out[i] = out[i + 1] = ' '; i += 2; state = 'code'; continue }
+      if (c !== '\n') out[i] = ' '
+      i += 1
+      continue
+    }
+    // Inside a string or template literal: skip escapes so `\'` cannot end it.
+    if (c === '\\') { i += 2; continue }
+    if (c === state) state = 'code'
+    i += 1
+  }
+  return out.join('')
+}
+
 const templates = loadTemplates()
 let failed = false
 
 for (const file of sourceFiles(join(root, 'src'))) {
-  const source = readFileSync(file, 'utf8')
-  const lines = source.split('\n')
+  const source = maskComments(readFileSync(file, 'utf8'))
 
-  lines.forEach((line, index) => {
-    // Only literal call sites, and only real locale keys.
-    //
-    // A locale key always contains a dot ('redisdb.search.header'); a bare
-    // identifier does not. Requiring the dot is what keeps `React.createElement
-    // ('span', { ... })` from being read as `t('span', {...})` — the first
-    // version of this check reported every element name in the codebase.
-    const call = /\bt\('([a-zA-Z0-9._]*\.[a-zA-Z0-9._]+)'\s*,\s*\{([^}]*)\}/.exec(line)
-    if (call === null) return
+  /**
+   * Scan the WHOLE file, not one line at a time.
+   *
+   * This check used to run per line, which silently missed every call whose
+   * argument object is written across several lines — the shape used wherever a
+   * template takes more than one value. `t('redis.index.building', { db, ... })`
+   * was exactly that, and it shipped: the template names {n}, the call supplied
+   * `db`, and the banner rendered the literal "正在为 db{n} 建立索引". A guard that
+   * only recognises the one-line spelling of the very pattern it guards is a
+   * guard against a fraction of the problem.
+   *
+   * `[^}]*` already spans newlines, so matching the full text is enough; the
+   * line number is recovered from the match offset for a usable message.
+   */
+  const re = /\bt\('([a-zA-Z0-9._]*\.[a-zA-Z0-9._]+)'\s*,\s*\{([^}]*)\}/g
+  let call
+  while ((call = re.exec(source)) !== null) {
+    const line = source.slice(0, call.index).split('\n').length
     const key = call[1]
     const template = templates.get(key)
     if (template === undefined) {
-      console.log(`${file.replace(root, '')}:${index + 1}: t('${key}') has no zh template`)
+      console.log(`${file.replace(root, '')}:${line}: t('${key}') has no zh template`)
       failed = true
-      return
+      continue
     }
 
     const needs = new Set([...template.matchAll(/\{(\w+)\}/g)].map(m => m[1]))
@@ -96,7 +155,7 @@ for (const file of sourceFiles(join(root, 'src'))) {
     const missing = [...needs].filter(name => !supplies.has(name))
     if (missing.length > 0) {
       console.log(
-        `${file.replace(root, '')}:${index + 1}: t('${key}') is missing ${missing.map(n => `'${n}'`).join(', ')}` +
+        `${file.replace(root, '')}:${line}: t('${key}') is missing ${missing.map(n => `'${n}'`).join(', ')}` +
         ` (template needs {${[...needs].join('} {')}})`,
       )
       failed = true
@@ -107,10 +166,10 @@ for (const file of sourceFiles(join(root, 'src'))) {
       // Informational: an unused value is harmless, but it is usually a typo for
       // a real placeholder, which is exactly what the check above catches.
       console.log(
-        `${file.replace(root, '')}:${index + 1}: t('${key}') also passes unused ${extra.map(n => `'${n}'`).join(', ')}`,
+        `${file.replace(root, '')}:${line}: t('${key}') also passes unused ${extra.map(n => `'${n}'`).join(', ')}`,
       )
     }
-  })
+  }
 }
 
 console.log(failed ? 'FAILED' : 'ok')
