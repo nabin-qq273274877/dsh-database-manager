@@ -157,8 +157,31 @@ function compareKeyNames(a: string, b: string): number {
 /** Cap for the whole-database {@link RedisDriver.tree} helper (tests, exports). */
 const MAX_TREE_KEYS = 50000
 
-/** SCAN batch size for level and tree scans. */
-const TREE_SCAN_COUNT = 1000
+/**
+ * SCAN batch size for level, search and tree scans.
+ *
+ * COUNT is a hint for how many keys Redis gathers per reply, and it divides the
+ * total work into round trips: a full pass costs roughly (keys / COUNT) x (RTT).
+ * That makes it a LATENCY knob before a throughput one, which the old value of
+ * 1000 got badly wrong on a remote server. Measured against a production Redis
+ * (830k keys, 17 ms RTT):
+ *
+ *   COUNT   1000 -> 831 batches -> 24.8 s   (the tree budget is 30 s)
+ *   COUNT  10000 ->  83 batches -> 16.6 s
+ *   COUNT  50000 ->  17 batches -> 10.8 s
+ *
+ * At 1000 the scan sat 5 s under its own deadline, so any latency jitter or a
+ * slightly larger database pushed it over — which is exactly how "scanning a key
+ * level timed out after 30000 ms" appeared on a big remote database while the
+ * same data scanned in 3 s locally (1 ms RTT).
+ *
+ * 10000 rather than 50000: it captures most of the win (831 -> 83 round trips is
+ * 10x fewer, 50000 only reaches 17), while keeping one reply small. A SCAN reply
+ * carries key names, so a very large COUNT holds every one of them in memory at
+ * once on both sides, and the gain past 10000 is small because the server's own
+ * traversal becomes the cost rather than the network.
+ */
+const TREE_SCAN_COUNT = 10000
 
 /**
  * How many keys one TYPE/TTL pipeline batch covers.
@@ -242,11 +265,21 @@ export class RedisDriver implements RedisDriverContract {
    * handshake (the plaintext-server-vs-TLS-client case) produces no error to
    * count — the promise simply never settles. Racing a timer is the only way to
    * guarantee the UI gets an answer, and it is cheaper than hanging forever.
+   *
+   * @param what - names the operation, in the user's terms, for the timeout text.
+   * @param hint - what a timeout most likely MEANS for this operation. The
+   *   connection wording ("did not complete the handshake, check the port and
+   *   TLS") is only true for a connection attempt; applying it to a long scan
+   *   sent the reader to inspect TLS settings when the real cause was that a
+   *   large remote keyspace needed more round trips than the budget allowed.
    */
-  private withDeadline<T>(work: Promise<T>, timeoutMs: number, what: string): Promise<T> {
+  private withDeadline<T>(work: Promise<T>, timeoutMs: number, what: string, hint?: string): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
-        reject(new Error(`${what} timed out after ${timeoutMs} ms — the server did not complete the handshake. Check the host, port and whether this server expects an encrypted (TLS) connection.`))
+        reject(new Error(
+          `${what} timed out after ${timeoutMs} ms — ${hint ??
+          'the server did not complete the handshake. Check the host, port and whether this server expects an encrypted (TLS) connection.'}`,
+        ))
       }, timeoutMs)
       work.then(
         (value) => { clearTimeout(timer); resolve(value) },
@@ -443,7 +476,13 @@ export class RedisDriver implements RedisDriverContract {
    * @param pattern - Redis glob pattern; empty is treated as `*`.
    */
   async search(input: { db: number; pattern: string }): Promise<RedisSearchPage> {
-    return this.withDeadline(this.searchUnbounded(input), this.treeDeadlineMs(), 'searching Redis keys')
+    return this.withDeadline(
+      this.searchUnbounded(input),
+      this.treeDeadlineMs(),
+      'searching Redis keys',
+      'the scan did not finish within the time budget. A pattern that matches many keys in a large remote ' +
+      'database takes longer; try a more specific pattern or raise this data source\'s timeout setting.',
+    )
   }
 
   /** The actual search; callers go through {@link search} for the deadline. */
@@ -497,7 +536,13 @@ export class RedisDriver implements RedisDriverContract {
    *   level of a large database is all folders, so it usually needs none.
    */
   async level(input: { db: number; prefix: string; withTypes: boolean }): Promise<RedisLevelPage> {
-    return this.withDeadline(this.levelUnbounded(input), this.treeDeadlineMs(), 'scanning a key level')
+    return this.withDeadline(
+      this.levelUnbounded(input),
+      this.treeDeadlineMs(),
+      'scanning a key level',
+      'the keyspace was too large to traverse within the time budget. Redis has no prefix index, so listing a level ' +
+      'walks every key in the database. Try raising this data source\'s timeout setting, or open a narrower folder.',
+    )
   }
 
   /** The actual level scan; callers go through {@link level} for the deadline. */
@@ -663,7 +708,12 @@ export class RedisDriver implements RedisDriverContract {
    * it: see {@link level}. Still capped, and still reports truncation.
    */
   async tree(input: { db: number; pattern?: string }): Promise<RedisTreePage> {
-    return this.withDeadline(this.treeUnbounded(input), this.treeDeadlineMs(), 'scanning the key tree')
+    return this.withDeadline(
+      this.treeUnbounded(input),
+      this.treeDeadlineMs(),
+      'scanning the key tree',
+      'the keyspace was too large to traverse within the time budget. Try raising this data source\'s timeout setting.',
+    )
   }
 
   /** The actual tree scan; callers go through {@link tree} for the deadline. */
@@ -941,7 +991,13 @@ export class RedisDriver implements RedisDriverContract {
    * reported.
    */
   async deletePrefix(path: string, db: number): Promise<RedisDeletePrefixResult> {
-    return this.withDeadline(this.deletePrefixUnbounded(path, db), this.treeDeadlineMs(), `deleting folder "${path}"`)
+    return this.withDeadline(
+      this.deletePrefixUnbounded(path, db),
+      this.treeDeadlineMs(),
+      `deleting folder "${path}"`,
+      'the traversal did not finish within the time budget. The delete is bounded and batched, so some keys may ' +
+      'already be gone; re-read the folder to see what remains before retrying.',
+    )
   }
 
   /** The actual prefix delete; callers go through {@link deletePrefix}. */
@@ -1000,7 +1056,13 @@ export class RedisDriver implements RedisDriverContract {
 
   /** How many keys sit under one folder prefix (the delete dialog's warning). */
   async countPrefix(path: string, db: number): Promise<number> {
-    return this.withDeadline(this.countPrefixUnbounded(path, db), this.treeDeadlineMs(), `counting folder "${path}"`)
+    return this.withDeadline(
+      this.countPrefixUnbounded(path, db),
+      this.treeDeadlineMs(),
+      `counting folder "${path}"`,
+      'the count walks every key under the folder and did not finish in time. Redis has no prefix index, so a folder ' +
+      'this large cannot be counted quickly; raise this data source\'s timeout setting if the count is needed.',
+    )
   }
 
   /** The actual prefix count; callers go through {@link countPrefix}. */

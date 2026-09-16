@@ -44,6 +44,7 @@ const files = [
   'scripts/bench-tree-e2e.mjs',
   'scripts/dump-value-pane.mjs',
   'scripts/e2e-tree-loading.mjs',
+  'scripts/e2e-db-scope.mjs',
   'scripts/e2e-search-tree.mjs',
   'scripts/shot-tree-loading.mjs',
 ]

@@ -85,10 +85,21 @@ const FLOW = `(async () => {
   click(sidebar);
   await waitFor(() => document.querySelector('.dbm-root'), 10000);
 
-  const cell = await waitFor(() => byIncludes('.dbm-table td', ${JSON.stringify(sourceId)}), 10000)
-    || await waitFor(() => document.querySelector('.dbm-table tbody tr'), 5000);
-  const dataRow = cell ? cell.closest('tr') : null;
-  const connect = dataRow ? (byText('.dbm-actions .dbm-btn', '连接') || byText('.dbm-actions .dbm-btn', 'Connect')) : null;
+  // Located by the source's own text. No fallback to the first row: that
+  // silently connected to whichever source sorted first, so the run measured the
+  // wrong server and reported the failure as something else entirely.
+  const sourceRow = await waitFor(() => Array.from(document.querySelectorAll('.dbm-table tbody tr'))
+    .find((row) => (row.textContent || '').includes(${JSON.stringify(sourceId)})) ?? null, 20000);
+  if (!sourceRow) {
+    return JSON.stringify({
+      ...report,
+      fatal: 'data source row not found',
+      wanted: ${JSON.stringify(sourceId)},
+      rows: Array.from(document.querySelectorAll('.dbm-table tbody tr')).map((row) => (row.textContent || '').trim().slice(0, 60)),
+    });
+  }
+  const connect = Array.from(sourceRow.querySelectorAll('.dbm-actions .dbm-btn'))
+    .find((b) => ['连接', 'Connect'].includes((b.textContent || '').trim())) || null;
   if (!connect) return JSON.stringify({ ...report, fatal: 'no connect button' });
   click(connect);
 

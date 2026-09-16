@@ -70,12 +70,33 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
    */
   const [levels, setLevels] = React.useState<Record<string, RedisLevel | undefined>>({})
   /**
-   * Databases start collapsed, except the one this source is configured for:
-   * that is where the user expects to land, and it is one bounded scan.
+   * Databases start COLLAPSED — every one of them, including the source's own.
+   *
+   * Auto-expanding that one used to look helpful, but its cost is a full scan of
+   * whatever database the source points at, and that database can be huge: a db
+   * with 485k keys made the panel sit there scanning before the list appeared.
+   * The database list is cheap and always useful, so the panel shows that and
+   * scans only what the user actually opens.
    */
-  const [openDbs, setOpenDbs] = React.useState<Record<number, boolean>>(() => ({ [source.db ?? 0]: true }))
+  const [openDbs, setOpenDbs] = React.useState<Record<number, boolean>>({})
   const [openFolders, setOpenFolders] = React.useState<Record<number, Record<string, boolean> | undefined>>({})
+  /**
+   * What the user last selected in the tree: a key, a folder, or a database.
+   *
+   * Undefined until something is selected. Nothing is expanded on open, so
+   * claiming a database was "in view" would be inventing a state the user never
+   * chose.
+   */
   const [selection, setSelection] = React.useState<RedisSelection>(undefined)
+  /**
+   * The database the console's commands run against.
+   *
+   * Deliberately NOT a view of `selection`, and that separation is a safety
+   * property: the console can WRITE, so its target must not silently change
+   * because a key in another database was clicked for inspection. It changes only
+   * through its own selector.
+   */
+  const [consoleDb, setConsoleDb] = React.useState<number>(source.db ?? 0)
   const [activeKey, setActiveKey] = React.useState<{ db: number; key: string } | undefined>(undefined)
   const [value, setValue] = React.useState<RedisValue | undefined>(undefined)
   const [valueLoading, setValueLoading] = React.useState(false)
@@ -177,15 +198,27 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
     }
   }, [api, source.id, levels, loadLevel])
 
-  // Load the connection's own database root once, since it starts expanded.
+  /** The database the source is configured for; the console and value pane fall back to it. */
   const initialDb = source.db ?? 0
-  React.useEffect(() => { void loadLevel(initialDb, '') }, [initialDb, loadLevel])
+
+  /*
+   * Nothing is scanned on open. There used to be a `loadLevel(initialDb, '')`
+   * here, which fired the moment the panel appeared — a full SCAN of that
+   * database before the user had asked for anything. On a db holding 485k keys
+   * that is a visible stall on every entry into the panel, for a level the user
+   * may never look at. The database list comes from `INFO`/`DBSIZE` (cheap) and
+   * is what the panel shows; a level is scanned only when its database is opened.
+   */
 
   /** Expand or collapse one database, loading its root level on first open. */
   const toggleDb = (db: number): void => {
     const next = openDbs[db] !== true
     setOpenDbs(current => ({ ...current, [db]: next }))
     if (next && levels[levelKey(db, '')] === undefined) void loadLevel(db, '')
+    // Opening a database selects it, so the row can show as active. This is what
+    // the `{ kind: 'db' }` variant of RedisSelection was declared for and never
+    // assigned, leaving a database row unable to appear selected.
+    if (next) setSelection({ kind: 'db', db })
   }
 
   /** Expand or collapse one folder, loading its level on first open. */
@@ -528,7 +561,12 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
         key: 'console',
         api,
         source,
-        db: selection?.db ?? initialDb,
+        // The console's own target database — see `consoleDb`. Kept independent
+        // of the tree selection so that inspecting a key elsewhere cannot
+        // silently redirect a write.
+        db: consoleDb,
+        databases,
+        onSelectDb: setConsoleDb,
         onResult: (message) => { setNotice(message); setError(undefined) },
         onError: (message) => { setError(message); setNotice(undefined) },
         onMutated: (key) => {
@@ -541,8 +579,6 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
     )
   }
 
-  const activeDb = selection?.db ?? initialDb
-
   return React.createElement(
     'div',
     { className: 'dbm-root' },
@@ -552,7 +588,14 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
       React.createElement(BackButton, { onBack, label: t('panel.backToList') }),
       React.createElement('span', { className: 'dbm-title' }, source.name),
       React.createElement('span', { className: 'dbm-badge dbm-badge-redis' }, 'redis'),
-      React.createElement('span', { className: 'dbm-subtitle dbm-mono' }, `${source.host ?? ''}:${source.port ?? ''}/db${activeDb}`),
+      // The connection's address only. A db number used to sit here and it
+      // misled: it was rendered from the last KEY or FOLDER clicked, so browsing
+      // db0 read "/db2" as soon as a key in db2 had been opened, and expanding a
+      // database did not update it at all. The panel shows every expanded
+      // database at once, so no single number can honestly describe it. Where a
+      // database DOES matter it is now named at the point of use — the console
+      // states the db its command will run against.
+      React.createElement('span', { className: 'dbm-subtitle dbm-mono' }, `${source.host ?? ''}:${source.port ?? ''}`),
       React.createElement('span', { className: 'dbm-spacer' }),
       React.createElement(BackButton, { onBack: onClose }),
     ),
@@ -645,11 +688,15 @@ function ConsoleView(props: {
   api: DbApi
   source: DataSourceSummary
   db: number
+  /** Every database to offer as a target. */
+  databases: RedisDbNode[]
+  /** Change which database commands run against. */
+  onSelectDb(db: number): void
   onResult(message: string): void
   onError(message: string): void
   onMutated(key?: string): void
 }): React.ReactElement {
-  const { api, source, db, onResult, onError, onMutated } = props
+  const { api, source, db, databases, onSelectDb, onResult, onError, onMutated } = props
   const [command, setCommand] = React.useState('')
   const [allowWrite, setAllowWrite] = React.useState(false)
   const [result, setResult] = React.useState<{ columns: string[]; rows: Array<Array<string | number | boolean | null>>; message: string } | undefined>(undefined)
@@ -701,7 +748,29 @@ function ConsoleView(props: {
           }),
           t('redis.allowWrite'),
         ),
-        React.createElement('span', { className: 'dbm-hint' }, `db${db} · ${allowWrite ? t('redis.allowWrite.hint') : t('redis.readonlyNotice')}`),
+        // Which database the command runs against, stated AND settable. The
+        // console can write, so an unstated or inherited target is a hazard: this
+        // used to read from the last key clicked, so typing a write while looking
+        // at db0 could have landed it in db2.
+        React.createElement(
+          'label',
+          { className: 'dbm-check' },
+          t('redis.consoleDb'),
+          React.createElement(
+            'select',
+            {
+              className: 'dbm-select',
+              value: String(db),
+              title: t('redisdb.search.scope.db', { n: db }),
+              'aria-label': t('redis.consoleDb'),
+              onChange: (event: { target: { value: string } }) => onSelectDb(Number(event.target.value)),
+            },
+            databases.map(node =>
+              React.createElement('option', { key: node.db, value: String(node.db) }, `db${node.db}`),
+            ),
+          ),
+        ),
+        React.createElement('span', { className: 'dbm-hint' }, allowWrite ? t('redis.allowWrite.hint') : t('redis.readonlyNotice')),
       ),
     ),
     result === undefined
