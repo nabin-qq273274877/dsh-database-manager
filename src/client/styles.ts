@@ -318,6 +318,35 @@ export const PANEL_CSS = `
 .dbm-icon-btn:hover { background: var(--dsw-alias-button-floating-hover); color: var(--dsw-alias-label-primary); }
 .dbm-icon-btn-danger:hover { color: var(--dsw-alias-label-danger, #d33); border-color: currentColor; }
 
+/* ---- keyspace index progress ------------------------------------------- */
+/*
+ * A thin bar under the progress sentence.
+ *
+ * The percentage is real work done (keys visited over the database's size), which
+ * is what makes a minute-long index build on a huge database legible instead of
+ * looking frozen. The bar is decorative — the sentence carries the same numbers —
+ * so it is hidden from assistive tech rather than announced twice.
+ */
+.dbm-index-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.dbm-index-bar {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--dsw-alias-interactive-bg-hover);
+  overflow: hidden;
+}
+
+.dbm-index-fill {
+  display: block;
+  height: 100%;
+  background: var(--dsw-alias-brand-primary, #4c8bf5);
+  transition: width .3s ease;
+}
+
 /* ---- search results ---------------------------------------------------- */
 /*
  * The search header states the scope (which database) and the pattern, because

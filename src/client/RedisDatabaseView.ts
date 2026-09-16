@@ -12,8 +12,16 @@ import * as React from 'react'
  * agent write gate (auth.ts) is deliberately not involved.
  */
 
-import type { DataSourceSummary, RedisInfo, RedisValue } from '../protocol.ts'
+import type {
+  DataSourceSummary,
+  RedisIndexEstimate,
+  RedisIndexStatus,
+  RedisInfo,
+  RedisKeyInfo,
+  RedisValue,
+} from '../protocol.ts'
 import type { DbApi } from './api.ts'
+import { DbApiError } from './api.ts'
 import { keyFromCommand, splitCommand } from './command.ts'
 import {
   DeleteDialog,
@@ -22,6 +30,7 @@ import {
   levelKey,
   type RedisCreatePayload,
   type RedisDbNode,
+  type RedisFolderRow,
   type RedisLevel,
   type RedisSearchState,
   type RedisSelection,
@@ -34,6 +43,17 @@ type RedisTab = 'value' | 'info' | 'console'
 
 /** Every logical database a Redis server exposes by default. */
 const DB_COUNT = 16
+
+/**
+ * Key count at which a database is indexed rather than scanned per level.
+ *
+ * The distinction is not about speed but about whether per-level scanning works AT
+ * ALL. Redis has no prefix index, so listing a level walks the whole keyspace: at
+ * this size one level already means scanning a million keys, which a click cannot
+ * wait for. Below it, the scan is a single bounded request and an upfront index
+ * build would be pure overhead.
+ */
+const LARGE_DB_KEYS = 1_000_000
 
 /** Props for {@link RedisDatabaseView}. */
 export interface RedisDatabaseViewProps {
@@ -123,12 +143,48 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
   const [refreshing, setRefreshing] = React.useState(false)
 
   /**
+   * Databases whose levels are served from a cached keyspace index.
+   *
+   * A set rather than a boolean per database because the level loader reads it to
+   * choose its source, and it must be stable across renders (it is a dependency of
+   * that callback). A database joins it as soon as a walk is started, so levels open
+   * from the index while it is still filling in.
+   */
+  const [indexDbs, setIndexDbs] = React.useState<Set<number>>(() => new Set())
+
+  /**
+   * Index walk progress, per database, while a walk is running.
+   *
+   * Kept for the progress display: on a huge database the walk takes about a minute,
+   * and a real percentage is what makes that wait legible. Removed once the walk
+   * finishes, since a finished index needs no banner.
+   */
+  const [indexProgress, setIndexProgress] = React.useState<Record<number, RedisIndexStatus | undefined>>({})
+
+  /**
+   * The database whose walk is awaiting confirmation, if any.
+   *
+   * The index loads the server, so a large one is confirmed rather than started
+   * silently: `estimate` reports the cost first, and this holds the pending choice.
+   */
+  const [indexPrompt, setIndexPrompt] = React.useState<{ db: number; estimate: RedisIndexEstimate } | undefined>(undefined)
+
+  /**
    * Load one level.
    *
-   * The TYPE/TTL fetch is skipped for the database root, which on a large
-   * database is nothing but folders — that is the difference between a root that
-   * opens immediately and one that spends a round trip per key on rows the user
-   * cannot see.
+   * Two sources, and the choice matters on a large database:
+   *
+   * - The **keyspace index**, when one exists for this database. It answers from
+   *   memory on the host, so expanding a level costs nothing at all. This is the
+   *   path that makes a 19.5M-key database browsable: a per-level scan there is a
+   *   full traversal of the keyspace (Redis has no prefix index), measured in
+   *   minutes, whereas the index pays that once and reuses it.
+   * - A **per-level scan** otherwise. For a small or medium database it is one
+   *   bounded request and needs no upfront walk, so the panel does not impose an
+   *   index build on someone browsing a few thousand keys.
+   *
+   * A 409 from the index route means "nothing built yet"; that is not an error the
+   * user should see, so the scan answers instead.
    *
    * @param prefix - '' for the database root.
    */
@@ -140,24 +196,51 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
         ? { folders: [], keys: [], truncated: false, keysAtLevel: 0, loading: true }
         : { ...current[key]!, loading: true, error: undefined },
     }))
-    try {
-      const page = await api.redisLevel(source.id, { db, prefix, withTypes: prefix !== '' })
+
+    /** Apply a level from either source, normalising the two reply shapes. */
+    const apply = (level: {
+      folders: RedisFolderRow[]
+      keys: RedisKeyInfo[]
+      keysAtLevel: number
+      truncated?: boolean
+      partial?: boolean
+      countsApproximate?: boolean
+      scannedKeys?: number
+      dbSize?: number
+    }): void => {
       setLevels(current => ({
         ...current,
         [key]: {
-          folders: page.folders,
-          keys: page.keys,
-          truncated: page.truncated,
-          keysAtLevel: page.keysAtLevel,
-          // Carried through so the tree can say the counts are lower bounds
-          // rather than showing them as exact — the difference matters most on a
-          // folder row, which is what a delete is confirmed against.
-          countsApproximate: page.countsApproximate,
-          scannedKeys: page.scannedKeys,
-          // The level's own size, so the "partial" notice can give a basis.
-          dbSize: page.dbSize,
+          folders: level.folders,
+          keys: level.keys,
+          truncated: level.truncated ?? false,
+          keysAtLevel: level.keysAtLevel,
+          // An index still being built is the same situation the scan reports with
+          // `countsApproximate`: the level may gain rows, and saying so is what stops
+          // a partial tree from looking complete.
+          countsApproximate: level.countsApproximate ?? level.partial === true,
+          scannedKeys: level.scannedKeys,
+          dbSize: level.dbSize,
         },
       }))
+    }
+
+    try {
+      if (indexDbs.has(db)) {
+        try {
+          const level = await api.redisIndexLevel(source.id, { db, prefix, withTypes: prefix !== '' })
+          apply(level)
+          setError(undefined)
+          return
+        } catch (failure) {
+          // 409 = no index yet (and any other index problem degrades the same way).
+          // Falling back keeps the panel usable rather than showing an error for a
+          // cache that simply is not there.
+          if (!(failure instanceof DbApiError) || failure.status !== 409) throw failure
+        }
+      }
+      const page = await api.redisLevel(source.id, { db, prefix, withTypes: prefix !== '' })
+      apply(page)
       setError(undefined)
     } catch (failure) {
       setLevels(current => ({
@@ -168,7 +251,7 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
         },
       }))
     }
-  }, [api, source.id])
+  }, [api, source.id, indexDbs])
 
   /**
    * Refresh the server overview and every loaded level.
@@ -217,15 +300,99 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
    * is what the panel shows; a level is scanned only when its database is opened.
    */
 
-  /** Expand or collapse one database, loading its root level on first open. */
+  /**
+   * Start a keyspace walk and follow it to completion.
+   *
+   * Polls rather than streaming: the walk runs on the host in bounded steps, so
+   * asking for progress is a cheap request, and polling keeps the client free of any
+   * assumption about how long the walk takes.
+   *
+   * The database is added to `indexDbs` FIRST, so levels opened while the walk is
+   * still running read from whatever has been indexed instead of falling back to a
+   * full traversal — that is what makes the tree appear immediately on a huge
+   * database rather than after the walk.
+   */
+  const buildIndex = React.useCallback(async (db: number): Promise<void> => {
+    setIndexDbs(current => new Set(current).add(db))
+    setIndexPrompt(undefined)
+    try {
+      const first = await api.redisIndexStart(source.id, { db })
+      setIndexProgress(current => ({ ...current, [db]: first }))
+
+      let status = first
+      // Bounded so a stalled walk surfaces as a stop rather than an endless poll.
+      const deadline = Date.now() + 10 * 60 * 1000
+      while (!status.done && status.error === undefined && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 400))
+        status = await api.redisIndexStart(source.id, { db })
+        setIndexProgress(current => ({ ...current, [db]: status }))
+      }
+
+      setIndexProgress(current => ({ ...current, [db]: undefined }))
+      if (status.error !== undefined) {
+        setError(status.error)
+        return
+      }
+      /*
+       * Bring the tree up to date from the finished index.
+       *
+       * `refreshAll` alone is not enough: it reloads only levels that were ALREADY
+       * loaded, and the root level of this database typically is not — the user
+       * opened the database, which started the walk, and no level request has
+       * happened yet. Loading it explicitly is what makes the folders appear as soon
+       * as the walk finishes instead of after a second click.
+       */
+      await loadLevel(db, '')
+      await refreshAll()
+    } catch (failure) {
+      // A failed walk must not leave the database stuck on the index path, or every
+      // level would keep failing instead of falling back to the scan.
+      setIndexDbs(current => {
+        const next = new Set(current)
+        next.delete(db)
+        return next
+      })
+      setIndexProgress(current => ({ ...current, [db]: undefined }))
+      setError(failure instanceof Error ? failure.message : String(failure))
+    }
+  }, [api, source.id, refreshAll, loadLevel])
+
+  /**
+   * Expand one database, deciding whether to index it first.
+   *
+   * A small database needs no index: the per-level scan is one bounded request and
+   * imposes no upfront cost. A large one cannot be scanned per level at all (each
+   * level is a full traversal), so it is indexed — but only after the user confirms,
+   * because the walk loads their server for about a minute.
+   */
   const toggleDb = (db: number): void => {
     const next = openDbs[db] !== true
     setOpenDbs(current => ({ ...current, [db]: next }))
-    if (next && levels[levelKey(db, '')] === undefined) void loadLevel(db, '')
-    // Opening a database selects it, so the row can show as active. This is what
-    // the `{ kind: 'db' }` variant of RedisSelection was declared for and never
-    // assigned, leaving a database row unable to appear selected.
     if (next) setSelection({ kind: 'db', db })
+    if (!next) return
+
+    if (indexDbs.has(db)) {
+      if (levels[levelKey(db, '')] === undefined) void loadLevel(db, '')
+      return
+    }
+
+    const size = databases.find(node => node.db === db)?.keys ?? 0
+    // Below the threshold, scanning a level is cheap and an index would be a
+    // pointless upfront cost. Above it, per-level scanning cannot work at all.
+    if (size < LARGE_DB_KEYS) {
+      if (levels[levelKey(db, '')] === undefined) void loadLevel(db, '')
+      return
+    }
+
+    // Large: state the cost and let the user choose. The estimate comes from DBSIZE,
+    // so asking does not itself load the server.
+    void api.redisIndexEstimate(source.id, { db })
+      .then(estimate => setIndexPrompt({ db, estimate }))
+      .catch(() => {
+        // If the cost cannot be determined, do not block browsing: fall back to the
+        // scan, which works on any database small enough to reach this path at all.
+        if (levels[levelKey(db, '')] === undefined) void loadLevel(db, '')
+      })
   }
 
   /** Expand or collapse one folder, loading its level on first open. */
@@ -608,6 +775,20 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
     ),
     error === undefined ? null : React.createElement(ErrorBanner, { message: error }),
     notice === undefined ? null : React.createElement('div', { className: 'dbm-ok', style: { padding: '6px 14px' } }, notice),
+    /**
+     * Progress for a keyspace walk, per database.
+     *
+     * Shown because a big database takes about a minute to index, and the walk keeps
+     * loading the server for that whole time. A real percentage is what makes the
+     * wait understandable; without it the panel would look frozen while it worked.
+     */
+    ...Object.entries(indexProgress)
+      .filter(([, status]) => status !== undefined && !status.done)
+      .map(([db, status]) => React.createElement(IndexProgressBanner, {
+        key: `idx-${db}`,
+        db: Number(db),
+        status: status!,
+      })),
     React.createElement('div', { className: 'dbm-split' }, left as never, React.createElement('div', { className: 'dbm-main' }, body as never)),
     createFor === undefined ? null : React.createElement(NewKeyDialog, {
       db: createFor.db,
@@ -623,6 +804,86 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
       onConfirm: () => { void confirmDelete() },
       onClose: () => setDeleteFor(undefined),
     }),
+    /**
+     * The confirmation for indexing a large database.
+     *
+     * Deliberately a prompt rather than an automatic decision: the walk is read-only
+     * but it holds the server's CPU for about a minute, and on a production server
+     * that is the user's call to make, not the panel's.
+     */
+    indexPrompt === undefined ? null : React.createElement(IndexPromptDialog, {
+      db: indexPrompt.db,
+      estimate: indexPrompt.estimate,
+      onConfirm: () => { void buildIndex(indexPrompt.db) },
+      onCancel: () => {
+        const db = indexPrompt.db
+        setIndexPrompt(undefined)
+        // Declining still lets the user browse: a per-level scan is attempted, which
+        // is exactly the slow path they were warned about — so the warning said what
+        // would happen, not that it was impossible.
+        if (levels[levelKey(db, '')] === undefined) void loadLevel(db, '')
+      },
+    }),
+  )
+}
+
+/**
+ * A one-line progress bar for a running keyspace walk.
+ *
+ * The percentage is `visited / dbSize` — a real measure of work done, not a spinner
+ * of unknown length. It also names the database, because several may be walked.
+ */
+function IndexProgressBanner(props: { db: number; status: RedisIndexStatus }): React.ReactElement {
+  const { db, status } = props
+  const pct = status.dbSize === 0 ? 0 : Math.min(100, Math.round((status.visited / status.dbSize) * 100))
+  return React.createElement(
+    'div',
+    { className: 'dbm-ok dbm-index-progress', style: { padding: '6px 14px' } },
+    React.createElement('span', null, t('redis.index.building', {
+      db,
+      visited: status.visited.toLocaleString(),
+      total: status.dbSize.toLocaleString(),
+      folders: status.folders.toLocaleString(),
+    })),
+    React.createElement(
+      'span',
+      { className: 'dbm-index-bar', 'aria-hidden': 'true' },
+      React.createElement('span', { className: 'dbm-index-fill', style: { width: `${pct}%` } }),
+    ),
+  )
+}
+
+/** The dialog that warns what indexing a large database costs, before it starts. */
+function IndexPromptDialog(props: {
+  db: number
+  estimate: RedisIndexEstimate
+  onConfirm(): void
+  onCancel(): void
+}): React.ReactElement {
+  const { db, estimate, onConfirm, onCancel } = props
+  return React.createElement(
+    'div',
+    { className: 'dbm-modal-backdrop' },
+    React.createElement(
+      'div',
+      { className: 'dbm-modal', role: 'dialog', 'aria-modal': true },
+      React.createElement('div', { className: 'dbm-modal-head' }, t('redis.index.title', { n: db })),
+      React.createElement(
+        'div',
+        { className: 'dbm-modal-body' },
+        React.createElement('p', null, t('redis.index.why', {
+          keys: estimate.keys.toLocaleString(),
+          seconds: estimate.estimatedSeconds,
+        })),
+        React.createElement('p', { className: 'dbm-hint' }, t('redis.index.warning')),
+      ),
+      React.createElement(
+        'div',
+        { className: 'dbm-modal-foot' },
+        React.createElement('button', { type: 'button', className: 'dbm-btn', onClick: onCancel }, t('redis.index.skip')),
+        React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-primary', onClick: onConfirm }, t('redis.index.confirm')),
+      ),
+    ),
   )
 }
 

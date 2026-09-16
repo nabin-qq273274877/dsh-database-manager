@@ -17,6 +17,9 @@ import {
   type RedisDeleteResult,
   type RedisElementEdit,
   type RedisInfo,
+  type RedisIndexEstimate,
+  type RedisIndexLevel,
+  type RedisIndexStatus,
   type RedisKeyPage,
   type RedisLevelPage,
   type RedisMutationResult,
@@ -32,10 +35,21 @@ import {
 } from '../protocol.ts'
 
 /** Error carrying the route's JSON error message. */
+/**
+ * Error carrying the route's JSON error message.
+ *
+ * `status` is kept because callers act on specific codes rather than on the text: a
+ * 409 from the index route means "nothing indexed yet", which is a normal state the
+ * panel handles by falling back, not something to show the user.
+ */
 export class DbApiError extends Error {
-  constructor(message: string) {
+  /** HTTP status, when the failure came from a response. */
+  readonly status: number | undefined
+
+  constructor(message: string, status?: number) {
     super(message)
     this.name = 'DbApiError'
+    this.status = status
   }
 }
 
@@ -59,14 +73,14 @@ async function readJson<T>(response: Response): Promise<T> {
   try {
     body = await response.json()
   } catch {
-    throw new DbApiError(`HTTP ${response.status}: invalid JSON response`)
+    throw new DbApiError(`HTTP ${response.status}: invalid JSON response`, response.status)
   }
   if (!response.ok) {
     const message =
       typeof body === 'object' && body !== null && typeof (body as { error?: unknown }).error === 'string'
         ? (body as { error: string }).error
         : `HTTP ${response.status}`
-    throw new DbApiError(message)
+    throw new DbApiError(message, response.status)
   }
   return body as T
 }
@@ -255,6 +269,53 @@ export class DbApi {
     return (await readJson<{ page: RedisSearchPage }>(
       await fetch(DB_API.redisSearch(id, query({ db: options.db, pattern: options.pattern }))),
     )).page
+  }
+
+  /**
+   * What a keyspace walk would cost, before anything is scanned.
+   *
+   * Exists so the panel can warn before loading the server: a walk of a huge
+   * database takes tens of seconds and holds the server's CPU, and the user should
+   * decide that consciously rather than discover it.
+   */
+  async redisIndexEstimate(id: string, options: { db: number }): Promise<RedisIndexEstimate> {
+    return (await readJson<{ estimate: RedisIndexEstimate }>(
+      await fetch(DB_API.redisIndexEstimate(id, query({ db: options.db }))),
+    )).estimate
+  }
+
+  /**
+   * Start (or resume) the keyspace walk for one database, returning its status.
+   *
+   * Idempotent on the host, so calling it again while a walk runs just reports
+   * progress — the panel polls this rather than tracking progress itself.
+   */
+  async redisIndexStart(id: string, options: { db: number }): Promise<RedisIndexStatus> {
+    return (await readJson<{ status: RedisIndexStatus }>(
+      await fetch(DB_API.redisIndex(id, query({ db: options.db }))),
+    )).status
+  }
+
+  /** Drop a cached index, so the next read rebuilds it. */
+  async redisIndexInvalidate(id: string, options: { db: number }): Promise<void> {
+    await readJson(await fetch(DB_API.redisIndex(id, query({ db: options.db })), { method: 'DELETE' }))
+  }
+
+  /**
+   * One level of the cached keyspace index.
+   *
+   * Answers from memory on the host, so expanding a level costs no scanning at all —
+   * which is the entire reason the index exists. Throws on 409 when no index has
+   * been built, letting the caller decide to build one.
+   */
+  async redisIndexLevel(id: string, options: { db: number; prefix: string; withTypes: boolean }): Promise<RedisIndexLevel> {
+    return (await readJson<{ level: RedisIndexLevel }>(
+      await fetch(DB_API.redisIndexLevel(id, query({
+        db: options.db,
+        prefix: options.prefix,
+        withTypes: options.withTypes ? '1' : '0',
+      }))),
+    )).level
   }
 
   /**
