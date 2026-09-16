@@ -247,6 +247,77 @@ export const PANEL_CSS = `
 .dbm-tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dbm-tree-meta { margin-left: auto; color: var(--dsw-alias-label-secondary); font-size: 11px; }
 
+/* ---- Redis key tree ----------------------------------------------------- */
+/*
+ * The Redis tree has more levels than the SQL one (database > folder > … > key)
+ * and its rows carry hover controls, so it does not reuse .dbm-tree-item. The
+ * rows are divs rather than buttons because a row can contain buttons, and a
+ * button inside a button is invalid HTML that browsers re-parent in surprising
+ * ways.
+ */
+.dbm-tree-node {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+  width: 100%;
+  text-align: left;
+  box-sizing: border-box;
+}
+.dbm-tree-node:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.dbm-tree-node[data-active="true"] {
+  background: var(--dsw-alias-interactive-bg-active);
+  font-weight: 500;
+}
+/*
+ * One indent step per tree depth, applied by class rather than inline style so
+ * the whole ladder is visible in one place. Depth is capped at 6 in the
+ * component: a 12-segment key name would otherwise indent past the panel.
+ */
+.dbm-tree-depth-1 { padding-left: 24px; }
+.dbm-tree-depth-2 { padding-left: 40px; }
+.dbm-tree-depth-3 { padding-left: 56px; }
+.dbm-tree-depth-4 { padding-left: 72px; }
+.dbm-tree-depth-5 { padding-left: 88px; }
+.dbm-tree-depth-6 { padding-left: 104px; }
+.dbm-tree-glyph { flex: none; width: 16px; text-align: center; font-size: 12px; }
+.dbm-tree-hint { padding-top: 3px; padding-bottom: 3px; }
+
+/*
+ * Row actions appear on hover (and on keyboard focus, so they are reachable
+ * without a mouse). Always-visible controls turned the tree into a wall of
+ * icons; hidden ones with no focus path would make the feature mouse-only.
+ */
+.dbm-tree-actions {
+  margin-left: auto;
+  display: none;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+.dbm-tree-node:hover > .dbm-tree-actions,
+.dbm-tree-node:focus-within > .dbm-tree-actions { display: inline-flex; }
+/* With actions shown, the count must not also claim the auto margin. */
+.dbm-tree-node:hover > .dbm-tree-meta,
+.dbm-tree-node:focus-within > .dbm-tree-meta { margin-left: 0; }
+
+.dbm-icon-btn {
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  padding: 2px 5px;
+  border: 1px solid var(--dsw-alias-border-l3);
+  border-radius: 6px;
+  background: var(--dsw-alias-button-elevated-fill);
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+}
+.dbm-icon-btn:hover { background: var(--dsw-alias-button-floating-hover); color: var(--dsw-alias-label-primary); }
+.dbm-icon-btn-danger:hover { color: var(--dsw-alias-label-danger, #d33); border-color: currentColor; }
+
 /* ---- tabs -------------------------------------------------------------- */
 .dbm-tabs {
   display: flex;

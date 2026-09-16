@@ -513,4 +513,128 @@ describe.skipIf(!available)('built host half', () => {
     expect((await fetch(`${base}/nope`)).status).toBe(404)
     expect((await fetch(`${base}/sources/ghost/connect`, { method: 'POST' })).status).toBe(404)
   })
+
+  describe('Redis key editing routes', () => {
+    /**
+     * The route family is exercised against a source that points nowhere: every
+     * case below is rejected by validation BEFORE a connection is attempted, so
+     * the suite stays independent of a running Redis. The cases that need a
+     * live server live in redis-edit.test.ts.
+     *
+     * The source must be of kind redis even so: the routes check the driver's
+     * type before they parse the body, so a SQL source would exercise the wrong
+     * branch. Port 1 on loopback is reliably refused, and nothing dials it here.
+     */
+    const redisId = 'routes-redis'
+
+    beforeAll(async () => {
+      const created = await fetch(`${base}/sources`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ kind: 'redis', name: 'routes-redis', id: redisId, host: '127.0.0.1', port: 1, db: 0 }),
+      })
+      expect(created.status).toBe(201)
+    })
+
+    afterAll(async () => {
+      // Left in place and the later source-list assertions break.
+      await fetch(`${base}/sources/${redisId}`, { method: 'DELETE' })
+    })
+
+    it('rejects a create with no keys, naming the field', async () => {
+      const response = await fetch(`${base}/sources/${redisId}/redis/key?db=0`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ keys: [] }),
+      })
+      expect(response.status).toBe(400)
+      expect(((await response.json()) as { error: string }).error).toMatch(/keys must be a non-empty array/)
+    })
+
+    it('rejects an unknown key type', async () => {
+      const response = await fetch(`${base}/sources/${redisId}/redis/key?db=0`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ keys: [{ key: 'k', type: 'stream' }] }),
+      })
+      expect(response.status).toBe(400)
+      expect(((await response.json()) as { error: string }).error).toMatch(/type must be one of/)
+    })
+
+    it('rejects a half-specified collection before touching the server', async () => {
+      // A hash with no fields, and a zset member with a non-numeric score: both
+      // are the browser being wrong, and both must be caught here.
+      const noFields = await fetch(`${base}/sources/${redisId}/redis/key?db=0`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ keys: [{ key: 'h', type: 'hash', fields: [] }] }),
+      })
+      expect(noFields.status).toBe(400)
+      expect(((await noFields.json()) as { error: string }).error).toMatch(/fields must be a non-empty array/)
+
+      const badScore = await fetch(`${base}/sources/${redisId}/redis/key?db=0`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ keys: [{ key: 'z', type: 'zset', members: [{ member: 'm', score: 'abc' }] }] }),
+      })
+      expect(badScore.status).toBe(400)
+      expect(((await badScore.json()) as { error: string }).error).toMatch(/score must be a number/)
+    })
+
+    it('rejects a negative TTL', async () => {
+      const response = await fetch(`${base}/sources/${redisId}/redis/key?db=0`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ keys: [{ key: 'k', type: 'string', value: 'v', ttl: -5 }] }),
+      })
+      expect(response.status).toBe(400)
+      expect(((await response.json()) as { error: string }).error).toMatch(/ttl cannot be negative/)
+    })
+
+    it('requires a key name', async () => {
+      const response = await fetch(`${base}/sources/${redisId}/redis/key?db=0`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ keys: [{ key: '', type: 'string', value: 'v' }] }),
+      })
+      expect(response.status).toBe(400)
+      expect(((await response.json()) as { error: string }).error).toMatch(/key is required/)
+    })
+
+    it('requires a key for a single delete and a prefix for a folder delete', async () => {
+      const noKey = await fetch(`${base}/sources/${redisId}/redis/key?db=0`, { method: 'DELETE' })
+      expect(noKey.status).toBe(400)
+      expect(((await noKey.json()) as { error: string }).error).toMatch(/key is required/)
+
+      const noPrefix = await fetch(`${base}/sources/${redisId}/redis/prefix?db=0`, { method: 'DELETE' })
+      expect(noPrefix.status).toBe(400)
+      expect(((await noPrefix.json()) as { error: string }).error).toMatch(/prefix is required/)
+    })
+
+    it('rejects a non-GET method on the tree route', async () => {
+      const response = await fetch(`${base}/sources/${redisId}/redis/tree?db=0`, { method: 'POST' })
+      expect(response.status).toBe(404)
+    })
+
+    it('refuses the Redis key routes on a SQL source', async () => {
+      // Writing Redis keys through a SQLite connection must not be possible even
+      // if the path is guessed.
+      const create = await fetch(`${base}/sources/app/redis/key?db=0`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ keys: [{ key: 'k', type: 'string', value: 'v' }] }),
+      })
+      expect(create.status).toBe(400)
+      expect(((await create.json()) as { error: string }).error).toMatch(/Redis/)
+
+      const tree = await fetch(`${base}/sources/app/redis/tree?db=0`)
+      expect(tree.status).toBe(400)
+      expect(((await tree.json()) as { error: string }).error).toMatch(/Redis/)
+    })
+
+    it('answers 404 for a Redis key route on an unknown source', async () => {
+      const response = await fetch(`${base}/sources/ghost/redis/prefix?prefix=a&db=0`, { method: 'DELETE' })
+      expect(response.status).toBe(404)
+    })
+  })
 })

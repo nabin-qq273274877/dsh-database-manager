@@ -7,8 +7,20 @@
  * boot fine, so the import is lazy and its failure is an actionable message.
  */
 
-import type { DataSourceEntry, QueryResult, RedisInfo, RedisKeyInfo, RedisKeyPage, RedisValue, TestResult } from '../protocol.ts'
+import type {
+  DataSourceEntry,
+  QueryResult,
+  RedisCreateKey,
+  RedisDeletePrefixResult,
+  RedisInfo,
+  RedisKeyInfo,
+  RedisKeyPage,
+  RedisTreePage,
+  RedisValue,
+  TestResult,
+} from '../protocol.ts'
 import { toWireValue } from '../sql-util.ts'
+import { keyPattern, prefixPattern } from '../redis-util.ts'
 import type { RedisDriver as RedisDriverContract } from './types.ts'
 
 /** Structural view of the ioredis surface this driver uses. */
@@ -28,6 +40,7 @@ interface RedisClient {
   xrange(key: string, start: string, end: string, ...args: Array<string | number>): Promise<Array<[string, string[]]>>
   select(db: number): Promise<string>
   call(command: string, ...args: Array<string | number>): Promise<unknown>
+  del(...keys: string[]): Promise<number>
   disconnect(): void
   on(event: string, listener: (...args: unknown[]) => void): void
 }
@@ -65,6 +78,30 @@ export async function redisAvailable(): Promise<boolean> {
 
 /** Cap on elements read from one collection, so a huge key cannot freeze the GUI. */
 const MAX_ELEMENTS = 1000
+
+/**
+ * Ceiling on keys collected by one whole-database tree scan.
+ *
+ * The tree groups keys by prefix, so a partial scan would show a folder that
+ * silently lacks members — worse than saying "too many". The cap is a report
+ * threshold: past it the result is marked truncated and the UI says so.
+ */
+const MAX_TREE_KEYS = 20000
+
+/** SCAN batch size for the tree scan. */
+const TREE_SCAN_COUNT = 1000
+
+/**
+ * Ceiling on keys removed by one folder delete.
+ *
+ * Deleting is destructive and runs unattended, so it is bounded and the outcome
+ * reports whether the ceiling was hit. A larger folder must be deleted in
+ * several passes rather than in one unbounded sweep.
+ */
+const MAX_DELETE_KEYS = 50000
+
+/** DEL batch size, kept small enough to stay off Redis's per-command limits. */
+const DELETE_BATCH = 500
 
 /** Fallback connection/command deadline when the entry sets none. */
 const DEFAULT_TIMEOUT_MS = 10000
@@ -312,9 +349,244 @@ export class RedisDriver implements RedisDriverContract {
     return shapeRedisReply(result, Date.now() - started)
   }
 
+  /**
+   * Every key in one logical database, for the folder tree.
+   *
+   * A tree needs the whole key set: grouping by prefix from a partial SCAN page
+   * would render a folder that silently lacks members. The traversal is
+   * therefore exhaustive up to {@link MAX_TREE_KEYS}, and the caller is told
+   * when the cap was reached rather than being handed a plausible-looking
+   * half-tree.
+   *
+   * Types and TTLs are fetched in bounded parallel batches: one round trip per
+   * key across 20k keys would take minutes, while an unbounded Promise.all
+   * would open as many sockets as the server allows.
+   */
+  async tree(input: { db: number; pattern?: string }): Promise<RedisTreePage> {
+    return this.withDeadline(this.treeUnbounded(input), this.treeDeadlineMs(), 'scanning the key tree')
+  }
+
+  /** The actual tree scan; callers go through {@link tree} for the deadline. */
+  private async treeUnbounded(input: { db: number; pattern?: string }): Promise<RedisTreePage> {
+    const client = await this.client(input.db)
+    const match = input.pattern === undefined || input.pattern === '' ? '*' : input.pattern
+    const names: string[] = []
+    let cursor = '0'
+    let truncated = false
+
+    do {
+      const [next, found] = await client.scan(cursor, 'MATCH', match, 'COUNT', TREE_SCAN_COUNT)
+      cursor = String(next)
+      for (const name of found) {
+        names.push(name)
+        if (names.length >= MAX_TREE_KEYS) { truncated = true; break }
+      }
+      if (truncated) break
+    } while (cursor !== '0')
+
+    const dbSize = await client.dbsize().catch(() => names.length)
+    const keys: RedisKeyInfo[] = []
+    const BATCH = 200
+    for (let i = 0; i < names.length; i += BATCH) {
+      const slice = names.slice(i, i + BATCH)
+      const described = await Promise.all(slice.map(async key => {
+        const [type, ttl] = await Promise.all([
+          client.type(key).catch(() => 'unknown'),
+          client.ttl(key).catch(() => -2),
+        ])
+        return { key, type, ttl } satisfies RedisKeyInfo
+      }))
+      keys.push(...described)
+    }
+    return { keys, dbSize, truncated }
+  }
+
+  /**
+   * Create one key, or report why it could not be.
+   *
+   * Refuses to overwrite: a create that silently replaced an existing key would
+   * destroy data behind a dialog titled 新增. `type` is checked first so the
+   * message names the real conflict rather than a type error.
+   */
+  async createKey(input: RedisCreateKey, db: number): Promise<void> {
+    return this.withDeadline(this.createKeyUnbounded(input, db), this.deadlineMs(), `creating "${input.key}"`)
+  }
+
+  /** The actual create; callers go through {@link createKey} for the deadline. */
+  private async createKeyUnbounded(input: RedisCreateKey, db: number): Promise<void> {
+    const client = await this.client(db)
+    const { key, type } = input
+    if (key === '') throw new Error('key name is required')
+
+    const existing = await client.type(key)
+    if (existing !== 'none') {
+      throw new Error(`键「${key}」已存在（类型 ${existing}）；请换一个名字，或先删除它`)
+    }
+
+    switch (type) {
+      case 'string':
+        await client.call('SET', key, input.value ?? '')
+        break
+      case 'list': {
+        const items = input.items ?? []
+        if (items.length === 0) throw new Error(`「${key}」需要一个元素`)
+        // RPUSH keeps the form's line order as the list's order.
+        await client.call('RPUSH', key, ...items)
+        break
+      }
+      case 'set': {
+        const items = input.items ?? []
+        if (items.length === 0) throw new Error(`「${key}」需要一个成员`)
+        await client.call('SADD', key, ...items)
+        break
+      }
+      case 'hash': {
+        const fields = input.fields ?? []
+        if (fields.length === 0) throw new Error(`「${key}」需要一个字段`)
+        await client.call('HSET', key, ...fields.flatMap(pair => [pair.field, pair.value]))
+        break
+      }
+      case 'zset': {
+        const members = input.members ?? []
+        if (members.length === 0) throw new Error(`「${key}」需要一个成员`)
+        await client.call('ZADD', key, ...members.flatMap(pair => [pair.score, pair.member]))
+        break
+      }
+      default: {
+        const never: never = type
+        throw new Error(`unsupported key type: ${String(never)}`)
+      }
+    }
+
+    // Only set an expiry when one was asked for: EXPIRE with 0 would delete the
+    // key we just wrote.
+    if (input.ttl !== undefined && input.ttl > 0) await client.call('EXPIRE', key, input.ttl)
+  }
+
+  /** Delete one key; returns whether it existed. */
+  async deleteKey(key: string, db: number): Promise<boolean> {
+    return this.withDeadline(this.deleteKeyUnbounded(key, db), this.deadlineMs(), `deleting "${key}"`)
+  }
+
+  /** The actual single-key delete; callers go through {@link deleteKey}. */
+  private async deleteKeyUnbounded(key: string, db: number): Promise<boolean> {
+    const client = await this.client(db)
+    const removed = await client.del(key)
+    return removed > 0
+  }
+
+  /**
+   * Delete every key under one folder prefix.
+   *
+   * The scan runs HERE, immediately before the delete, for two reasons: the
+   * browser's key list may be a capped or filtered view (deleting from it would
+   * silently leave keys behind), and SCAN is not a snapshot, so the set must be
+   * collected as close to the delete as possible.
+   *
+   * The traversal is re-run after each batch until the pattern is exhausted, so
+   * a folder holding more keys than one scan pass returns is still fully
+   * cleared; {@link MAX_DELETE_KEYS} is the sole ceiling and hitting it is
+   * reported.
+   */
+  async deletePrefix(path: string, db: number): Promise<RedisDeletePrefixResult> {
+    return this.withDeadline(this.deletePrefixUnbounded(path, db), this.treeDeadlineMs(), `deleting folder "${path}"`)
+  }
+
+  /** The actual prefix delete; callers go through {@link deletePrefix}. */
+  private async deletePrefixUnbounded(path: string, db: number): Promise<RedisDeletePrefixResult> {
+    const client = await this.client(db)
+    let deleted = 0
+
+    // The folder's own key first (`a:b` may exist alongside `a:b:*`). DEL takes
+    // the literal name, NOT a glob: escaping here would target a different,
+    // non-existent key.
+    const own = await client.del(path)
+    deleted += own
+
+    const pattern = prefixPattern(path)
+    // Passes restart from cursor 0 and delete what they find, then re-scan:
+    // SCAN is not a snapshot, so a single traversal can miss keys that move
+    // between hash-table slots while the delete progresses. The loop ends when
+    // a pass finds nothing left to remove.
+    //
+    // `MAX_PASSES` bounds a pathological case where a pass finds keys but
+    // removes none (a concurrent writer recreating them); without it the loop
+    // could never settle. Hitting it is reported as truncated, because keys may
+    // then remain.
+    const MAX_PASSES = 100
+    for (let pass = 0; pass < MAX_PASSES; pass++) {
+      const [cursor, found] = await client.scan('0', 'MATCH', pattern, 'COUNT', TREE_SCAN_COUNT)
+      if (found.length === 0) {
+        // Nothing matched from the start of the keyspace: the folder is gone.
+        if (cursor === '0') return { deleted, truncated: false }
+        // A cursor with an empty page means this pass is spent; the next pass
+        // rescans from 0.
+        continue
+      }
+
+      let removedThisPass = 0
+      for (let i = 0; i < found.length; i += DELETE_BATCH) {
+        const batch = found.slice(i, i + DELETE_BATCH)
+        if (deleted + batch.length > MAX_DELETE_KEYS) {
+          const room = MAX_DELETE_KEYS - deleted
+          if (room > 0) deleted += await client.del(...batch.slice(0, room))
+          return { deleted, truncated: true }
+        }
+        // DEL reports how many keys it actually removed; a key that vanished
+        // between the scan and the delete must not be counted as deleted.
+        removedThisPass += await client.del(...batch)
+      }
+      deleted += removedThisPass
+
+      // Nothing removed and the traversal finished: there is nothing left.
+      if (removedThisPass === 0) return { deleted, truncated: false }
+    }
+
+    // Passes exhausted with keys still present: report the partial result.
+    return { deleted, truncated: true }
+  }
+
+  /** How many keys sit under one folder prefix (the delete dialog's warning). */
+  async countPrefix(path: string, db: number): Promise<number> {
+    return this.withDeadline(this.countPrefixUnbounded(path, db), this.treeDeadlineMs(), `counting folder "${path}"`)
+  }
+
+  /** The actual prefix count; callers go through {@link countPrefix}. */
+  private async countPrefixUnbounded(path: string, db: number): Promise<number> {
+    const client = await this.client(db)
+    // The two patterns are disjoint by construction — `prefixPattern` requires
+    // a separator after the path, and `keyPattern` matches the path exactly —
+    // so their counts can simply be added.
+    let count = 0
+    for (const pattern of [keyPattern(path), prefixPattern(path)]) {
+      let cursor = '0'
+      do {
+        const [next, found] = await client.scan(cursor, 'MATCH', pattern, 'COUNT', TREE_SCAN_COUNT)
+        cursor = String(next)
+        count += found.length
+        // Past the delete ceiling the exact number stops mattering; the dialog
+        // only needs to know the folder is large.
+        if (count > MAX_DELETE_KEYS) return count
+      } while (cursor !== '0')
+    }
+    return count
+  }
+
   /** The per-operation deadline for this data source. */
   private deadlineMs(): number {
     return this.entry.connectTimeoutMs ?? DEFAULT_TIMEOUT_MS
+  }
+
+  /**
+   * The deadline for a whole-database traversal.
+   *
+   * A tree scan and a folder delete both walk the entire keyspace, which is
+   * categorically slower than one command, so the per-operation budget would
+   * abort a legitimate scan of a large database. This is a ceiling on a stalled
+   * server, not an expectation.
+   */
+  private treeDeadlineMs(): number {
+    return Math.max(this.deadlineMs() * 3, 30000)
   }
 }
 

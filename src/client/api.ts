@@ -11,8 +11,14 @@ import {
   type EngineAvailability,
   type GateSettingsView,
   type QueryResult,
+  type RedisCreateKey,
+  type RedisCreateResult,
+  type RedisDeletePrefixResult,
+  type RedisDeleteResult,
   type RedisInfo,
   type RedisKeyPage,
+  type RedisPrefixCount,
+  type RedisTreePage,
   type RedisValue,
   type SchemaInfo,
   type ColumnInfo,
@@ -211,5 +217,35 @@ export class DbApi {
       args: body.args,
       allowWrite: body.allowWrite,
     })).result
+  }
+
+  /** Every key in one logical database, for the folder tree. */
+  async redisTree(id: string, options: { db: number; pattern?: string }): Promise<RedisTreePage> {
+    return (await readJson<{ page: RedisTreePage }>(await fetch(DB_API.redisTree(id, query(options))))).page
+  }
+
+  /** Create one or more keys; resolves with the names that were created. */
+  async redisCreateKeys(id: string, options: { db: number; keys: RedisCreateKey[] }): Promise<string[]> {
+    return (await send<RedisCreateResult>(`${DB_API.redisCreate(id)}?${query({ db: options.db })}`, 'POST', {
+      keys: options.keys,
+    })).created
+  }
+
+  /** Delete one key; resolves with whether it existed. */
+  async redisDeleteKey(id: string, options: { key: string; db: number }): Promise<boolean> {
+    return (await send<RedisDeleteResult>(DB_API.redisDeleteKey(id, query(options)), 'DELETE')).removed
+  }
+
+  /** How many keys a folder holds, for the delete confirmation. */
+  async redisPrefixCount(id: string, options: { prefix: string; db: number }): Promise<number> {
+    return (await readJson<RedisPrefixCount>(await fetch(DB_API.redisPrefixCount(id, query(options))))).count
+  }
+
+  /** Delete a folder: its own key plus every descendant. Irreversible. */
+  async redisDeletePrefix(id: string, options: { prefix: string; db: number }): Promise<RedisDeletePrefixResult> {
+    return (await send<{ result: RedisDeletePrefixResult }>(
+      `${DB_API.redisDeletePrefix(id)}?${query({ prefix: options.prefix, db: options.db })}`,
+      'DELETE',
+    )).result
   }
 }

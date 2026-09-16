@@ -18,7 +18,16 @@ import { probeEngines } from './pool.ts'
 import type { DataSourceStore, StoredSettings } from './store.ts'
 import { summarize, validatePayload } from './store.ts'
 import { asJsonObject, errorMessage, readJsonBody, writeError, writeJson } from './http.ts'
-import type { QueryResult } from './protocol.ts'
+import type {
+  QueryResult,
+  RedisCreatableType,
+  RedisCreateKey,
+  RedisCreateResult,
+  RedisDeletePrefixResult,
+  RedisDeleteResult,
+  RedisPrefixCount,
+} from './protocol.ts'
+import { REDIS_CREATABLE_TYPES } from './protocol.ts'
 import { isRedisDriver, isSqlDriver, type Driver } from './drivers/types.ts'
 import { isRedisReadCommand } from './drivers/redis.ts'
 import { looksReadOnly } from './sql-util.ts'
@@ -79,6 +88,115 @@ function readPairs(value: unknown, what: string): Array<{ column: string; value:
     if (!isWireScalar(cell)) throw new Error(`${what}[${index}].value must be a scalar`)
     return { column, value: cell }
   })
+}
+
+/** Read a list of strings, rejecting a non-array or a non-string member. */
+function readStringArray(value: unknown, what: string): string[] | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value)) throw new Error(`${what} must be an array of strings`)
+  return value.map((item, index) => {
+    if (typeof item !== 'string') throw new Error(`${what}[${index}] must be a string`)
+    return item
+  })
+}
+
+/** Whether an unknown value is one of the creatable Redis key types. */
+function isCreatableType(value: unknown): value is RedisCreatableType {
+  return typeof value === 'string' && (REDIS_CREATABLE_TYPES as readonly string[]).includes(value)
+}
+
+/**
+ * Validate one create request into the driver's shape.
+ *
+ * Validation lives here, not in the browser: the browser is not a trust
+ * boundary, and a hand-rolled request must not be able to create a
+ * half-specified key (an empty hash, a zset member with a non-numeric score).
+ *
+ * @param body - the parsed JSON request body.
+ * @returns the keys to create, or a message naming the first problem.
+ */
+function parseCreateRequest(body: Record<string, unknown>): { keys: RedisCreateKey[] } | { error: string } {
+  const rawKeys = body['keys']
+  if (!Array.isArray(rawKeys) || rawKeys.length === 0) return { error: 'keys must be a non-empty array' }
+  if (rawKeys.length > 1000) return { error: 'too many keys in one request (max 1000)' }
+
+  const keys: RedisCreateKey[] = []
+  for (const [index, item] of rawKeys.entries()) {
+    const record = asJsonObject(item)
+    if (record === undefined) return { error: `keys[${index}] must be an object` }
+
+    const key = typeof record['key'] === 'string' ? record['key'] : ''
+    if (key === '') return { error: `keys[${index}].key is required` }
+
+    const rawType = record['type']
+    if (!isCreatableType(rawType)) {
+      return { error: `keys[${index}].type must be one of ${REDIS_CREATABLE_TYPES.join(', ')}` }
+    }
+    const type = rawType
+
+    let ttl: number | undefined
+    if (record['ttl'] !== undefined && record['ttl'] !== null) {
+      if (typeof record['ttl'] !== 'number' || !Number.isFinite(record['ttl'])) {
+        return { error: `keys[${index}].ttl must be a number of seconds` }
+      }
+      if (record['ttl'] < 0) return { error: `keys[${index}].ttl cannot be negative` }
+      if (record['ttl'] > 0) ttl = Math.trunc(record['ttl'])
+    }
+
+    try {
+      if (type === 'string') {
+        const value = record['value']
+        if (value !== undefined && typeof value !== 'string') return { error: `keys[${index}].value must be a string` }
+        keys.push({ key, type, value: value ?? '', ...(ttl === undefined ? {} : { ttl }) })
+        continue
+      }
+
+      if (type === 'list' || type === 'set') {
+        const items = readStringArray(record['items'], `keys[${index}].items`)
+        if (items === undefined || items.length === 0) return { error: `keys[${index}].items must be a non-empty array for a ${type}` }
+        keys.push({ key, type, items, ...(ttl === undefined ? {} : { ttl }) })
+        continue
+      }
+
+      if (type === 'hash') {
+        const raw = record['fields']
+        if (!Array.isArray(raw) || raw.length === 0) return { error: `keys[${index}].fields must be a non-empty array for a hash` }
+        const fields: Array<{ field: string; value: string }> = []
+        for (const [position, entry] of raw.entries()) {
+          const pair = asJsonObject(entry)
+          if (pair === undefined) return { error: `keys[${index}].fields[${position}] must be an object` }
+          const field = pair['field']
+          const value = pair['value']
+          if (typeof field !== 'string' || field === '') return { error: `keys[${index}].fields[${position}].field must be a non-empty string` }
+          if (typeof value !== 'string') return { error: `keys[${index}].fields[${position}].value must be a string` }
+          fields.push({ field, value })
+        }
+        keys.push({ key, type, fields, ...(ttl === undefined ? {} : { ttl }) })
+        continue
+      }
+
+      // zset
+      const raw = record['members']
+      if (!Array.isArray(raw) || raw.length === 0) return { error: `keys[${index}].members must be a non-empty array for a zset` }
+      const members: Array<{ member: string; score: string }> = []
+      for (const [position, entry] of raw.entries()) {
+        const pair = asJsonObject(entry)
+        if (pair === undefined) return { error: `keys[${index}].members[${position}] must be an object` }
+        const member = pair['member']
+        const score = pair['score']
+        if (typeof member !== 'string' || member === '') return { error: `keys[${index}].members[${position}].member must be a non-empty string` }
+        if (typeof score !== 'string' || score === '') return { error: `keys[${index}].members[${position}].score must be a string` }
+        // The score reaches ZADD verbatim; reject a non-numeric one here so the
+        // failure names the field instead of surfacing as a Redis syntax error.
+        if (!Number.isFinite(Number(score))) return { error: `keys[${index}].members[${position}].score must be a number` }
+        members.push({ member, score })
+      }
+      keys.push({ key, type, members, ...(ttl === undefined ? {} : { ttl }) })
+    } catch (error) {
+      return { error: errorMessage(error) }
+    }
+  }
+  return { keys }
 }
 
 /**
@@ -491,6 +609,92 @@ export function makeRoutes(deps: RoutesDeps): { routes: WebRoute[]; upgrade: Web
           return
         }
         writeJson(res, 200, { result: await driver.command(args, queryInt(url, 'db', entry.db ?? 0)) })
+        return
+      }
+
+      // ---- Redis tree and key editing (the USER surface) -------------------
+      // Everything below is the panel acting on the user's direct input, the
+      // same authorization model as the SQL row routes: the click IS the
+      // authorization. Model-initiated writes never come through here — they
+      // go through the agent tools and the auth gate.
+      if (action === 'redis/tree' && method === 'GET') {
+        if (!isRedisDriver(driver)) {
+          writeError(res, 400, 'redis/tree is only available for Redis data sources')
+          return
+        }
+        const page = await driver.tree({
+          db: queryInt(url, 'db', entry.db ?? 0),
+          ...(queryParam(url, 'pattern') === undefined ? {} : { pattern: queryParam(url, 'pattern')! }),
+        })
+        writeJson(res, 200, { page })
+        return
+      }
+
+      if (action === 'redis/key') {
+        if (!isRedisDriver(driver)) {
+          writeError(res, 400, 'redis/key is only available for Redis data sources')
+          return
+        }
+        const db = queryInt(url, 'db', entry.db ?? 0)
+
+        if (method === 'POST') {
+          const body = asJsonObject(await readJsonBody(req))
+          if (body === undefined) {
+            writeError(res, 400, 'body must be a JSON object')
+            return
+          }
+          const parsed = parseCreateRequest(body)
+          if ('error' in parsed) {
+            writeError(res, 400, parsed.error)
+            return
+          }
+          // Created one at a time on purpose: a multi-key form must report
+          // exactly which names landed, so a partial failure is not hidden by
+          // an all-or-nothing bulk call.
+          const created: string[] = []
+          for (const candidate of parsed.keys) {
+            await driver.createKey(candidate, db)
+            created.push(candidate.key)
+          }
+          writeJson(res, 201, { created } satisfies RedisCreateResult)
+          return
+        }
+
+        if (method === 'DELETE') {
+          const key = queryParam(url, 'key')
+          if (key === undefined) {
+            writeError(res, 400, 'key is required')
+            return
+          }
+          writeJson(res, 200, { removed: await driver.deleteKey(key, db) } satisfies RedisDeleteResult)
+          return
+        }
+
+        writeError(res, 405, `${method} is not allowed on ${path}`)
+        return
+      }
+
+      if (action === 'redis/prefix') {
+        if (!isRedisDriver(driver)) {
+          writeError(res, 400, 'redis/prefix is only available for Redis data sources')
+          return
+        }
+        const prefix = queryParam(url, 'prefix')
+        if (prefix === undefined) {
+          writeError(res, 400, 'prefix is required')
+          return
+        }
+        const db = queryInt(url, 'db', entry.db ?? 0)
+
+        if (method === 'GET') {
+          writeJson(res, 200, { count: await driver.countPrefix(prefix, db) } satisfies RedisPrefixCount)
+          return
+        }
+        if (method === 'DELETE') {
+          writeJson(res, 200, { result: await driver.deletePrefix(prefix, db) })
+          return
+        }
+        writeError(res, 405, `${method} is not allowed on ${path}`)
         return
       }
 

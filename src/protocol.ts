@@ -207,6 +207,79 @@ export interface RedisKeyPage {
   cursor: string
 }
 
+/**
+ * One database's complete key set, for the folder tree.
+ *
+ * The tree groups keys by the `:` separator in their names, and a group is only
+ * correct if it sees every key under it — so this is a full scan of one logical
+ * database rather than a SCAN page. It is bounded by a cap: past
+ * {@link RedisTreePage.truncated} the caller must not treat the grouping as
+ * complete.
+ */
+export interface RedisTreePage {
+  keys: RedisKeyInfo[]
+  /** Total keys the database holds (DBSIZE), whatever the pattern matched. */
+  dbSize: number
+  /** True when the scan stopped at the cap, so `keys` is incomplete. */
+  truncated: boolean
+}
+
+/** Key types this plugin can create from the new-key form. */
+export type RedisCreatableType = 'string' | 'list' | 'set' | 'hash' | 'zset'
+
+/** Every creatable type, for validation and the form's select. */
+export const REDIS_CREATABLE_TYPES: readonly RedisCreatableType[] = ['string', 'list', 'set', 'hash', 'zset']
+
+/**
+ * One key to create, already parsed and validated by the caller.
+ *
+ * The shape mirrors {@link RedisValue} so the same renderer can read it back,
+ * which is what makes "create then inspect" round-trip without a second model.
+ */
+export interface RedisCreateKey {
+  /** The full key name. */
+  key: string
+  type: RedisCreatableType
+  /** string: the value. */
+  value?: string
+  /** list | set: the elements, in order for a list. */
+  items?: string[]
+  /** hash: the fields to set. */
+  fields?: Array<{ field: string; value: string }>
+  /** zset: the scored members to add. */
+  members?: Array<{ member: string; score: string }>
+  /** Expiry in seconds; absent, 0 or negative means no expiry. */
+  ttl?: number
+}
+
+/** Outcome of one create request (several keys when the form named several). */
+export interface RedisCreateResult {
+  created: string[]
+}
+
+/** Outcome of deleting one key. */
+export interface RedisDeleteResult {
+  /** Whether a key was actually removed. */
+  removed: boolean
+}
+
+/** Outcome of deleting every key under one folder prefix. */
+export interface RedisDeletePrefixResult {
+  deleted: number
+  /**
+   * True when the scan hit its safety ceiling, so keys may remain. Reported
+   * rather than hidden: a partial delete that claims success is worse than one
+   * the user knows to repeat.
+   */
+  truncated: boolean
+}
+
+/** How many keys sit under one folder prefix (computed host-side for the dialog). */
+export interface RedisPrefixCount {
+  /** Keys whose name is the prefix itself, or starts with `prefix:` . */
+  count: number
+}
+
 /** The full value of one Redis key, shaped by its type. */
 export interface RedisValue {
   key: string
@@ -294,4 +367,14 @@ export const DB_API = {
   redisKeys: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/keys?${params}`,
   redisValue: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/value?${params}`,
   redisCommand: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/command`,
+  /** One database's whole key set for the folder tree. */
+  redisTree: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/tree?${params}`,
+  /** Create one or more keys. */
+  redisCreate: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/key`,
+  /** Delete one key (query param `key`) — DELETE on the same path as create. */
+  redisDeleteKey: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/key?${params}`,
+  /** Delete every key under one folder prefix. */
+  redisDeletePrefix: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/prefix`,
+  /** Count the keys under one folder prefix (the delete dialog's warning). */
+  redisPrefixCount: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/prefix?${params}`,
 } as const

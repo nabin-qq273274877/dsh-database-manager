@@ -8,8 +8,11 @@ import type {
   ColumnInfo,
   IndexInfo,
   QueryResult,
+  RedisCreateKey,
+  RedisDeletePrefixResult,
   RedisInfo,
   RedisKeyPage,
+  RedisTreePage,
   RedisValue,
   SchemaInfo,
   TableInfo,
@@ -89,8 +92,18 @@ export interface RedisDriver {
   info(): Promise<RedisInfo>
   /** SCAN one page of keys. */
   keys(input: { pattern: string; cursor: string; count: number; db: number }): Promise<RedisKeyPage>
+  /** Every key in one database, for the folder tree (bounded, reports truncation). */
+  tree(input: { db: number; pattern?: string }): Promise<RedisTreePage>
   /** Read one key's full value (bounded by `limit` per collection). */
   value(key: string, db: number, limit: number): Promise<RedisValue>
+  /** Create one key; refuses to overwrite an existing one. */
+  createKey(input: RedisCreateKey, db: number): Promise<void>
+  /** Delete one key; returns whether it existed. */
+  deleteKey(key: string, db: number): Promise<boolean>
+  /** Delete a folder: its own key plus every descendant, scanned fresh here. */
+  deletePrefix(path: string, db: number): Promise<RedisDeletePrefixResult>
+  /** How many keys a folder holds (the delete dialog's warning). */
+  countPrefix(path: string, db: number): Promise<number>
   /** Run one command; the caller owns the write-authorisation decision. */
   command(args: string[], db: number): Promise<QueryResult>
 }

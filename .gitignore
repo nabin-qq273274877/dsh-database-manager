@@ -3,3 +3,6 @@ node_modules/
 .dsh-*/
 *.tsbuildinfo
 .DS_Store
+# Screenshots from scripts/shot-redis-tree.mjs — review artifacts, not sources.
+.shots/
+
