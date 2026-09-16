@@ -80,7 +80,16 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
     | { target: { kind: 'key'; db: number; key: string } | { kind: 'folder'; db: number; path: string }; count: number | undefined }
     | undefined
   >(undefined)
+  /** A dialog's own submit/confirm action is in flight. */
   const [busy, setBusy] = React.useState(false)
+  /**
+   * A tree-wide refresh is in flight (a write just happened, or ⟳ was pressed).
+   *
+   * Surfaced on the refresh control so the wait is visible even when the branch
+   * that changed is scrolled out of view — the level's own row marker only helps
+   * if that row is on screen.
+   */
+  const [refreshing, setRefreshing] = React.useState(false)
 
   /**
    * Load one level.
@@ -123,19 +132,38 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
     }
   }, [api, source.id])
 
-  /** Refresh the server overview and every level already loaded. */
-  const refreshAll = React.useCallback(async (): Promise<void> => {
+  /**
+   * Refresh the server overview and every loaded level.
+   *
+   * AWAITS every reload rather than firing them off. The callers are the write
+   * paths, and their whole point is to leave the tree showing the new truth
+   * before they clear their busy flag — returning early let the flag drop while
+   * the tree was still fetching, which is precisely the "nothing happened for a
+   * moment" gap this is meant to close.
+   *
+   * @param extra - levels to reload as well, for a target that is not loaded yet
+   *   (a folder a create just opened, so it is absent from `levels`). Deduped
+   *   against the loaded ones, so nothing is fetched twice.
+   */
+  const refreshAll = React.useCallback(async (extra?: Array<{ db: number; prefix: string }>): Promise<void> => {
+    setRefreshing(true)
     try {
-      setInfo(await api.redisInfo(source.id))
-    } catch (failure) {
-      setError(failure instanceof Error ? failure.message : String(failure))
-    }
-    // Only the open levels: a collapsed folder's data is discarded anyway, and
-    // re-scanning it would defeat the lazy design.
-    const open = Object.keys(levels)
-    for (const key of open) {
-      const at = key.indexOf('\u0000')
-      void loadLevel(Number(key.slice(0, at)), key.slice(at + 1))
+      try {
+        setInfo(await api.redisInfo(source.id))
+      } catch (failure) {
+        setError(failure instanceof Error ? failure.message : String(failure))
+      }
+      // Only the loaded levels: a collapsed folder's data is discarded anyway,
+      // and re-scanning it would defeat the lazy design.
+      const targets = new Map<string, { db: number; prefix: string }>()
+      for (const key of Object.keys(levels)) {
+        const at = key.indexOf('\u0000')
+        targets.set(key, { db: Number(key.slice(0, at)), prefix: key.slice(at + 1) })
+      }
+      for (const item of extra ?? []) targets.set(levelKey(item.db, item.prefix), item)
+      await Promise.all([...targets.values()].map(item => loadLevel(item.db, item.prefix)))
+    } finally {
+      setRefreshing(false)
     }
   }, [api, source.id, levels, loadLevel])
 
@@ -208,8 +236,12 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
           return { ...current, [createFor.db]: { ...forDb, [createFor.folderPath!]: true } }
         })
       }
-      await refreshAll()
-      await loadLevel(createFor.db, createFor.folderPath ?? '')
+      // ONE refresh covering every loaded level PLUS the target folder. Passing
+      // the target matters when the key went into a folder that was not loaded
+      // yet: it is absent from `levels`, so refreshAll alone would leave the new
+      // key invisible. A separate loadLevel call after this one (as it used to
+      // be) re-fetched that same level twice.
+      await refreshAll([{ db: createFor.db, prefix: createFor.folderPath ?? '' }])
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure))
     } finally {
@@ -237,6 +269,9 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
     if (deleteFor === undefined) return
     setBusy(true)
     try {
+      // The levels this delete changes, so the refresh covers them even if they
+      // were never loaded (a collapsed folder's rows are not in `levels`).
+      let affected: Array<{ db: number; prefix: string }> = []
       if (deleteFor.target.kind === 'key') {
         const { db, key } = deleteFor.target
         const removed = await api.redisDeleteKey(source.id, { key, db })
@@ -245,6 +280,8 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
           setActiveKey(undefined)
           setValue(undefined)
         }
+        // The key's own level is the one whose row disappeared.
+        affected = [{ db, prefix: key.includes(':') ? key.slice(0, key.lastIndexOf(':')) : '' }]
       } else {
         const { db, path } = deleteFor.target
         const result = await api.redisDeletePrefix(source.id, { prefix: path, db })
@@ -257,13 +294,14 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
           setActiveKey(undefined)
           setValue(undefined)
         }
-        // A folder's parent level changed too (the folder itself may be gone).
+        // Two levels changed: the folder's parent (the folder row is gone) and
+        // the folder itself (which may still be expanded in the UI).
         const parent = path.includes(':') ? path.slice(0, path.lastIndexOf(':')) : ''
-        void loadLevel(db, parent)
+        affected = [{ db, prefix: parent }, { db, prefix: path }]
       }
       setError(undefined)
       setDeleteFor(undefined)
-      await refreshAll()
+      await refreshAll(affected)
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure))
     } finally {
@@ -288,11 +326,15 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
       }),
       React.createElement('button', {
         type: 'button',
-        className: 'dbm-btn dbm-btn-sm',
+        className: `dbm-btn dbm-btn-sm${refreshing ? ' dbm-btn-busy' : ''}`,
         title: t('redisdb.refresh'),
         'aria-label': t('redisdb.refresh'),
+        // A second press while a refresh is running would stack another round of
+        // scans on the same levels.
+        disabled: refreshing,
+        'aria-busy': refreshing ? 'true' : undefined,
         onClick: () => { void refreshAll() },
-      }, '⟳'),
+      }, refreshing ? React.createElement('span', { className: 'dbm-spinner' }) : '⟳'),
     ),
     React.createElement(
       'div',

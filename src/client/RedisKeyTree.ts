@@ -46,7 +46,19 @@ export interface RedisLevel {
   truncated: boolean
   /** How many keys live at this level, whether or not all were returned. */
   keysAtLevel: number
-  /** True while the fetch is in flight. */
+  /**
+   * True while a fetch for this level is in flight.
+   *
+   * Reached in two situations, which the tree renders differently on purpose:
+   *
+   * - FIRST load (no rows yet): a placeholder block, because there is nothing to
+   *   show and the level's contents are unknown.
+   * - REFRESH (rows already present, e.g. straight after a create or a delete):
+   *   the existing rows stay, dimmed, with a spinner on the branch. Blanking
+   *   them would make the tree jump and lose the user's place, but showing them
+   *   unmarked is what made a create/delete look like nothing had happened until
+   *   the new data arrived.
+   */
   loading?: boolean
   /** Set when the fetch failed. */
   error?: string
@@ -128,13 +140,13 @@ function matchesFilter(key: string, filter: string): boolean {
 export function RedisKeyTree(props: RedisKeyTreeProps): React.ReactElement {
   const { databases, levels, openDbs, openFolders, filter, selection, activeKey } = props
 
-  /** One key leaf. */
-  const renderKey = (db: number, info: RedisKeyInfo, depth: number): unknown =>
+  /** One key leaf, optionally dimmed while a refresh is in flight. */
+  const renderKey = (db: number, info: RedisKeyInfo, depth: number, stale = false): unknown =>
     React.createElement(
       'div',
       {
         key: `key-${db}-${info.key}`,
-        className: `dbm-tree-node dbm-tree-depth-${Math.min(depth, 8)}`,
+        className: `dbm-tree-node dbm-tree-depth-${Math.min(depth, 8)}${stale ? ' dbm-tree-stale' : ''}`,
         'data-active': String(activeKey?.db === db && activeKey.key === info.key),
         'data-kind': 'key',
         'data-key': info.key,
@@ -176,14 +188,26 @@ export function RedisKeyTree(props: RedisKeyTreeProps): React.ReactElement {
     if (level === undefined) {
       rows.push(React.createElement('div', {
         key: `loading-${db}-${prefix}`,
-        className: `dbm-tree-hint dbm-tree-depth-${Math.min(depth, 8)} dbm-hint`,
+        className: `dbm-tree-hint dbm-tree-depth-${Math.min(depth, 8)} dbm-hint dbm-tree-pending`,
       }, t('redisdb.loading')))
       return rows
     }
-    if (level.loading === true && level.folders.length === 0 && level.keys.length === 0) {
+    /**
+     * A refresh is in flight over rows that are already on screen.
+     *
+     * The rows are kept and dimmed rather than replaced by a placeholder: they
+     * are still the best information available, and swapping them out would make
+     * the tree collapse and jump under the cursor. They are marked so the user
+     * can tell the difference between "this is current" and "this is about to
+     * change" — which is exactly what was missing when a create or delete
+     * appeared to do nothing for a moment.
+     */
+    const refreshing = level.loading === true
+
+    if (refreshing && level.folders.length === 0 && level.keys.length === 0) {
       rows.push(React.createElement('div', {
         key: `loading-${db}-${prefix}`,
-        className: `dbm-tree-hint dbm-tree-depth-${Math.min(depth, 8)} dbm-hint`,
+        className: `dbm-tree-hint dbm-tree-depth-${Math.min(depth, 8)} dbm-hint dbm-tree-pending`,
       }, t('redisdb.loading')))
       return rows
     }
@@ -214,13 +238,16 @@ export function RedisKeyTree(props: RedisKeyTreeProps): React.ReactElement {
           'div',
           {
             key: `folder-${db}-${folder.path}`,
-            className: `dbm-tree-node dbm-tree-depth-${Math.min(depth, 8)}`,
+            className: `dbm-tree-node dbm-tree-depth-${Math.min(depth, 8)}${refreshing ? ' dbm-tree-stale' : ''}`,
             'data-active': String(selected),
             'data-kind': 'folder',
             'data-path': folder.path,
             title: folder.path,
             role: 'treeitem',
             'aria-expanded': isOpen,
+            // Announced while a refresh is in flight, so the state is not
+            // conveyed by the dimming alone.
+            'aria-busy': refreshing ? 'true' : undefined,
             // A folder row is both "select it" (so an action can target it) and
             // "open it". The row does both on one click, which is what RDM does.
             onClick: () => {
@@ -269,7 +296,7 @@ export function RedisKeyTree(props: RedisKeyTreeProps): React.ReactElement {
       if (isOpen) rows.push(...renderLevel(db, folder.path, depth + 1))
     }
 
-    for (const info of keys) rows.push(renderKey(db, info, depth))
+    for (const info of keys) rows.push(renderKey(db, info, depth, refreshing))
 
     if (level.truncated) {
       rows.push(React.createElement('div', {
@@ -284,16 +311,26 @@ export function RedisKeyTree(props: RedisKeyTreeProps): React.ReactElement {
   for (const node of databases) {
     const isOpen = openDbs[node.db] === true
     const selected = selection?.kind === 'db' && selection.db === node.db
+    /**
+     * Whether this database's ROOT level is being fetched.
+     *
+     * Checked here as well as inside renderLevel because the spinner belongs on
+     * the database row itself: when a create or delete refreshes the tree, the
+     * user's eye is on the branch they acted in, and a marker only on the child
+     * level would be easy to miss.
+     */
+    const rootLoading = levels[levelKey(node.db, '')]?.loading === true
 
     rows.push(
       React.createElement(
         'div',
         {
           key: `db-${node.db}`,
-          className: 'dbm-tree-node dbm-tree-depth-0',
+          className: `dbm-tree-node dbm-tree-depth-0${rootLoading ? ' dbm-tree-stale' : ''}`,
           'data-active': String(selected),
           'data-kind': 'db',
           'data-db': String(node.db),
+          'aria-busy': rootLoading ? 'true' : undefined,
           title: t('redisdb.dbSummary', { n: node.db, keys: node.keys }),
           role: 'treeitem',
           'aria-expanded': isOpen,
@@ -302,7 +339,9 @@ export function RedisKeyTree(props: RedisKeyTreeProps): React.ReactElement {
         React.createElement('span', { className: 'dbm-tree-caret' }, isOpen ? '▾' : '▸'),
         React.createElement('span', { className: 'dbm-tree-glyph' }, '🗄'),
         React.createElement('span', { className: 'dbm-tree-name' }, `db${node.db}`),
-        React.createElement('span', { className: 'dbm-tree-meta' }, String(node.keys)),
+        rootLoading
+          ? React.createElement('span', { className: 'dbm-tree-meta dbm-spinner', 'aria-label': t('redisdb.loading') })
+          : React.createElement('span', { className: 'dbm-tree-meta' }, String(node.keys)),
         React.createElement(
           'span',
           { className: 'dbm-tree-actions' },

@@ -318,6 +318,55 @@ export const PANEL_CSS = `
 .dbm-icon-btn:hover { background: var(--dsw-alias-button-floating-hover); color: var(--dsw-alias-label-primary); }
 .dbm-icon-btn-danger:hover { color: var(--dsw-alias-label-danger, #d33); border-color: currentColor; }
 
+/* ---- busy / refresh feedback ------------------------------------------- */
+/*
+ * Rows kept on screen while their level is re-fetched.
+ *
+ * Dimmed rather than replaced: after a create or a delete the existing rows are
+ * still the best information available, and blanking them would collapse the
+ * tree and lose the user's place. The dimming is what distinguishes "current"
+ * from "about to change", which was missing while a write appeared to do
+ * nothing for a moment.
+ *
+ * pointer-events is set to none because a row being reloaded may no longer
+ * exist on the server — acting on it would target a stale key. The container's
+ * own controls stay usable.
+ */
+.dbm-tree-stale {
+  opacity: .5;
+  pointer-events: none;
+}
+
+/*
+ * An indeterminate spinner. Sized in em so it sits on the baseline of whatever
+ * row it replaces (the key count, the ⟳ glyph) without shifting the layout.
+ */
+.dbm-spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--dsw-alias-border-l3);
+  border-top-color: var(--dsw-alias-label-secondary);
+  border-radius: 50%;
+  animation: dbm-spin .7s linear infinite;
+}
+@keyframes dbm-spin {
+  to { transform: rotate(360deg); }
+}
+/*
+ * A spinner that cannot be seen moving is just a strange dot, so when motion is
+ * unwelcome it becomes a pulse instead — still clearly "working", never moving.
+ */
+@media (prefers-reduced-motion: reduce) {
+  .dbm-spinner { animation: dbm-pulse 1.2s ease-in-out infinite; }
+  @keyframes dbm-pulse {
+    0%, 100% { opacity: .35; }
+    50% { opacity: 1; }
+  }
+}
+/* A control that is busy keeps its width, so the header does not jitter. */
+.dbm-btn-busy { cursor: progress; }
+
 /* ---- tabs -------------------------------------------------------------- */
 .dbm-tabs {
   display: flex;
