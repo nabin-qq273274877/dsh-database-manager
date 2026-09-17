@@ -248,6 +248,26 @@ function containsStatementSeparator(sql: string): boolean {
 }
 
 /**
+ * Whether a statement is a transaction-control statement.
+ *
+ * Used by the importer, which runs a script inside a transaction of its own: a
+ * script's own `BEGIN` would be a nested `BEGIN` ("cannot start a transaction
+ * within a transaction") and its `COMMIT` would end the wrapper's transaction
+ * early, defeating the all-or-nothing guarantee. Both are dropped so the wrapper
+ * owns the transaction unconditionally, which is what makes a foreign dump as
+ * atomic as one this plugin wrote.
+ *
+ * The forms are enumerated rather than pattern-guessed: SQLite accepts `BEGIN`,
+ * `BEGIN TRANSACTION` and `BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE] [TRANSACTION]`,
+ * MySQL accepts `BEGIN [WORK]` and `START TRANSACTION`, and a savepoint is
+ * deliberately NOT included — a savepoint is a real thing a script may want.
+ */
+export function isTransactionControl(statement: string): boolean {
+  const text = statement.trim().replace(/;+\s*$/, '').trim()
+  return /^(?:BEGIN(?:\s+(?:DEFERRED|IMMEDIATE|EXCLUSIVE))?(?:\s+TRANSACTION)?|COMMIT(?:\s+(?:TRANSACTION|WORK))?|END(?:\s+TRANSACTION)?|ROLLBACK(?:\s+(?:TRANSACTION|WORK))?|START\s+TRANSACTION)$/i.test(text)
+}
+
+/**
  * Coerce an engine value into the JSON-safe scalar the wire accepts. Buffers
  * and bigints become strings, Dates become ISO text, and anything unknown
  * falls back to its string form so a result set can always be serialized.
@@ -271,12 +291,26 @@ export function toWireValue(value: unknown): string | number | boolean | null {
   }
 }
 
-/** One structured search condition, mirrored from the driver contract. */
-export interface SearchFilter {
-  column: string
-  operator: string
-  value?: string
-  value2?: string
+import type { RowFilter } from './protocol.ts'
+export type { RowFilter }
+
+/** Which engine's identifier quoting and escaping rules apply. */
+export type SqlDialect = 'sqlite' | 'mysql'
+
+/**
+ * The `ESCAPE` clause for a `LIKE`.
+ *
+ * Engine-specific on purpose. `likePattern` escapes `%` and `_` with a
+ * backslash, and each engine needs to be TOLD that the backslash is the escape
+ * character — but the way that is spelled differs: MySQL treats a backslash
+ * inside a string literal as an escape itself, so the literal has to be written
+ * `'\\'` for the server to see a single backslash, whereas SQLite takes `'\'`
+ * as-is. Emitting MySQL's spelling to SQLite (or the reverse) makes the clause
+ * look for a double backslash, and every escaped search silently matches
+ * nothing.
+ */
+export function likeEscapeClause(dialect: SqlDialect): string {
+  return dialect === 'mysql' ? "ESCAPE '\\\\'" : "ESCAPE '\\'"
 }
 
 /** The comparison operators a search filter may name. */
@@ -314,10 +348,11 @@ function likePattern(value: string, position: 'contains' | 'startsWith' | 'endsW
  * @throws when a filter names an unknown column or operator, or omits a value.
  */
 export function buildSearchWhere(
-  filters: readonly SearchFilter[],
+  filters: readonly RowFilter[],
   join: 'and' | 'or',
   quote: (name: string) => string,
   known: ReadonlySet<string>,
+  dialect: SqlDialect = 'sqlite',
 ): { where: string; params: unknown[] } {
   const clauses: string[] = []
   const params: unknown[] = []
@@ -344,7 +379,7 @@ export function buildSearchWhere(
       }
       case 'in': {
         // A comma-separated list, each member its own bound parameter.
-        const members = value.split(',').map(member => member.trim()).filter(member => member !== '')
+        const members = value.split(',').map((member: string) => member.trim()).filter((member: string) => member !== '')
         if (members.length === 0) throw new Error('in needs at least one value')
         clauses.push(`${quoted} IN (${members.map(() => '?').join(', ')})`)
         params.push(...members)
@@ -358,8 +393,9 @@ export function buildSearchWhere(
           ? 'contains'
           : filter.operator === 'startsWith' ? 'startsWith' : 'endsWith'
         const negated = filter.operator === 'notContains'
-        // `LIKE … ESCAPE '\'` so the escaping in `likePattern` is honoured.
-        clauses.push(`${quoted} ${negated ? 'NOT ' : ''}LIKE ? ESCAPE '\\'`)
+        // `ESCAPE` so the escaping in `likePattern` is honoured, spelled the way
+        // this engine's string literals require.
+        clauses.push(`${quoted} ${negated ? 'NOT ' : ''}LIKE ? ${likeEscapeClause(dialect)}`)
         params.push(likePattern(value, position))
         continue
       }

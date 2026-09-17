@@ -32,6 +32,13 @@ import {
   type TableInfo,
   type TablePage,
   type TestResult,
+  type RowFilter,
+  type SchemaChangePayload,
+  type SchemaChangeResult,
+  type ExportPayload,
+  type ExportResponse,
+  type ImportPayload,
+  type ImportResponse,
 } from '../protocol.ts'
 
 /** Error carrying the route's JSON error message. */
@@ -210,10 +217,54 @@ export class DbApi {
     term?: string
     condition?: string
     orderBy?: string
+    orderByColumns?: string[]
     orderDir?: 'asc' | 'desc'
+    filters?: RowFilter[]
+    filterJoin?: 'and' | 'or'
+    /** Also return the table's index list, so 按索引排序 needs one request. */
+    withIndexes?: boolean
   }): Promise<TablePage> {
-    const url = `${DB_API.rows(id)}?${query(options)}`
+    const url = `${DB_API.rows(id)}?${query({
+      ...options,
+      // A condition list is one JSON parameter rather than a parameter per
+      // field: the shape is a list, and flattening it into repeated names would
+      // lose the association between a condition's column and its operand.
+      filters: options.filters === undefined || options.filters.length === 0 ? undefined : JSON.stringify(options.filters),
+      orderByColumns: options.orderByColumns === undefined || options.orderByColumns.length === 0
+        ? undefined
+        : options.orderByColumns.join(','),
+      withIndexes: options.withIndexes === true ? '1' : undefined,
+    })}`
     return (await readJson<{ page: TablePage }>(await fetch(url))).page
+  }
+
+  /** Delete several rows in one request and one transaction. */
+  async deleteRows(id: string, body: {
+    schema?: string
+    table: string
+    keySets: Array<Array<{ column: string; value: string | number | boolean | null }>>
+  }): Promise<QueryResult> {
+    return (await send<{ result: QueryResult }>(DB_API.deleteRows(id), 'POST', body)).result
+  }
+
+  /** How many distinct values a column holds. */
+  async distinctCount(id: string, options: { schema?: string; table: string; column: string }): Promise<number> {
+    return (await readJson<{ count: number }>(await fetch(DB_API.distinct(id, query(options))))).count
+  }
+
+  /** One schema change: add / alter / drop a column, set the key, manage an index. */
+  async changeSchema(id: string, body: SchemaChangePayload): Promise<SchemaChangeResult> {
+    return (await send<{ result: SchemaChangeResult }>(DB_API.schema(id), 'POST', body)).result
+  }
+
+  /** Export a schema or one table. The text comes back for the browser to save. */
+  async exportData(id: string, body: ExportPayload): Promise<ExportResponse> {
+    return send<ExportResponse>(DB_API.exportData(id), 'POST', body)
+  }
+
+  /** Import a SQL dump or a CSV file. */
+  async importData(id: string, body: ImportPayload): Promise<ImportResponse> {
+    return (await send<{ result: ImportResponse }>(DB_API.importData(id), 'POST', body)).result
   }
 
   /** Insert one row. */

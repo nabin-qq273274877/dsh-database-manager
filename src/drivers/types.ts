@@ -19,6 +19,7 @@ import type {
   RedisSearchPage,
   RedisTreePage,
   RedisValue,
+  RowFilter,
   SchemaInfo,
   TableInfo,
   TablePage,
@@ -65,50 +66,25 @@ export interface RowQuery {
   filters?: RowFilter[]
   /** How the structured filters combine. Defaults to 'AND'. */
   filterJoin?: 'and' | 'or'
+  /**
+   * Skip the `COUNT(*)` that normally accompanies a page.
+   *
+   * For a caller that walks the whole table a page at a time — the SQL/CSV
+   * exporter — the count is pure overhead: it is computed again for every page
+   * and thrown away. `total` comes back as -1, which is a value no count can
+   * produce, so a caller that forgot this option cannot mistake it for "empty".
+   */
+  skipCount?: boolean
 }
 
 /**
  * One condition from the 搜索 tab.
  *
- * Structured rather than a SQL fragment so the operator decides the SQL shape:
- * `contains` is `LIKE %v%` (a bound pattern), `is null` is `IS NULL` (no bound
- * value at all), `in` is a list of bound parameters. Building this as text would
- * put the user's operand back into the statement.
+ * Re-exported from the shared protocol so the driver contract and the browser
+ * cannot drift; the definition lives there because both halves name it.
  */
-export interface RowFilter {
-  /** Column the condition applies to; must exist on the table. */
-  column: string
-  /** Comparison to apply. */
-  operator: RowFilterOperator
-  /** Operand; ignored by the unary operators (`is null`, `is not null`). */
-  value?: string
-  /**
-   * True when the operand is a pre-built operator fragment rather than the
-   * column's own type. Set by the 结构 tab's 「非重复值」 shortcut, not by a user
-   * typing; it is not exposed in the 搜索 tab's operator list.
-   */
-  raw?: boolean
-  /** For `between`: the upper bound. */
-  value2?: string
-}
-
-/**
- * The comparison operators the 搜索 tab offers.
- *
- * Deliberately a closed set: each one maps to a SQL shape this plugin writes,
- * so the operand is always a bound parameter and never part of the statement.
- */
-export type RowFilterOperator =
-  | 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte'
-  | 'contains' | 'notContains' | 'startsWith' | 'endsWith'
-  | 'isNull' | 'isNotNull' | 'between' | 'in'
-
-/** Canonical operator order, for validation and the UI's select. */
-export const ROW_FILTER_OPERATORS: readonly RowFilterOperator[] = [
-  'eq', 'neq', 'gt', 'gte', 'lt', 'lte',
-  'contains', 'notContains', 'startsWith', 'endsWith',
-  'between', 'in', 'isNull', 'isNotNull',
-]
+export type { RowFilter, RowFilterOperator } from '../protocol.ts'
+export { ROW_FILTER_OPERATORS, UNARY_FILTER_OPERATORS } from '../protocol.ts'
 
 /** A key/value pair identifying one row for an update or delete. */
 export interface RowKey {
@@ -219,6 +195,62 @@ export interface SqlDriver {
   createIndex(schema: string | undefined, table: string, spec: { name: string; columns: string[]; unique: boolean }): Promise<QueryResult>
   /** Drop an index. Refuses a primary key's own index. */
   dropIndex(schema: string | undefined, table: string, name: string): Promise<QueryResult>
+  /**
+   * The `CREATE TABLE` statement for a table, as the engine stores it.
+   *
+   * Read rather than reconstructed: the export has to reproduce the table
+   * (`CHECK`, foreign keys, collation, generated columns, engine options) and
+   * the engine's own text is the only complete description of it. `undefined`
+   * for a view or a missing table.
+   */
+  createStatement(schema: string | undefined, table: string): Promise<string | undefined>
+  /**
+   * The DDL a table needs BEYOND its `CREATE TABLE`.
+   *
+   * Engine-specific and not cosmetic. SQLite keeps an index (and a trigger) as a
+   * separate schema object, so its `CREATE TABLE` text does not mention them —
+   * a dump built from that text alone would silently lose every index on the
+   * table. MySQL's `SHOW CREATE TABLE` already inlines its keys, so it returns
+   * nothing here and a caller that emitted both would create them twice.
+   *
+   * @returns statements to run after the `CREATE TABLE`, in dependency order.
+   */
+  auxiliaryDdl(schema: string | undefined, table: string): Promise<string[]>
+  /**
+   * Run several statements as ONE atomic unit.
+   *
+   * The import path, and distinct from `exec` in the two ways that matter to it:
+   * the statements share a transaction (so a failure half way is a no-op rather
+   * than a half-imported database), and each is reported through `onStatement`
+   * as it runs, so a long import has progress instead of one silent pause.
+   *
+   * A script's own `BEGIN`/`COMMIT` is tolerated rather than rejected: a dump
+   * written by this plugin contains them, and refusing them would make the
+   * plugin's own exports un-importable.
+   */
+  runScript(statements: string[], schema: string | undefined, onStatement?: (index: number) => void): Promise<void>
+  /**
+   * Every row of a table, in one array.
+   *
+   * For the exporter, which must see all of them. Deliberately NOT the 浏览
+   * tab's path: loading a million rows into the host's memory to render 200 of
+   * them is the mistake the paged read exists to prevent.
+   *
+   * @param limit - stop after this many rows; `truncated` says whether it hit.
+   */
+  allRows(schema: string | undefined, table: string, limit: number): Promise<{ columns: string[]; rows: Array<Record<string, string | number | boolean | null>>; truncated: boolean }>
+  /** List the tables and views in one schema (names only, for an export scope). */
+  tableNames(schema: string | undefined): Promise<Array<{ name: string; type: string }>>
+  /**
+   * Which tables each table references, keyed by lower-cased table name.
+   *
+   * For the exporter's ordering: a dump replays statement by statement, and a
+   * `CREATE TABLE` whose foreign key names a table that does not exist yet is
+   * refused. `information_schema.TABLES` returns name order, which puts a
+   * referrer before its target often enough to make an unordered dump
+   * un-importable.
+   */
+  tableReferences(schema: string | undefined): Promise<Map<string, string[]>>
   /**
    * Remove every row of a table, keeping the table itself.
    *

@@ -128,6 +128,55 @@ export interface TableInfo {
   collation?: string
 }
 
+/**
+ * One condition from the 搜索 tab.
+ *
+ * Structured rather than a SQL fragment so the operator decides the SQL shape:
+ * `contains` is `LIKE %v%` (a bound pattern), `is null` is `IS NULL` (no bound
+ * value at all), `in` is a list of bound parameters. Building this as text would
+ * put the user's operand back into the statement.
+ *
+ * Lives in the shared protocol because both halves name it: the browser builds
+ * the list, the driver compiles it.
+ */
+export interface RowFilter {
+  /** Column the condition applies to; must exist on the table. */
+  column: string
+  /** Comparison to apply. */
+  operator: RowFilterOperator
+  /** Operand; ignored by the unary operators (`is null`, `is not null`). */
+  value?: string
+  /** For `between`: the upper bound. */
+  value2?: string
+}
+
+/**
+ * The comparison operators the 搜索 tab offers.
+ *
+ * Deliberately a closed set: each one maps to a SQL shape this plugin writes,
+ * so the operand is always a bound parameter and never part of the statement.
+ */
+export type RowFilterOperator =
+  | 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte'
+  | 'contains' | 'notContains' | 'startsWith' | 'endsWith'
+  | 'isNull' | 'isNotNull' | 'between' | 'in'
+
+/** Canonical operator order, for validation and the UI's select. */
+export const ROW_FILTER_OPERATORS: readonly RowFilterOperator[] = [
+  'eq', 'neq', 'gt', 'gte', 'lt', 'lte',
+  'contains', 'notContains', 'startsWith', 'endsWith',
+  'between', 'in', 'isNull', 'isNotNull',
+]
+
+/**
+ * Operators that need no operand.
+ *
+ * The browser uses this to hide an unused input rather than showing a field it
+ * will ignore, and the compiler uses it to decide whether a missing operand is a
+ * user error.
+ */
+export const UNARY_FILTER_OPERATORS: readonly RowFilterOperator[] = ['isNull', 'isNotNull']
+
 /** One column description (the 结构 tab). */
 export interface ColumnInfo {
   name: string
@@ -208,6 +257,83 @@ export interface TablePage {
   pageSize: number
   /** Primary-key column names; empty when the table has none. */
   primaryKey: string[]
+  /**
+   * Indexes of the table, so the 浏览 tab can offer 按索引排序 without a second
+   * request. Present only when the caller asked for them (`withIndexes=1`): an
+   * index list costs a round trip on MySQL and the tree does not need it.
+   */
+  indexes?: IndexInfo[]
+}
+
+/**
+ * The result of a schema change, plus what the panel must reload.
+ *
+ * A separate shape from {@link QueryResult} because a schema change invalidates
+ * things a row write does not: a dropped column changes the grid's column list,
+ * and a table rebuild changes everything about it. Naming what changed lets the
+ * panel refresh exactly that instead of guessing.
+ */
+export interface SchemaChangeResult {
+  /** Rows/steps the engine reported, for the confirmation message. */
+  affected: number
+  durationMs: number
+  /**
+   * What the caller should re-read: the table's structure, its rows, or the
+   * schema's table list (a rebuild can rename the table it touched).
+   */
+  reload: Array<'columns' | 'indexes' | 'rows' | 'tables'>
+}
+
+/** One export request as the browser sends it. */
+export interface ExportPayload {
+  schema?: string
+  tables?: string[]
+  includeData: boolean
+  includeStructure: boolean
+  drop: boolean
+  format: 'sql' | 'csv'
+}
+
+/** One export's outcome (the text itself, for the browser to save). */
+export interface ExportResponse {
+  filename: string
+  contentType: string
+  text: string
+  truncated: string[]
+  byteLength: number
+}
+
+/** One import request as the browser sends it. */
+export interface ImportPayload {
+  schema?: string
+  table?: string
+  format: 'sql' | 'csv'
+  hasHeader?: boolean
+  emptyAsNull?: boolean
+  content: string
+}
+
+/** One import's outcome. */
+export interface ImportResponse {
+  statements: number
+  rows: number
+  skipped: Array<{ line: number; fields: number }>
+}
+
+/** A table-level schema-change request. */
+export interface SchemaChangePayload {
+  schema?: string
+  table: string
+  /** `isView` guards the whole schema surface: a view has no columns to alter. */
+  isView?: boolean
+  action:
+    | 'addColumn'
+    | 'alterColumn'
+    | 'dropColumn'
+    | 'setPrimaryKey'
+    | 'createIndex'
+    | 'dropIndex'
+    | 'createTable'
 }
 
 /** Connection test outcome. */
@@ -563,8 +689,18 @@ export const DB_API = {
   columns: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/columns?${params}`,
   indexes: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/indexes?${params}`,
   rows: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/rows`,
+  /** How many distinct values a column holds (结构页的「非重复值」). */
+  distinct: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/distinct?${params}`,
   row: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/row`,
+  /** Delete several rows in one request (浏览页的多选删除）. */
+  deleteRows: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/rows/delete`,
   table: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/table`,
+  /** Schema changes: add / alter / drop a column, set the key, index management. */
+  schema: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/schema`,
+  /** Export a schema or one table (SQL dump or CSV). */
+  exportData: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/export`,
+  /** Import a SQL dump or a CSV file. */
+  importData: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/import`,
   query: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/query`,
   redisInfo: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/info`,
   redisKeys: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/keys?${params}`,

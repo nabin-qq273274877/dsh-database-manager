@@ -15,7 +15,7 @@ import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { expandHome } from '../dsh-home.ts'
 import type { ColumnInfo, DataSourceEntry, IndexInfo, QueryResult, SchemaInfo, TableInfo, TablePage, TestResult } from '../protocol.ts'
-import { assertSingleStatement, buildSearchWhere, looksReadOnly, pushDownLimit, qualifySqlite, quoteSqlite, requireIdentifier, toWireValue } from '../sql-util.ts'
+import { assertSingleStatement, buildSearchWhere, isTransactionControl, likeEscapeClause, looksReadOnly, pushDownLimit, qualifySqlite, quoteSqlite, requireIdentifier, toWireValue } from '../sql-util.ts'
 import {
   type ColumnDefinition,
   type TableShape,
@@ -358,7 +358,7 @@ export class SqliteDriver implements SqlDriver {
     // user arranged on screen, and mixing it with a free-text term would apply
     // two different filters to one read.
     if (query.filters !== undefined && query.filters.length > 0) {
-      return buildSearchWhere(query.filters, query.filterJoin === 'or' ? 'or' : 'and', quoteSqlite, known)
+      return buildSearchWhere(query.filters, query.filterJoin === 'or' ? 'or' : 'and', quoteSqlite, known, 'sqlite')
     }
     if (query.mode === 'search') {
       const term = query.term ?? ''
@@ -368,7 +368,7 @@ export class SqliteDriver implements SqlDriver {
       // is bound, never interpolated; its `%`/`_` are escaped so a literal
       // percent sign is a character to find rather than a wildcard.
       const pattern = `%${term.replace(/[\\%_]/g, match => `\\${match}`)}%`
-      const clauses = allColumns.map(column => `CAST(${quoteSqlite(column)} AS TEXT) LIKE ? ESCAPE '\\'`)
+      const clauses = allColumns.map(column => `CAST(${quoteSqlite(column)} AS TEXT) LIKE ? ${likeEscapeClause('sqlite')}`)
       return { where: ` WHERE (${clauses.join(' OR ')})`, params: allColumns.map(() => pattern) }
     }
     if (query.condition !== undefined && query.condition.trim() !== '') {
@@ -868,6 +868,158 @@ export class SqliteDriver implements SqlDriver {
         write: true,
         truncated: false,
       } satisfies QueryResult
+    })
+  }
+
+  /**
+   * Run several statements as one transaction.
+   *
+   * A script's own `BEGIN`/`COMMIT` is neutralized rather than rejected: a dump
+   * this plugin wrote wraps itself in them, and SQLite treats a nested `BEGIN`
+   * as an error while a stray `COMMIT` would end the wrapper's transaction early
+   * and defeat the whole point. Both are dropped, and the wrapper owns the
+   * transaction — which is what makes "all or nothing" true for a foreign dump
+   * as well as the plugin's own.
+   */
+  async runScript(statements: string[], schema: string | undefined, onStatement?: (index: number) => void): Promise<void> {
+    const body = statements.filter(statement => !isTransactionControl(statement))
+    if (body.length === 0) return
+    for (const statement of body) assertSingleStatement(statement)
+    return this.run(db => {
+      db.exec('BEGIN')
+      try {
+        for (const [index, statement] of body.entries()) {
+          db.exec(statement)
+          onStatement?.(index)
+        }
+        db.exec('COMMIT')
+      } catch (error) {
+        try {
+          db.exec('ROLLBACK')
+        } catch {
+          /* the transaction is already gone */
+        }
+        throw error
+      }
+    })
+  }
+
+  /**
+   * The `CREATE INDEX` / `CREATE TRIGGER` statements a table owns.
+   *
+   * Needed because SQLite's `CREATE TABLE` text does not mention them: a dump
+   * built from that text alone would lose every index and trigger on the table.
+   * `sqlite_master` is the only place an expression index or a trigger body
+   * exists, so the text is read from there and used verbatim.
+   *
+   * Order matters: index_before_trigger, so a trigger that references an index
+   * finds it. `sqlite_autoindex_*` rows are skipped — they have no SQL and are
+   * recreated by the `CREATE TABLE` itself.
+   */
+  async auxiliaryDdl(schema: string | undefined, table: string): Promise<string[]> {
+    const target = schema === undefined || schema === '' ? 'main' : schema
+    requireIdentifier(target, 'schema name', quoteSqlite)
+    requireIdentifier(table, 'table name', quoteSqlite)
+    return this.run(db => {
+      const rows = db
+        .prepare(
+          `SELECT type, sql FROM ${quoteSqlite(target)}.sqlite_master ` +
+            "WHERE tbl_name = ? AND type IN ('index','trigger') AND name NOT LIKE 'sqlite_autoindex_%' " +
+            "ORDER BY CASE type WHEN 'index' THEN 0 ELSE 1 END, name",
+        )
+        .all(table) as Array<Record<string, unknown>>
+      return rows
+        .map(row => (row['sql'] === null || row['sql'] === undefined ? '' : String(row['sql']).trim()))
+        .filter(sql => sql !== '')
+        .map(sql => (sql.endsWith(';') ? sql : `${sql};`))
+    })
+  }
+
+  /** The `CREATE TABLE` text SQLite recorded, or undefined for a view. */
+  async createStatement(schema: string | undefined, table: string): Promise<string | undefined> {
+    const target = schema === undefined || schema === '' ? 'main' : schema
+    requireIdentifier(target, 'schema name', quoteSqlite)
+    requireIdentifier(table, 'table name', quoteSqlite)
+    return this.run(db => {
+      const row = db
+        .prepare(`SELECT sql FROM ${quoteSqlite(target)}.sqlite_master WHERE type = 'table' AND name = ?`)
+        .get(table) as { sql?: unknown } | undefined
+      return row?.sql === undefined || row.sql === null ? undefined : String(row.sql)
+    })
+  }
+
+  /**
+   * Every row of a table, capped at `limit`.
+   *
+   * `SELECT *` with no ORDER BY: an export of a table with no primary key has
+   * no stable order to impose, and paying for a sort of the whole table to
+   * produce a different arbitrary order would be worse than not paying.
+   */
+  async allRows(
+    schema: string | undefined,
+    table: string,
+    limit: number,
+  ): Promise<{ columns: string[]; rows: Array<Record<string, string | number | boolean | null>>; truncated: boolean }> {
+    const cap = Math.max(1, Math.trunc(limit))
+    const qualified = qualifySqlite(schema, table)
+    // One row PAST the cap, which is what proves there was more.
+    return this.run(db => {
+      const statement = db.prepare(`SELECT * FROM ${qualified} LIMIT ?`)
+      const raw = statement.all(cap + 1) as Array<Record<string, unknown>>
+      const truncated = raw.length > cap
+      const rows = truncated ? raw.slice(0, cap) : raw
+      const columns = rows.length > 0 ? Object.keys(rows[0]!) : this.columnNames(db, schema, table)
+      return { columns, rows: rows.map(row => projectRow(row)), truncated }
+    })
+  }
+
+  /** The column names of a table, for an export with no rows to read them from. */
+  private columnNames(db: SqliteDatabase, schema: string | undefined, table: string): string[] {
+    const target = schema === undefined || schema === '' ? 'main' : schema
+    const rows = db.prepare(`PRAGMA ${quoteSqlite(target)}.table_xinfo(${quoteSqlite(table)})`).all() as Array<Record<string, unknown>>
+    return rows.filter(row => Number(row['hidden'] ?? 0) !== 1).map(row => String(row['name'] ?? ''))
+  }
+
+  /** Which tables each table references, from its own foreign-key clauses. */
+  async tableReferences(schema: string | undefined): Promise<Map<string, string[]>> {
+    const target = schema === undefined || schema === '' ? 'main' : schema
+    requireIdentifier(target, 'schema name', quoteSqlite)
+    return this.run(db => {
+      const names = db
+        .prepare(`SELECT name FROM ${quoteSqlite(target)}.sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
+        .all() as Array<Record<string, unknown>>
+      const references = new Map<string, string[]>()
+      for (const row of names) {
+        const name = String(row['name'] ?? '')
+        if (name === '') continue
+        const list = db.prepare(`PRAGMA ${quoteSqlite(target)}.foreign_key_list(${quoteSqlite(name)})`).all() as Array<Record<string, unknown>>
+        const targets = new Set<string>()
+        for (const entry of list) {
+          const table = entry['table']
+          // A self-reference is not a dependency to order by: the table is its
+          // own target, and treating it as one would make the walk skip it.
+          if (typeof table === 'string' && table !== '' && table.toLowerCase() !== name.toLowerCase()) targets.add(table.toLowerCase())
+        }
+        if (targets.size > 0) references.set(name.toLowerCase(), [...targets])
+      }
+      return references
+    })
+  }
+
+  /** Tables and views in one schema, names only — the export scope's list. */
+  async tableNames(schema: string | undefined): Promise<Array<{ name: string; type: string }>> {
+    const target = schema === undefined || schema === '' ? 'main' : schema
+    requireIdentifier(target, 'schema name', quoteSqlite)
+    return this.run(db => {
+      const rows = db
+        .prepare(
+          `SELECT name, type FROM ${quoteSqlite(target)}.sqlite_master ` +
+            "WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY type, name",
+        )
+        .all() as Array<Record<string, unknown>>
+      return rows
+        .filter(row => typeof row['name'] === 'string')
+        .map(row => ({ name: String(row['name']), type: row['type'] === 'view' ? 'view' : 'table' }))
     })
   }
 

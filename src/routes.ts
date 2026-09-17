@@ -19,6 +19,8 @@ import type { DataSourceStore, StoredSettings } from './store.ts'
 import { summarize, validatePayload } from './store.ts'
 import { asJsonObject, errorMessage, readJsonBody, writeError, writeJson } from './http.ts'
 import type {
+  ExportResponse,
+  ImportResponse,
   QueryResult,
   RedisCreatableType,
   RedisCreateKey,
@@ -28,14 +30,18 @@ import type {
   RedisElementEdit,
   RedisKeyInfo,
   RedisPrefixCount,
+  SchemaChangeResult,
 } from './protocol.ts'
 import { REDIS_CREATABLE_TYPES } from './protocol.ts'
-import { isRedisDriver, isSqlDriver, type Driver } from './drivers/types.ts'
+import type { ColumnSpec, RowFilter, RowFilterOperator } from './drivers/types.ts'
+import { ROW_FILTER_OPERATORS } from './drivers/types.ts'
+import { isRedisDriver, isSqlDriver, type Driver, type SqlDriver } from './drivers/types.ts'
 import { isRedisReadCommand } from './drivers/redis.ts'
 import type { IndexRegistry } from './index-registry.ts'
 import { estimateIndexCost, indexProgress, levelFromIndex } from './redis-index.ts'
 import { compareKeyNames } from './redis-util.ts'
 import { looksReadOnly } from './sql-util.ts'
+import { EXPORT_ROW_CAP, IMPORT_BYTE_CAP, exportSql, importSql, type ExportRequest } from './sql-transfer.ts'
 
 /** Everything the routes need from the plugin. */
 export interface RoutesDeps {
@@ -63,6 +69,24 @@ const MAX_PAGE_SIZE = 5000
 const DEFAULT_SQL_LIMIT = 1000
 /** Default SCAN page size. */
 const DEFAULT_KEY_COUNT = 200
+/**
+ * Cap on rows one batch delete may carry.
+ *
+ * A select-all over a page is bounded by the page size, which is bounded by
+ * {@link MAX_PAGE_SIZE}, so this is the ceiling for "delete everything I can see
+ * at once" and not a limit a normal interaction meets.
+ */
+const MAX_BATCH_ROWS = 5000
+/**
+ * Body cap for an import request.
+ *
+ * Larger than the family default (1 MiB) because the body IS the file, base64 of
+ * it as JSON text. It is above the importer's own
+ * {@link IMPORT_BYTE_CAP} so a file the importer would have refused is refused
+ * by the importer, with a message naming the limit, rather than by a silent
+ * body-length rejection.
+ */
+const IMPORT_BODY_MAX_BYTES = IMPORT_BYTE_CAP + 1024 * 1024
 
 /** Read one query-string value. */
 function queryParam(url: URL, name: string): string | undefined {
@@ -77,6 +101,201 @@ function queryInt(url: URL, name: string, fallback: number): number {
   const parsed = Number(raw)
   return Number.isFinite(parsed) ? Math.trunc(parsed) : fallback
 }
+
+/**
+ * Validate a filter list from the wire.
+ *
+ * `operator` is checked against the closed set here, not only in the driver:
+ * a mistyped operator must be a 400 naming the field rather than a driver error
+ * that reads like an SQL failure.
+ *
+ * @throws when an entry is not an object with a usable column and operator.
+ */
+function parseFilters(value: unknown): RowFilter[] {
+  if (!Array.isArray(value)) throw new Error('must be an array of conditions')
+  if (value.length > 50) throw new Error('too many conditions (max 50)')
+  return value.map((entry, index) => {
+    const record = asJsonObject(entry)
+    if (record === undefined) throw new Error(`[${index}] must be an object`)
+    const column = record['column']
+    if (typeof column !== 'string' || column === '') throw new Error(`[${index}].column must be a non-empty string`)
+    const operator = record['operator']
+    if (typeof operator !== 'string' || !(ROW_FILTER_OPERATORS as readonly string[]).includes(operator)) {
+      throw new Error(`[${index}].operator must be one of ${ROW_FILTER_OPERATORS.join(', ')}`)
+    }
+    const read = (name: string): string | undefined => {
+      const raw = record[name]
+      if (raw === undefined || raw === null) return undefined
+      if (typeof raw === 'string') return raw
+      if (typeof raw === 'number' || typeof raw === 'boolean') return String(raw)
+      throw new Error(`[${index}].${name} must be a scalar`)
+    }
+    return {
+      column,
+      operator: operator as RowFilterOperator,
+      ...(read('value') === undefined ? {} : { value: read('value')! }),
+      ...(read('value2') === undefined ? {} : { value2: read('value2')! }),
+    }
+  })
+}
+
+/** Read a {@link ColumnSpec} out of a request body field. */
+function readColumnSpec(value: unknown, what: string): ColumnSpec {
+  const record = asJsonObject(value)
+  if (record === undefined) throw new Error(`${what} must be an object`)
+  const name = record['name']
+  if (typeof name !== 'string' || name === '') throw new Error(`${what}.name must be a non-empty string`)
+  const type = typeof record['type'] === 'string' ? record['type'] : ''
+  // An omitted `nullable` means NOT NULL, which is the safe reading: a column
+  // presented as nullable but stored NOT NULL is a data-loss surprise, whereas
+  // the reverse is a refused insert the user can see.
+  const nullable = record['nullable'] === true
+  const defaultValue = typeof record['defaultValue'] === 'string' ? record['defaultValue'] : undefined
+  const comment = typeof record['comment'] === 'string' ? record['comment'] : undefined
+  let primaryKeyPosition: number | undefined
+  if (record['primaryKeyPosition'] !== undefined && record['primaryKeyPosition'] !== null) {
+    if (typeof record['primaryKeyPosition'] !== 'number' || !Number.isInteger(record['primaryKeyPosition']) || record['primaryKeyPosition'] < 1) {
+      throw new Error(`${what}.primaryKeyPosition must be a positive integer`)
+    }
+    primaryKeyPosition = record['primaryKeyPosition']
+  }
+  return {
+    name,
+    type,
+    nullable,
+    ...(defaultValue === undefined ? {} : { defaultValue }),
+    ...(comment === undefined ? {} : { comment }),
+    ...(primaryKeyPosition === undefined ? {} : { primaryKeyPosition }),
+    ...(record['autoIncrement'] === true ? { autoIncrement: true } : {}),
+    ...(record['unique'] === true ? { unique: true } : {}),
+  }
+}
+
+/** One validated schema change. */
+interface SchemaChange {
+  action: string
+  schema?: string
+  table: string
+  column?: string
+  spec?: ColumnSpec
+  rename?: string
+  columns?: string[]
+  index?: { name: string; columns: string[]; unique: boolean }
+}
+
+/**
+ * Validate a schema-change request into a {@link SchemaChange}.
+ *
+ * The action decides which fields are required, so a request missing one fails
+ * with a message naming it instead of reaching a driver with an undefined field.
+ */
+function parseSchemaChange(body: Record<string, unknown>): { change: SchemaChange } | { error: string } {
+  try {
+    const table = body['table']
+    if (typeof table !== 'string' || table === '') return { error: 'table is required' }
+    const schema = typeof body['schema'] === 'string' && body['schema'] !== '' ? body['schema'] : undefined
+    const action = body['action']
+    if (typeof action !== 'string') return { error: 'action is required' }
+    const base = { action, table, ...(schema === undefined ? {} : { schema }) }
+
+    switch (action) {
+      case 'addColumn':
+        return { change: { ...base, spec: readColumnSpec(body['column'], 'column') } }
+      case 'alterColumn': {
+        const spec = readColumnSpec(body['column'], 'column')
+        const rename = body['rename']
+        if (rename !== undefined && (typeof rename !== 'string' || rename === '')) {
+          return { error: 'rename must be a non-empty string when present' }
+        }
+        return { change: { ...base, spec, ...(rename === undefined ? {} : { rename }) } }
+      }
+      case 'dropColumn': {
+        const column = body['column']
+        if (typeof column !== 'string' || column === '') return { error: 'column is required for dropColumn' }
+        return { change: { ...base, column } }
+      }
+      case 'setPrimaryKey': {
+        const columns = body['columns']
+        if (!Array.isArray(columns) || columns.some(entry => typeof entry !== 'string' || entry === '')) {
+          return { error: 'columns must be an array of column names' }
+        }
+        return { change: { ...base, columns: columns as string[] } }
+      }
+      case 'createIndex': {
+        const index = asJsonObject(body['index'])
+        if (index === undefined) return { error: 'index must be an object' }
+        const name = index['name']
+        const columns = index['columns']
+        if (typeof name !== 'string' || name === '') return { error: 'index.name is required' }
+        if (!Array.isArray(columns) || columns.length === 0 || columns.some(entry => typeof entry !== 'string' || entry === '')) {
+          return { error: 'index.columns must be a non-empty array of column names' }
+        }
+        return { change: { ...base, index: { name, columns: columns as string[], unique: index['unique'] === true } } }
+      }
+      case 'dropIndex': {
+        const name = body['name']
+        if (typeof name !== 'string' || name === '') return { error: 'name is required for dropIndex' }
+        return { change: { ...base, column: name } }
+      }
+      default:
+        return { error: `unsupported action: ${JSON.stringify(action)}` }
+    }
+  } catch (error) {
+    return { error: errorMessage(error) }
+  }
+}
+
+/** Carry out one validated schema change, and report what it invalidated. */
+async function applySchemaChange(driver: SqlDriver, change: SchemaChange): Promise<SchemaChangeResult> {
+  const started = Date.now()
+  const finish = (result: QueryResult, reload: SchemaChangeResult['reload']): SchemaChangeResult => ({
+    affected: result.affected,
+    durationMs: Date.now() - started,
+    reload,
+  })
+
+  switch (change.action) {
+    case 'addColumn': {
+      // The 浏览 grid gains a column, and the overview's row count is unaffected.
+      const result = await driver.addColumn(change.schema, change.table, change.spec!)
+      return finish(result, ['columns'])
+    }
+    case 'alterColumn': {
+      const result = await driver.alterColumn(change.schema, change.table, change.spec!, {
+        ...(change.rename === undefined ? {} : { rename: change.rename }),
+      })
+      // A rebuild may have replaced the table, so its rows are re-read rather
+      // than patched: a stale grid would show the old column's values under the
+      // new column's name.
+      return finish(result, ['columns', 'indexes', 'rows'])
+    }
+    case 'dropColumn': {
+      const result = await driver.dropColumn(change.schema, change.table, change.column!)
+      return finish(result, ['columns', 'indexes', 'rows'])
+    }
+    case 'setPrimaryKey': {
+      const result = await driver.setPrimaryKey(change.schema, change.table, change.columns!)
+      // The key decides which rows the 浏览 tab can identify, so both surfaces
+      // change together.
+      return finish(result, ['columns', 'indexes', 'rows'])
+    }
+    case 'createIndex': {
+      const result = await driver.createIndex(change.schema, change.table, change.index!)
+      return finish(result, ['indexes'])
+    }
+    case 'dropIndex': {
+      const result = await driver.dropIndex(change.schema, change.table, change.column!)
+      return finish(result, ['indexes'])
+    }
+    default:
+      throw new Error(`unsupported action: ${JSON.stringify(change.action)}`)
+  }
+}
+
+/** A no-op result, for a route that reports success without an engine change. */
+const NO_CHANGE: SchemaChangeResult = { affected: 0, durationMs: 0, reload: [] }
+void NO_CHANGE
+void EXPORT_ROW_CAP
 
 /** Clamp a page size into the accepted range. */
 function clampPageSize(value: number): number {
@@ -520,21 +739,173 @@ export function makeRoutes(deps: RoutesDeps): { routes: WebRoute[]; upgrade: Web
             return
           }
           const mode = queryParam(url, 'mode')
+          // The 浏览 tab's structured filter is sent as JSON in one query
+          // parameter, so a filter list does not have to be encoded into the
+          // parameter names. Invalid JSON is a 400 naming the parameter.
+          let filters: RowFilter[] | undefined
+          const rawFilters = queryParam(url, 'filters')
+          if (rawFilters !== undefined) {
+            try {
+              filters = parseFilters(JSON.parse(rawFilters) as unknown)
+            } catch (error) {
+              writeError(res, 400, `filters: ${errorMessage(error)}`)
+              return
+            }
+          }
+          const orderByColumns = queryParam(url, 'orderByColumns')
           const page = await driver.rows({
             ...(queryParam(url, 'schema') === undefined ? {} : { schema: queryParam(url, 'schema')! }),
             table,
             page: Math.max(1, queryInt(url, 'page', 1)),
             pageSize: clampPageSize(queryInt(url, 'pageSize', DEFAULT_PAGE_SIZE)),
             ...(queryParam(url, 'orderBy') === undefined ? {} : { orderBy: queryParam(url, 'orderBy')! }),
+            ...(orderByColumns === undefined ? {} : { orderByColumns: orderByColumns.split(',').filter(name => name !== '') }),
             ...(queryParam(url, 'orderDir') === 'desc' ? { orderDir: 'desc' as const } : {}),
             mode: mode === 'search' ? 'search' : 'browse',
             ...(queryParam(url, 'term') === undefined ? {} : { term: queryParam(url, 'term')! }),
             ...(queryParam(url, 'condition') === undefined ? {} : { condition: queryParam(url, 'condition')! }),
+            ...(filters === undefined ? {} : { filters }),
+            ...(queryParam(url, 'filterJoin') === 'or' ? { filterJoin: 'or' as const } : {}),
           })
-          writeJson(res, 200, { page })
+          // The index list rides along when the caller asks for it, so 按索引排序
+          // is one request rather than two.
+          const indexes = queryParam(url, 'withIndexes') === '1' ? await driver.indexes(queryParam(url, 'schema'), table) : undefined
+          writeJson(res, 200, { page: indexes === undefined ? page : { ...page, indexes } })
           return
         }
         writeError(res, 405, `${method} is not allowed on ${path}`)
+        return
+      }
+
+      // Multi-row delete, in one request and one transaction. A separate path
+      // from `/row`, whose DELETE takes one key set: this one takes a list, so
+      // the panel's multi-select is one round trip rather than one per row.
+      if (action === 'rows/delete' && method === 'POST') {
+        if (!isSqlDriver(driver)) {
+          writeError(res, 400, 'rows/delete is only available for SQL data sources')
+          return
+        }
+        const body = asJsonObject(await readJsonBody(req))
+        if (body === undefined) {
+          writeError(res, 400, 'body must be a JSON object')
+          return
+        }
+        const table = typeof body['table'] === 'string' ? body['table'] : undefined
+        if (table === undefined || table === '') {
+          writeError(res, 400, 'table is required')
+          return
+        }
+        const schema = typeof body['schema'] === 'string' && body['schema'] !== '' ? body['schema'] : undefined
+        if (!Array.isArray(body['keySets']) || body['keySets'].length === 0) {
+          writeError(res, 400, 'keySets must be a non-empty array')
+          return
+        }
+        if (body['keySets'].length > MAX_BATCH_ROWS) {
+          writeError(res, 400, `too many rows in one request (max ${MAX_BATCH_ROWS})`)
+          return
+        }
+        const keySets = (body['keySets'] as unknown[]).map((entry, index) => readPairs(entry, `keySets[${index}]`))
+        writeJson(res, 200, { result: await driver.deleteRows(schema, table, keySets) })
+        return
+      }
+
+      // How many distinct values a column holds — the 结构 tab's 「非重复值」.
+      if (action === 'distinct' && method === 'GET') {
+        if (!isSqlDriver(driver)) {
+          writeError(res, 400, 'distinct is only available for SQL data sources')
+          return
+        }
+        const table = queryParam(url, 'table')
+        const column = queryParam(url, 'column')
+        if (table === undefined || column === undefined) {
+          writeError(res, 400, 'table and column are required')
+          return
+        }
+        writeJson(res, 200, { count: await driver.distinctCount(queryParam(url, 'schema'), table, column) })
+        return
+      }
+
+      // ---- schema changes (the 结构 tab) ----------------------------------
+      // The user surface, like the row routes: the click is the authorization.
+      // Every field that reaches a statement is validated by the driver, not
+      // here — this layer only decides the ACTION and shapes the reply.
+      if (action === 'schema' && method === 'POST') {
+        if (!isSqlDriver(driver)) {
+          writeError(res, 400, 'schema is only available for SQL data sources')
+          return
+        }
+        const body = asJsonObject(await readJsonBody(req))
+        if (body === undefined) {
+          writeError(res, 400, 'body must be a JSON object')
+          return
+        }
+        const parsed = parseSchemaChange(body)
+        if ('error' in parsed) {
+          writeError(res, 400, parsed.error)
+          return
+        }
+        const change = parsed.change
+        const result = await applySchemaChange(driver, change)
+        writeJson(res, 200, { result })
+        return
+      }
+
+      // ---- export / import ------------------------------------------------
+      if (action === 'export' && method === 'POST') {
+        if (!isSqlDriver(driver)) {
+          writeError(res, 400, 'export is only available for SQL data sources')
+          return
+        }
+        const body = asJsonObject(await readJsonBody(req))
+        if (body === undefined) {
+          writeError(res, 400, 'body must be a JSON object')
+          return
+        }
+        const request: ExportRequest = {
+          ...(typeof body['schema'] === 'string' && body['schema'] !== '' ? { schema: body['schema'] } : {}),
+          ...(Array.isArray(body['tables'])
+            ? { tables: body['tables'].filter((name): name is string => typeof name === 'string' && name !== '') }
+            : {}),
+          includeData: body['includeData'] !== false,
+          includeStructure: body['includeStructure'] !== false,
+          drop: body['drop'] === true,
+          format: body['format'] === 'csv' ? 'csv' : 'sql',
+        }
+        const result = await exportSql(driver, entry, request)
+        writeJson(res, 200, {
+          filename: result.filename,
+          contentType: result.contentType,
+          text: result.text,
+          truncated: result.truncated,
+          byteLength: Buffer.byteLength(result.text, 'utf8'),
+        } satisfies ExportResponse)
+        return
+      }
+
+      if (action === 'import' && method === 'POST') {
+        if (!isSqlDriver(driver)) {
+          writeError(res, 400, 'import is only available for SQL data sources')
+          return
+        }
+        const body = asJsonObject(await readJsonBody(req, { maxBytes: IMPORT_BODY_MAX_BYTES }))
+        if (body === undefined) {
+          writeError(res, 400, `body must be a JSON object under ${Math.trunc(IMPORT_BODY_MAX_BYTES / 1024 / 1024)} MiB`)
+          return
+        }
+        const content = body['content']
+        if (typeof content !== 'string' || content === '') {
+          writeError(res, 400, 'content is required')
+          return
+        }
+        const result = await importSql(driver, {
+          ...(typeof body['schema'] === 'string' && body['schema'] !== '' ? { schema: body['schema'] } : {}),
+          ...(typeof body['table'] === 'string' && body['table'] !== '' ? { table: body['table'] } : {}),
+          format: body['format'] === 'csv' ? 'csv' : 'sql',
+          ...(typeof body['hasHeader'] === 'boolean' ? { hasHeader: body['hasHeader'] } : {}),
+          ...(typeof body['emptyAsNull'] === 'boolean' ? { emptyAsNull: body['emptyAsNull'] } : {}),
+          content,
+        })
+        writeJson(res, 200, { result: { statements: result.statements, rows: result.rows, skipped: result.skipped } satisfies ImportResponse })
         return
       }
 
