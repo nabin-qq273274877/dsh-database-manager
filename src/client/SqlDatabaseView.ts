@@ -5,10 +5,22 @@ import * as React from 'react'
  *
  * Used for both SQLite and MySQL — the two drivers expose the same contract, so
  * the only per-engine difference is the label of the schema level.
+ *
+ * This file owns the panel's state and routing; the tabs themselves live in
+ * their own modules (`SqlBrowseTab`, `SqlStructureTab`, `SqlSearchTab`,
+ * `SqlInsertTab`, `SqlTransferDialogs`) because each is a self-contained editing
+ * surface with its own rules about what may be changed and what must be warned
+ * about. Keeping them here would mean one 2000-line component whose pieces cannot
+ * be read in isolation.
  */
 
-import type { ColumnInfo, DataSourceSummary, IndexInfo, TableInfo, TablePage } from '../protocol.ts'
+import type { ColumnInfo, DataSourceSummary, IndexInfo, RowFilter, TableInfo, TablePage } from '../protocol.ts'
 import type { DbApi } from './api.ts'
+import { SqlBrowseTab, type BrowseQuery } from './SqlBrowseTab.ts'
+import { SqlInsertTab } from './SqlInsertTab.ts'
+import { SqlSearchTab } from './SqlSearchTab.ts'
+import { SqlStructureTab } from './SqlStructureTab.ts'
+import { ExportDialog, ImportDialog } from './SqlTransferDialogs.ts'
 import { BackButton, ErrorBanner, Empty, Modal, TabStrip, formatBytes, isNull, renderCell, t } from './ui.ts'
 
 /** The right-hand tabs of a SQL database panel. */
@@ -32,6 +44,11 @@ interface RowsState {
   loading: boolean
   error?: string
 }
+
+/** Which transfer dialog is open, and what it is scoped to. */
+type TransferDialog =
+  | { kind: 'export'; rowsOnly?: boolean; selectedKeys?: Array<Array<{ column: string; value: string | number | boolean | null }>> }
+  | { kind: 'import' }
 
 /** The SQL database panel. */
 export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement {
@@ -61,13 +78,22 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
   const [notice, setNotice] = React.useState<string | undefined>(undefined)
 
   const [rows, setRows] = React.useState<RowsState | undefined>(undefined)
-  const [page, setPage] = React.useState(1)
-  const [pageSize, setPageSize] = React.useState(200)
-  const [orderBy, setOrderBy] = React.useState<string | undefined>(undefined)
-  const [orderDir, setOrderDir] = React.useState<'asc' | 'desc'>('asc')
+  /**
+   * The 浏览 read's layout, as one object.
+   *
+   * Held together rather than as separate pieces of state because a reload must
+   * repeat the SAME read: a page change or a sort that moved one field but not
+   * the other would silently drop the sort, or re-read a different page than the
+   * pager says.
+   */
+  const [browse, setBrowse] = React.useState<BrowseQuery>({ page: 1, pageSize: 200, orderDir: 'asc' })
 
   const [columns, setColumns] = React.useState<ColumnInfo[]>([])
   const [indexes, setIndexes] = React.useState<IndexInfo[]>([])
+  /** The open transfer dialog, if any. */
+  const [transfer, setTransfer] = React.useState<TransferDialog | undefined>(undefined)
+  /** The schema's table list, read when a transfer dialog needs it. */
+  const [schemaTables, setSchemaTables] = React.useState<Array<{ name: string; type: string }>>([])
 
   /**
    * Table statistics for the overview pane, per database.
@@ -238,6 +264,10 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
    * may be loading a table in a database other than the active one (opening a
    * table from the tree sets both together), and a stale `activeSchema` here
    * would silently read the wrong database.
+   *
+   * `withIndexes` asks for the table's index list in the same request, which is
+   * what the 浏览 tab's 按索引排序 needs. It is a distinct read because the list
+   * costs a round trip on MySQL and the tree's own table loads do not want it.
    */
   const loadRows = React.useCallback(async (options: {
     schema: string
@@ -248,7 +278,11 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     term?: string
     condition?: string
     orderBy?: string
+    orderByColumns?: string[]
     orderDir?: 'asc' | 'desc'
+    filters?: RowFilter[]
+    filterJoin?: 'and' | 'or'
+    withIndexes?: boolean
   }): Promise<void> => {
     setRows(current => ({ page: current?.page ?? emptyPage(), loading: true, ...(current?.error === undefined ? {} : { error: current.error }) }))
     try {
@@ -261,10 +295,20 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
         ...(options.term === undefined ? {} : { term: options.term }),
         ...(options.condition === undefined ? {} : { condition: options.condition }),
         ...(options.orderBy === undefined ? {} : { orderBy: options.orderBy }),
+        ...(options.orderByColumns === undefined ? {} : { orderByColumns: options.orderByColumns }),
+        ...(options.filters === undefined ? {} : { filters: options.filters }),
+        ...(options.filterJoin === undefined ? {} : { filterJoin: options.filterJoin }),
+        ...(options.withIndexes === true ? { withIndexes: true } : {}),
         orderDir: options.orderDir ?? 'asc',
       })
       setRows({ page: result, loading: false })
-      setColumns(result.columns)
+      // The index list rides on the page, so it is picked up here rather than
+      // with a second request.
+      if (result.indexes !== undefined) setIndexes(result.indexes)
+      // The browse tab reads its columns from the page; the structure tab owns
+      // its own copy (which carries the key positions and enum members). Only
+      // the structure read overwrites this, so a browse refresh cannot downgrade
+      // what the structure tab is showing.
     } catch (failure) {
       setRows(current => ({ page: current?.page ?? emptyPage(), loading: false, error: failure instanceof Error ? failure.message : String(failure) }))
     }
@@ -279,10 +323,38 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
       ])
       setColumns(cols)
       setIndexes(idx)
+      setError(undefined)
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure))
     }
-  }, [api, source.id, activeSchema])
+  }, [api, source.id])
+
+  /**
+   * Re-read whatever the current tab is showing.
+   *
+   * Called after a schema change, which invalidates more than one surface: a
+   * dropped column changes the grid's columns AND the tree's row counts. Each
+   * tab's own needs are covered here so a caller does not have to know them.
+   */
+  const reloadCurrent = React.useCallback((): void => {
+    if (activeSchema === undefined || activeTable === undefined) return
+    if (tab === 'structure' || tab === 'insert') void loadStructure(activeSchema, activeTable)
+    if (tab === 'browse') {
+      void loadRows({
+        schema: activeSchema,
+        table: activeTable,
+        page: browse.page,
+        pageSize: browse.pageSize,
+        mode: 'browse',
+        ...(browse.orderBy === undefined ? {} : { orderBy: browse.orderBy }),
+        ...(browse.orderByColumns === undefined ? {} : { orderByColumns: browse.orderByColumns }),
+        ...(browse.filters === undefined ? {} : { filters: browse.filters }),
+        ...(browse.filterJoin === undefined ? {} : { filterJoin: browse.filterJoin }),
+        orderDir: browse.orderDir,
+        withIndexes: true,
+      })
+    }
+  }, [activeSchema, activeTable, tab, browse, loadStructure, loadRows])
 
   /**
    * Open one table in the given tab.
@@ -295,12 +367,13 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     setActiveSchema(schema)
     setActiveTable(table)
     setTab(nextTab)
-    setOrderBy(undefined)
-    setPage(1)
+    // A new table starts unsorted on its first page: a sort carried over from the
+    // previous table would order by a column this one may not have.
+    setBrowse(current => ({ ...current, page: 1, orderBy: undefined, orderByColumns: undefined, filters: undefined }))
     setError(undefined)
     setNotice(undefined)
-    if (nextTab === 'structure') void loadStructure(schema, table)
-    if (nextTab === 'browse') void loadRows({ schema, table, page: 1, pageSize, mode: 'browse' })
+    if (nextTab === 'structure' || nextTab === 'insert') void loadStructure(schema, table)
+    if (nextTab === 'browse') void loadRows({ schema, table, page: 1, pageSize: browse.pageSize, mode: 'browse', withIndexes: true })
   }
 
   /** Switch tabs, loading whatever the target tab needs. */
@@ -309,14 +382,46 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     setError(undefined)
     setNotice(undefined)
     if (activeTable === undefined || activeSchema === undefined) return
-    if (next === 'structure') void loadStructure(activeSchema, activeTable)
-    if (next === 'browse') void loadRows({ schema: activeSchema, table: activeTable, page: 1, pageSize, mode: 'browse' })
-    if (next === 'insert') void loadStructure(activeSchema, activeTable)
+    if (next === 'structure' || next === 'insert') void loadStructure(activeSchema, activeTable)
+    if (next === 'browse') void loadRows({
+      schema: activeSchema,
+      table: activeTable,
+      page: browse.page,
+      pageSize: browse.pageSize,
+      mode: 'browse',
+      ...(browse.orderBy === undefined ? {} : { orderBy: browse.orderBy }),
+      ...(browse.orderByColumns === undefined ? {} : { orderByColumns: browse.orderByColumns }),
+      ...(browse.filters === undefined ? {} : { filters: browse.filters }),
+      ...(browse.filterJoin === undefined ? {} : { filterJoin: browse.filterJoin }),
+      orderDir: browse.orderDir,
+      withIndexes: true,
+    })
   }
 
   /** Whether a table name matches the filter (empty filter matches all). */
   const matchesFilter = (name: string): boolean =>
     tableFilter === '' || name.toLowerCase().includes(tableFilter.toLowerCase())
+
+  /**
+   * Open the import dialog, after reading the schema's table list.
+   *
+   * The list is a real request rather than the tree's cached names: the tree may
+   * never have expanded this database, and an import needs to offer every table
+   * the CSV could target — a stale or partial list would make a valid target
+   * un-selectable.
+   */
+  const openImport = async (schema: string): Promise<void> => {
+    try {
+      const tables = await api.tables(source.id, schema)
+      setSchemaTables(tables.map(table => ({ name: table.name, type: table.type })))
+    } catch (failure) {
+      // An enumeration failure must not block the dialog: a SQL import needs no
+      // table list at all, and the CSV side reports its own missing target.
+      setSchemaTables([])
+      void failure
+    }
+    setTransfer({ kind: 'import' })
+  }
 
   // ---- left tree ---------------------------------------------------------
   // phpMyAdmin shape: every database is a node that expands independently, and
@@ -509,33 +614,67 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     )
 
     if (tab === 'browse') {
-      body.push(React.createElement(BrowseTab, {
+      body.push(React.createElement(SqlBrowseTab, {
         key: 'browse-body',
+        api,
+        sourceId: source.id,
+        schema: selection.schema,
+        table: selection.table,
         rows,
-        orderBy,
-        orderDir,
-        pageSize,
-        onSort: (column) => {
-          const nextDir = orderBy === column && orderDir === 'asc' ? 'desc' : 'asc'
-          setOrderBy(column)
-          setOrderDir(nextDir)
-          void loadRows({ schema: selection.schema, table: selection.table, page, pageSize, mode: 'browse', orderBy: column, orderDir: nextDir })
+        query: browse,
+        knownColumns: columns,
+        /**
+         * A layout change re-reads from page 1 unless it is a page move.
+         *
+         * Sorting, filtering and a page-size change all redefine what "page 1" is,
+         * so staying on page 7 of the old ordering would show an arbitrary slice.
+         */
+        onQuery: (next) => {
+          const merged: BrowseQuery = { ...browse, ...next }
+          setBrowse(merged)
+          void loadRows({
+            schema: selection.schema,
+            table: selection.table,
+            page: merged.page,
+            pageSize: merged.pageSize,
+            mode: 'browse',
+            ...(merged.orderBy === undefined ? {} : { orderBy: merged.orderBy }),
+            ...(merged.orderByColumns === undefined ? {} : { orderByColumns: merged.orderByColumns }),
+            ...(merged.filters === undefined ? {} : { filters: merged.filters }),
+            ...(merged.filterJoin === undefined ? {} : { filterJoin: merged.filterJoin }),
+            orderDir: merged.orderDir,
+            withIndexes: true,
+          })
         },
-        onPage: (next) => {
-          setPage(next)
-          void loadRows({ schema: selection.schema, table: selection.table, page: next, pageSize, mode: 'browse', ...(orderBy === undefined ? {} : { orderBy, orderDir }) })
-        },
-        onPageSize: (size) => {
-          setPageSize(size)
-          setPage(1)
-          void loadRows({ schema: selection.schema, table: selection.table, page: 1, pageSize: size, mode: 'browse' })
-        },
-        onRefresh: () => { void loadRows({ schema: selection.schema, table: selection.table, page, pageSize, mode: 'browse', ...(orderBy === undefined ? {} : { orderBy, orderDir }) }) },
+        onReload: reloadCurrent,
+        onExport: options => setTransfer({
+          kind: 'export',
+          ...(options?.rowsOnly === true ? { rowsOnly: true } : {}),
+          ...(options?.selectedKeys === undefined ? {} : { selectedKeys: options.selectedKeys }),
+        }),
+        onImport: () => { void openImport(selection.schema) },
+        onNotice: message => { setNotice(message); if (message !== undefined) setError(undefined) },
+        onError: message => { setError(message); if (message !== undefined) setNotice(undefined) },
       }))
     }
 
     if (tab === 'structure') {
-      body.push(React.createElement(StructureTab, { key: 'structure-body', columns, indexes }))
+      body.push(React.createElement(SqlStructureTab, {
+        key: 'structure-body',
+        api,
+        sourceId: source.id,
+        schema: selection.schema,
+        table: selection.table,
+        kind: source.kind,
+        columns,
+        indexes,
+        loading: columns.length === 0,
+        ...(error === undefined ? {} : { error }),
+        onReload: () => { void loadStructure(selection.schema, selection.table) },
+        onReloadRows: () => { void loadTables(selection.schema, true); reloadCurrent() },
+        onNotice: message => { setNotice(message); if (message !== undefined) setError(undefined) },
+        onError: message => { setError(message); if (message !== undefined) setNotice(undefined) },
+      }))
     }
 
     if (tab === 'sql') {
@@ -553,41 +692,53 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
 
     if (tab === 'search') {
       body.push(
-        React.createElement(SearchTab, {
+        React.createElement(SqlSearchTab, {
           key: 'search-body',
-          onSearch: (payload) => {
+          columns,
+          filters: browse.filters ?? [],
+          join: browse.filterJoin ?? 'and',
+          loading: rows?.loading === true,
+          ...(rows?.page === undefined ? {} : { total: rows.page.total }),
+          onSearch: (filters, join) => {
+            // A search always starts at page 1: the previous page number was a
+            // position in the PREVIOUS result set, and keeping it would land the
+            // user past the end of a narrower one.
+            const merged: BrowseQuery = { ...browse, page: 1, filters, filterJoin: join }
+            setBrowse(merged)
             void loadRows({
               schema: selection.schema,
               table: selection.table,
               page: 1,
-              pageSize,
+              pageSize: merged.pageSize,
               mode: 'search',
-              ...(payload.term === undefined ? {} : { term: payload.term }),
-              ...(payload.condition === undefined ? {} : { condition: payload.condition }),
+              filters,
+              filterJoin: join,
             })
           },
-          rows,
+          onError: message => { setError(message); if (message !== undefined) setNotice(undefined) },
         }),
       )
     }
 
     if (tab === 'insert') {
       body.push(
-        React.createElement(InsertTab, {
+        React.createElement(SqlInsertTab, {
           key: 'insert-body',
           api,
           source,
           schema: selection.schema,
           table: selection.table,
           columns,
+          loading: columns.length === 0,
           onDone: (message) => {
             setNotice(message)
             setError(undefined)
-            // An INSERT can change the row count the tree shows, so refresh it.
+            // An INSERT can change the row count the tree shows, so refresh it,
+            // and the grid's total is now wrong too.
             void loadTables(selection.schema, true)
-            void loadRows({ schema: selection.schema, table: selection.table, page: 1, pageSize, mode: 'browse' })
+            void loadStats(selection.schema, true)
           },
-          onError: (message) => { setError(message); setNotice(undefined) },
+          onError: (message) => { setError(message); if (message !== undefined) setNotice(undefined) },
         }),
       )
     }
@@ -618,6 +769,42 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
           onCancel: () => setConfirming(undefined),
           onConfirm: () => { void runTableAction(confirming.schema, confirming.table, confirming.op) },
         }),
+    transfer === undefined
+      ? null
+      : transfer.kind === 'export'
+        ? React.createElement(ExportDialog, {
+            key: 'export',
+            api,
+            source,
+            schema: activeSchema ?? '',
+            ...(activeTable === undefined ? {} : { table: activeTable }),
+            tableCount: schemaTables.length,
+            ...(transfer.selectedKeys === undefined ? {} : { selectedKeys: transfer.selectedKeys }),
+            ...(transfer.rowsOnly === true ? { rowsOnly: true } : {}),
+            onClose: () => setTransfer(undefined),
+            onDone: message => { setNotice(message); setError(undefined) },
+            onError: message => { setError(message); setNotice(undefined) },
+          })
+        : React.createElement(ImportDialog, {
+            key: 'import',
+            api,
+            source,
+            schema: activeSchema ?? '',
+            ...(activeTable === undefined ? {} : { table: activeTable }),
+            tables: schemaTables,
+            onClose: () => setTransfer(undefined),
+            onDone: message => {
+              setNotice(message)
+              setError(undefined)
+              // An import can add tables and rows, so both the tree and the
+              // stats are stale afterwards.
+              if (activeSchema !== undefined) {
+                void loadTables(activeSchema, true)
+                void loadStats(activeSchema, true)
+              }
+            },
+            onError: message => { setError(message); setNotice(undefined) },
+          }),
   )
 }
 
@@ -844,181 +1031,6 @@ function emptyPage(): TablePage {
   return { columns: [], rows: [], total: 0, page: 1, pageSize: 200, primaryKey: [] }
 }
 
-/** The 浏览 tab: a paged, sortable data grid. */
-function BrowseTab(props: {
-  rows: RowsState | undefined
-  orderBy: string | undefined
-  orderDir: 'asc' | 'desc'
-  pageSize: number
-  onSort(column: string): void
-  onPage(page: number): void
-  onPageSize(size: number): void
-  onRefresh(): void
-}): React.ReactElement {
-  const { rows, orderBy, orderDir, pageSize, onSort, onPage, onPageSize, onRefresh } = props
-  if (rows === undefined) return React.createElement(Empty, { message: t('common.loading') })
-  if (rows.error !== undefined) return React.createElement(ErrorBanner, { message: rows.error })
-
-  const page = rows.page
-  const pages = Math.max(1, Math.ceil(page.total / page.pageSize))
-  const columns = page.columns.map(column => column.name)
-
-  return React.createElement(
-    'div',
-    { className: 'dbm-tab-body' },
-    React.createElement(
-      'div',
-      { className: 'dbm-row', style: { padding: '8px 12px' } },
-      React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-sm', onClick: onRefresh }, t('browse.refresh')),
-      React.createElement('label', { className: 'dbm-hint' }, `${t('browse.pageSize')}: ${''}`),
-      React.createElement(
-        'select',
-        {
-          className: 'dbm-select',
-          value: String(pageSize),
-          onChange: (event: { target: { value: string } }) => onPageSize(Number(event.target.value)),
-        },
-        [50, 100, 200, 500, 1000].map(size => React.createElement('option', { key: size, value: String(size) }, String(size))),
-      ),
-      React.createElement('span', { className: 'dbm-hint' }, t('browse.total', { n: page.total })),
-      React.createElement('span', { className: 'dbm-spacer' }),
-      rows.loading ? React.createElement('span', { className: 'dbm-hint' }, t('common.loading')) : null,
-    ),
-    page.columns.length === 0
-      ? React.createElement(Empty, { message: t('browse.empty') })
-      : React.createElement(
-          'div',
-          { className: 'dbm-data' },
-          React.createElement(
-            'table',
-            null,
-            React.createElement(
-              'thead',
-              null,
-              React.createElement(
-                'tr',
-                null,
-                page.columns.map(column =>
-                  React.createElement(
-                    'th',
-                    { key: column.name },
-                    React.createElement(
-                      'button',
-                      { type: 'button', onClick: () => onSort(column.name) },
-                      `${column.name}${orderBy === column.name ? (orderDir === 'asc' ? ' ▲' : ' ▼') : ''}`,
-                    ),
-                  ),
-                ),
-              ),
-            ),
-            React.createElement(
-              'tbody',
-              null,
-              page.rows.map((row, index) =>
-                React.createElement(
-                  'tr',
-                  { key: index },
-                  columns.map(column =>
-                    React.createElement(
-                      'td',
-                      { key: column, className: isNull(row[column] ?? null) ? 'dbm-null' : undefined, title: renderCell(row[column] ?? null) },
-                      renderCell(row[column] ?? null),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ),
-    React.createElement(
-      'div',
-      { className: 'dbm-pager' },
-      React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-sm', disabled: page.page <= 1, onClick: () => onPage(page.page - 1) }, t('browse.prev')),
-      React.createElement('span', null, t('browse.page', { page: page.page, pages })),
-      React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-sm', disabled: page.page >= pages, onClick: () => onPage(page.page + 1) }, t('browse.next')),
-      page.primaryKey.length === 0 ? React.createElement('span', { className: 'dbm-hint' }, t('browse.noPk')) : null,
-    ),
-  )
-}
-
-/** The 结构 tab: columns and indexes. */
-function StructureTab(props: { columns: ColumnInfo[]; indexes: IndexInfo[] }): React.ReactElement {
-  const { columns, indexes } = props
-  return React.createElement(
-    'div',
-    { className: 'dbm-tab-body' },
-    React.createElement(
-      'div',
-      { className: 'dbm-scroll' },
-      React.createElement('div', { className: 'dbm-pad' }, React.createElement('strong', null, t('structure.columns'))),
-      React.createElement(
-        'table',
-        { className: 'dbm-table' },
-        React.createElement(
-          'thead',
-          null,
-          React.createElement(
-            'tr',
-            null,
-            ...[t('structure.col.name'), t('structure.col.type'), t('structure.col.nullable'), t('structure.col.key'), t('structure.col.default'), t('structure.col.extra'), t('structure.col.comment')].map(label =>
-              React.createElement('th', { key: label }, label),
-            ),
-          ),
-        ),
-        React.createElement(
-          'tbody',
-          null,
-          columns.map(column =>
-            React.createElement(
-              'tr',
-              { key: column.name },
-              React.createElement('td', { className: 'dbm-mono' }, column.name),
-              React.createElement('td', { className: 'dbm-mono' }, column.type),
-              React.createElement('td', null, column.nullable ? t('common.yes') : t('common.no')),
-              React.createElement('td', null, column.key === '' ? t('common.none') : column.key),
-              React.createElement('td', { className: 'dbm-mono' }, column.defaultValue ?? t('common.none')),
-              React.createElement('td', { className: 'dbm-mono' }, column.extra ?? t('common.none')),
-              React.createElement('td', null, column.comment ?? ''),
-            ),
-          ),
-        ),
-      ),
-      React.createElement('div', { className: 'dbm-pad' }, React.createElement('strong', null, t('structure.indexes'))),
-      indexes.length === 0
-        ? React.createElement('div', { className: 'dbm-pad dbm-hint' }, t('structure.noIndexes'))
-        : React.createElement(
-            'table',
-            { className: 'dbm-table' },
-            React.createElement(
-              'thead',
-              null,
-              React.createElement(
-                'tr',
-                null,
-                ...[t('structure.index.name'), t('structure.index.unique'), t('structure.index.columns'), t('structure.index.type')].map(label =>
-                  React.createElement('th', { key: label }, label),
-                ),
-              ),
-            ),
-            React.createElement(
-              'tbody',
-              null,
-              indexes.map(index =>
-                React.createElement(
-                  'tr',
-                  { key: index.name },
-                  React.createElement('td', { className: 'dbm-mono' }, index.name),
-                  React.createElement('td', null, index.unique ? t('common.yes') : t('common.no')),
-                  React.createElement('td', { className: 'dbm-mono' }, index.columns.join(', ')),
-                  React.createElement('td', null, index.type ?? t('common.none')),
-                ),
-              ),
-            ),
-          ),
-    ),
-  )
-}
-
 /** The SQL tab: an editor plus its result grid. */
 function SqlTabView(props: {
   api: DbApi
@@ -1130,197 +1142,6 @@ function SqlTabView(props: {
                 ),
               ),
         ),
-  )
-}
-
-/** The 搜索 tab: free-text across text columns, or a raw WHERE condition. */
-function SearchTab(props: {
-  onSearch(payload: { term?: string; condition?: string }): void
-  rows: RowsState | undefined
-}): React.ReactElement {
-  const { onSearch, rows } = props
-  const [term, setTerm] = React.useState('')
-  const [condition, setCondition] = React.useState('')
-
-  const submit = (): void => {
-    if (condition.trim() !== '') onSearch({ condition: condition.trim() })
-    else if (term.trim() !== '') onSearch({ term: term.trim() })
-  }
-
-  return React.createElement(
-    'div',
-    { className: 'dbm-tab-body' },
-    React.createElement(
-      'div',
-      { className: 'dbm-pad' },
-      React.createElement(
-        'div',
-        { className: 'dbm-row' },
-        React.createElement('input', {
-          className: 'dbm-input',
-          style: { flex: 1, minWidth: 200 },
-          value: term,
-          placeholder: t('search.placeholder'),
-          onChange: (event: { target: { value: string } }) => setTerm(event.target.value),
-          onKeyDown: (event: { key: string }) => { if (event.key === 'Enter') submit() },
-        }),
-        React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-primary', onClick: submit }, t('search.run')),
-      ),
-      React.createElement(
-        'div',
-        { className: 'dbm-row' },
-        React.createElement('span', { className: 'dbm-hint' }, t('search.condition')),
-        React.createElement('input', {
-          className: 'dbm-input dbm-mono',
-          style: { flex: 1 },
-          value: condition,
-          placeholder: t('search.conditionPlaceholder'),
-          spellcheck: false,
-          onChange: (event: { target: { value: string } }) => setCondition(event.target.value),
-          onKeyDown: (event: { key: string }) => { if (event.key === 'Enter') submit() },
-        }),
-      ),
-    ),
-    rows === undefined
-      ? null
-      : rows.error !== undefined
-        ? React.createElement(ErrorBanner, { message: rows.error })
-        : React.createElement(
-            'div',
-            { className: 'dbm-tab-body', style: { minHeight: 0 } },
-            React.createElement('div', { className: 'dbm-pad dbm-hint' }, t('browse.total', { n: rows.page.total })),
-            React.createElement(
-              'div',
-              { className: 'dbm-data' },
-              React.createElement(
-                'table',
-                null,
-                React.createElement('thead', null, React.createElement('tr', null, rows.page.columns.map(column => React.createElement('th', { key: column.name }, column.name)))),
-                React.createElement(
-                  'tbody',
-                  null,
-                  rows.page.rows.map((row, index) =>
-                    React.createElement(
-                      'tr',
-                      { key: index },
-                      rows.page.columns.map(column =>
-                        React.createElement(
-                          'td',
-                          { key: column.name, className: isNull(row[column.name] ?? null) ? 'dbm-null' : undefined, title: renderCell(row[column.name] ?? null) },
-                          renderCell(row[column.name] ?? null),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ),
-  )
-}
-
-/** The 插入 tab: one row form derived from the table's columns. */
-function InsertTab(props: {
-  api: DbApi
-  source: DataSourceSummary
-  schema: string | undefined
-  table: string
-  columns: ColumnInfo[]
-  onDone(message: string): void
-  onError(message: string): void
-}): React.ReactElement {
-  const { api, source, schema, table, columns, onDone, onError } = props
-  const [values, setValues] = React.useState<Record<string, string>>({})
-  const [useNull, setUseNull] = React.useState<Record<string, boolean>>({})
-  const [busy, setBusy] = React.useState(false)
-
-  const submit = async (): Promise<void> => {
-    // Only the columns the user actually filled are sent, so the engine applies
-    // its own defaults for everything else.
-    const payload: Array<{ column: string; value: string | null }> = []
-    for (const column of columns) {
-      const raw = values[column.name] ?? ''
-      if (useNull[column.name] === true) payload.push({ column: column.name, value: null })
-      else if (raw !== '') payload.push({ column: column.name, value: raw })
-      else if (!column.nullable && column.defaultValue === undefined) {
-        onError(t('insert.required', { column: column.name }))
-        return
-      }
-    }
-    if (payload.length === 0) {
-      onError(t('insert.required', { column: columns[0]?.name ?? table }))
-      return
-    }
-    setBusy(true)
-    try {
-      const result = await api.insertRow(source.id, {
-        ...(schema === undefined ? {} : { schema }),
-        table,
-        values: payload,
-      })
-      setValues({})
-      setUseNull({})
-      onDone(t('insert.done', { n: result.affected }))
-    } catch (failure) {
-      onError(failure instanceof Error ? failure.message : String(failure))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  return React.createElement(
-    'div',
-    { className: 'dbm-tab-body' },
-    React.createElement(
-      'div',
-      { className: 'dbm-scroll' },
-      React.createElement(
-        'div',
-        { className: 'dbm-pad' },
-        React.createElement('strong', null, `${t('insert.title')} — ${table}`),
-        React.createElement('div', { className: 'dbm-hint' }, t('insert.hint')),
-        React.createElement(
-          'div',
-          { className: 'dbm-grid', style: { gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))' } },
-          columns.map(column =>
-            React.createElement(
-              'label',
-              { className: 'dbm-label', key: column.name },
-              React.createElement(
-                'span',
-                null,
-                column.name,
-                React.createElement('span', { className: 'dbm-hint' }, ` · ${column.type}${column.nullable ? '' : ' NOT NULL'}${column.key === 'PRI' ? ' PK' : ''}`),
-              ),
-              React.createElement('input', {
-                className: 'dbm-input dbm-mono',
-                value: values[column.name] ?? '',
-                disabled: useNull[column.name] === true,
-                placeholder: column.defaultValue ?? (column.nullable ? t('common.null') : ''),
-                onChange: (event: { target: { value: string } }) => setValues(current => ({ ...current, [column.name]: event.target.value })),
-              }),
-              column.nullable
-                ? React.createElement(
-                    'span',
-                    { className: 'dbm-check' },
-                    React.createElement('input', {
-                      type: 'checkbox',
-                      checked: useNull[column.name] === true,
-                      onChange: (event: { target: { checked: boolean } }) => setUseNull(current => ({ ...current, [column.name]: event.target.checked })),
-                    }),
-                    t('common.null'),
-                  )
-                : null,
-            ),
-          ),
-        ),
-        React.createElement(
-          'div',
-          { className: 'dbm-row' },
-          React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-primary', disabled: busy, onClick: () => { void submit() } }, busy ? t('common.loading') : t('insert.submit')),
-        ),
-      ),
-    ),
   )
 }
 

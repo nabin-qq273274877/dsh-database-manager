@@ -272,6 +272,11 @@ export class DbApi {
     return (await send<{ result: QueryResult }>(DB_API.row(id), 'POST', body)).result
   }
 
+  /** Insert several rows in one transaction; the host validates they share columns. */
+  async insertRows(id: string, body: { schema?: string; table: string; rows: Array<Array<{ column: string; value: string | number | boolean | null }>> }): Promise<QueryResult> {
+    return (await send<{ result: QueryResult }>(`${DB_API.row(id)}/batch`, 'POST', body)).result
+  }
+
   /** Update rows matched by keys. */
   async updateRow(id: string, body: { schema?: string; table: string; values: Array<{ column: string; value: string | number | boolean | null }>; keys: Array<{ column: string; value: string | number | boolean | null }> }): Promise<QueryResult> {
     return (await send<{ result: QueryResult }>(DB_API.row(id), 'PATCH', body)).result

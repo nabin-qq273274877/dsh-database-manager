@@ -199,3 +199,112 @@ export function BackButton(props: { onBack(): void; label?: string }): React.Rea
 export function Empty(props: { message: string }): React.ReactElement {
   return React.createElement('div', { className: 'dbm-empty' }, props.message)
 }
+
+/**
+ * Whether a value is safe to hand to `navigator.clipboard.writeText`.
+ *
+ * A `null` cell has nothing to copy, and copying the rendered placeholder
+ * (`NULL`) would put a literal string in the clipboard that the cell does not
+ * contain. The caller decides; this is the predicate for it.
+ */
+export function isCopyable(value: string | number | boolean | null): boolean {
+  return value !== null
+}
+
+/**
+ * Write text to the clipboard.
+ *
+ * `navigator.clipboard` is absent on an insecure origin (plain HTTP) and its
+ * promise rejects when the document is not focused, so both cases are reported
+ * rather than left as an unhandled rejection. The `execCommand` fallback is
+ * deliberately NOT used: it needs a selection of the whole document, which on
+ * this panel would also copy whatever the user had selected elsewhere.
+ *
+ * @returns null on success, or a message describing the failure.
+ */
+export async function copyText(text: string): Promise<string | null> {
+  try {
+    if (typeof navigator === 'undefined' || navigator.clipboard === undefined) {
+      return 'the clipboard API is unavailable (a secure origin is required)'
+    }
+    await navigator.clipboard.writeText(text)
+    return null
+  } catch (failure) {
+    return errorText(failure)
+  }
+}
+
+/**
+ * The 页码 control: a text field plus the current page's bounds.
+ *
+ * A number input rather than a page list, because the page count is unbounded on
+ * a large table: phpMyAdmin's own pager collapses to "1 … 200 … 800" for exactly
+ * that reason, and a field is what a user with a specific page in mind actually
+ * wants.
+ *
+ * The field keeps its own text while being typed, so a half-entered number is not
+ * corrected underneath the keystrokes; `onGo` fires on Enter or blur and the
+ * component resets to the current page afterwards.
+ */
+export function PageJump(props: {
+  page: number
+  pages: number
+  onGo(page: number): void
+}): React.ReactElement {
+  const { page, pages, onGo } = props
+  const [text, setText] = React.useState(String(page))
+  const [error, setError] = React.useState<string | undefined>(undefined)
+  // The displayed value follows the real page whenever the page changes from
+  // outside (a next/previous click), which is what keeps the two in step.
+  React.useEffect(() => { setText(String(page)); setError(undefined) }, [page])
+
+  const submit = (): void => {
+    const wanted = Number(text.trim())
+    if (!Number.isFinite(wanted) || Math.trunc(wanted) !== wanted || wanted < 1 || wanted > pages) {
+      setError(t('browse.jumpOutOfRange', { pages }))
+      return
+    }
+    setError(undefined)
+    if (wanted !== page) onGo(wanted)
+  }
+
+  return React.createElement(
+    'span',
+    { className: 'dbm-row', style: { gap: 4 } },
+    React.createElement('label', { className: 'dbm-hint' }, t('browse.jumpTo')),
+    React.createElement('input', {
+      className: 'dbm-input',
+      style: { width: 64 },
+      value: text,
+      inputMode: 'numeric',
+      title: t('browse.jumpHint'),
+      'aria-label': t('browse.jumpTo'),
+      'data-dbm-page-jump': '',
+      onChange: (event: { target: { value: string } }) => setText(event.target.value),
+      onKeyDown: (event: { key: string; preventDefault(): void }) => {
+        if (event.key !== 'Enter') return
+        event.preventDefault()
+        submit()
+      },
+      onBlur: submit,
+    }),
+    error === undefined ? null : React.createElement('span', { className: 'dbm-cell-failed' }, error),
+  )
+}
+
+/**
+ * The sort indicator for one column header.
+ *
+ * Rendered as a separate element rather than appended to the header's text, so
+ * its smaller size does not shrink the column name and so a screen reader reads
+ * the name and the state as two things.
+ */
+export function SortMark(props: { direction: 'asc' | 'desc' | 'none' }): React.ReactElement | null {
+  const { direction } = props
+  if (direction === 'none') return null
+  return React.createElement(
+    'span',
+    { className: 'dbm-sort-mark', 'aria-label': direction === 'asc' ? t('browse.sortAsc') : t('browse.sortDesc') },
+    direction === 'asc' ? '▲' : '▼',
+  )
+}

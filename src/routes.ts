@@ -945,6 +945,39 @@ export function makeRoutes(deps: RoutesDeps): { routes: WebRoute[]; upgrade: Web
         return
       }
 
+      // Several rows in one request, inserted in ONE transaction. The 插入 tab's
+      // "add another row" and a CSV import both land here, and both need the
+      // all-or-nothing guarantee: a failure on the third row must not leave the
+      // first two behind with no record of where it stopped.
+      if (action === 'row/batch' && method === 'POST') {
+        if (!isSqlDriver(driver)) {
+          writeError(res, 400, 'row/batch is only available for SQL data sources')
+          return
+        }
+        const body = asJsonObject(await readJsonBody(req))
+        if (body === undefined) {
+          writeError(res, 400, 'body must be a JSON object')
+          return
+        }
+        const table = typeof body['table'] === 'string' ? body['table'] : undefined
+        if (table === undefined || table === '') {
+          writeError(res, 400, 'table is required')
+          return
+        }
+        if (!Array.isArray(body['rows']) || body['rows'].length === 0) {
+          writeError(res, 400, 'rows must be a non-empty array')
+          return
+        }
+        if (body['rows'].length > MAX_BATCH_ROWS) {
+          writeError(res, 400, `too many rows in one request (max ${MAX_BATCH_ROWS})`)
+          return
+        }
+        const schema = typeof body['schema'] === 'string' && body['schema'] !== '' ? body['schema'] : undefined
+        const rows = (body['rows'] as unknown[]).map((entry, index) => readPairs(entry, `rows[${index}]`))
+        writeJson(res, 200, { result: await driver.insertRows(schema, table, rows) })
+        return
+      }
+
       if (action === 'table') {
         if (!isSqlDriver(driver)) {
           writeError(res, 400, 'table is only available for SQL data sources')

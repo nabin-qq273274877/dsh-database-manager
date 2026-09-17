@@ -531,6 +531,86 @@ export const PANEL_CSS = `
   cursor: pointer;
   padding: 0;
 }
+/*
+ * The multi-select checkbox column. It is narrow, it does not sort, and it has to
+ * stay put while the rest of the row scrolls sideways — so it is sticky on the
+ * left, the mirror of the sticky header row.
+ */
+.dbm-data th.dbm-select-col, .dbm-data td.dbm-select-col {
+  width: 30px;
+  max-width: 30px;
+  padding: 4px 6px;
+  text-align: center;
+  position: sticky;
+  left: 0;
+  background: var(--dsw-alias-bg-base);
+}
+.dbm-data td.dbm-select-col { z-index: 0; }
+.dbm-data th.dbm-select-col { z-index: 2; }
+/* The row controls: edit / copy / delete, revealed on hover like the tree's. */
+.dbm-data td.dbm-row-actions {
+  white-space: nowrap;
+  width: 1%;
+}
+.dbm-row-action {
+  font: inherit;
+  font-size: 11px;
+  padding: 1px 6px;
+  margin-right: 3px;
+  border: 1px solid var(--dsw-alias-border-l3);
+  border-radius: 5px;
+  background: var(--dsw-alias-button-elevated-fill);
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+}
+.dbm-row-action:hover { background: var(--dsw-alias-button-floating-hover); color: var(--dsw-alias-label-primary); }
+.dbm-row-action-danger:hover { color: var(--dsw-alias-label-danger, #d33); border-color: currentColor; }
+/*
+ * A row selected for a batch action. Kept visibly distinct from the hover tint,
+ * because "these are the rows that will be deleted" is a different claim from
+ * "the pointer is here".
+ */
+.dbm-data tr[data-selected="true"] { background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4c8bf5) 14%, transparent); }
+.dbm-data tr[data-selected="true"]:hover { background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4c8bf5) 20%, transparent); }
+/*
+ * The sort indicator.
+ *
+ * Sized in font-size 8px rather than left at the inherited 12px: at the header's
+ * own size the triangles were visually as loud as the column name, which reads as
+ * if the arrow were the label. The 4px left margin is what keeps them from
+ * touching the last letter.
+ */
+.dbm-sort-mark {
+  font-size: 8px;
+  margin-left: 4px;
+  color: var(--dsw-alias-label-secondary);
+  vertical-align: 1px;
+}
+.dbm-data th .dbm-sort-mark { color: var(--dsw-alias-label-primary); }
+/*
+ * A cell being edited in place.
+ *
+ * The editor fills the cell rather than sitting inside it, so the row keeps its
+ * height and the grid does not jump when a value is double-clicked.
+ */
+.dbm-cell-input {
+  font: inherit;
+  font-family: var(--ds-font-family-code);
+  font-size: 12px;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 90px;
+  padding: 2px 5px;
+  border: 1px solid var(--dsw-alias-label-primary);
+  border-radius: 4px;
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+}
+/* The cell is a double-click target, which has to be discoverable. */
+.dbm-cell-editable { cursor: text; }
+.dbm-cell-editable:hover { outline: 1px dashed var(--dsw-alias-border-l3); outline-offset: -2px; }
+.dbm-cell-saving { opacity: .6; }
+.dbm-cell-failed { color: var(--dsw-alias-label-danger, #d33); font-style: normal; }
 .dbm-null { color: var(--dsw-alias-label-secondary); font-style: italic; }
 /*
  * The value editor puts inputs inside the data grid. They must fill the cell
@@ -544,6 +624,43 @@ export const PANEL_CSS = `
 }
 /* An edited-but-unsaved cell is called out, so 保存 is never a guess. */
 .dbm-dirty { color: #c1720a; }
+
+/*
+ * The batch-action bar. It appears above the grid only while rows are selected,
+ * so the grid does not permanently lose a row of height to controls that are
+ * usually inapplicable — and its appearance is itself the feedback that a
+ * selection is active.
+ */
+.dbm-batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4c8bf5) 12%, transparent);
+  border-bottom: 1px solid var(--dsw-alias-border-l3);
+  flex: none;
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+
+/*
+ * A structure editor row: a column being added or changed, laid out as one line
+ * of fields. Wrapping is enabled because the type list plus the flags do not fit
+ * a narrow panel, and a horizontal scrollbar inside a table row is worse than a
+ * second line.
+ */
+.dbm-struct-editor {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 6px 8px;
+  background: var(--dsw-alias-interactive-bg-hover);
+  border-radius: 6px;
+}
+.dbm-struct-editor .dbm-input, .dbm-struct-editor .dbm-select { min-width: 90px; }
+/* A column that is part of the primary key, called out in the structure table. */
+.dbm-key-note { color: var(--dsw-alias-label-secondary); font-size: 11px; }
 
 /*
  * The TTL countdown. Tabular figures so a ticking number does not make the row
