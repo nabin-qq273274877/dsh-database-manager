@@ -227,17 +227,49 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
     }
   }
 
-  /** The index list with the primary key first, as phpMyAdmin offers it. */
-  const sortOptions: Array<{ label: string; columns: string[] }> = []
-  if (primaryKey.length > 0) sortOptions.push({ label: t('browse.sortByKey'), columns: primaryKey })
+  /**
+   * The sort list: one entry per index PER DIRECTION, the primary key first.
+   *
+   * Both directions are separate entries rather than a name plus a direction
+   * toggle, because the direction is part of what is being chosen — "sort by
+   * goodsid descending" is one decision, and splitting it across two controls
+   * leaves the second one meaningless until the first is set.
+   *
+   * The label is `name (direction)` and deliberately NOT the index's column
+   * list: the name identifies the index, and a long column list would push the
+   * direction — the only part that differs between two adjacent rows — out of
+   * view.
+   */
+  const sortOptions: Array<{ label: string; value: string; columns: string[]; dir: 'asc' | 'desc' }> = []
+  const sortTargets: Array<{ name: string; columns: string[] }> = []
+  if (primaryKey.length > 0) {
+    // Named `PRIMARY`, which is what the key's own index is called. On SQLite the
+    // implicit index is `sqlite_autoindex_<table>_<n>`; showing that name would
+    // describe the storage rather than the thing the user is sorting by.
+    sortTargets.push({ name: 'PRIMARY', columns: primaryKey })
+  }
   for (const index of indexes) {
     if (index.columns.length === 0) continue
+    // The primary key's own index is already listed as PRIMARY. Adding it again
+    // would offer the same sort twice under two different names.
     if (index.primary === true) continue
-    // The label says which columns it covers: two indexes over the same columns
-    // in different orders are different sorts, and a bare name would not show it.
-    sortOptions.push({ label: `${index.name} (${index.columns.join(', ')})`, columns: index.columns })
+    sortTargets.push({ name: index.name, columns: index.columns })
   }
-  const activeSort = query.orderByColumns === undefined ? undefined : sortOptions.find(option => option.columns.join('\u0000') === query.orderByColumns!.join('\u0000'))
+  for (const target of sortTargets) {
+    for (const dir of ['asc', 'desc'] as const) {
+      sortOptions.push({
+        label: `${target.name} (${dir === 'asc' ? t('browse.sortAsc') : t('browse.sortDesc')})`,
+        // Direction and columns in one value, so selecting an entry carries both.
+        // The separator is NUL, which cannot occur in an identifier.
+        value: `${dir}\u0000${target.columns.join('\u0000')}`,
+        columns: target.columns,
+        dir,
+      })
+    }
+  }
+  const activeSort = query.orderByColumns === undefined
+    ? undefined
+    : sortOptions.find(option => option.dir === query.orderDir && option.columns.join('\u0000') === query.orderByColumns!.join('\u0000'))
 
   if (rows === undefined) return React.createElement(Empty, { message: t('common.loading') })
   if (rows.error !== undefined && page === undefined) return React.createElement(ErrorBanner, { message: rows.error })
@@ -297,7 +329,7 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
           'button',
           {
             type: 'button',
-            title: t('browse.sortTitle'),
+            title: t('browse.sortByColumn'),
             onClick: () => {
               // Same column: flip the direction. A different column starts
               // ascending, which is what a header click means everywhere else.
@@ -464,29 +496,34 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
             {
               key: 'sort',
               className: 'dbm-select',
-              value: activeSort === undefined ? '' : activeSort.columns.join('\u0000'),
+              // The entry that is currently in effect; 「无」 when the page is
+              // unsorted or sorted by a column header instead (a header click
+              // sets `orderBy`, which is not one of these entries).
+              value: activeSort === undefined ? '' : activeSort.value,
+              title: t('browse.sortTitle'),
               onChange: (event: { target: { value: string } }) => {
                 const value = event.target.value
+                // 「无」 clears the sort entirely, so the read falls back to the
+                // engine's own row order.
                 if (value === '') { onQuery({ page: 1, orderByColumns: undefined, orderBy: undefined }); return }
-                onQuery({ page: 1, orderBy: undefined, orderByColumns: value.split('\u0000') })
+                const [dir, ...columns] = value.split('\u0000')
+                onQuery({
+                  page: 1,
+                  // A header sort and an index sort are exclusive: the driver
+                  // prefers `orderByColumns`, so leaving `orderBy` set would make
+                  // the header appear to do nothing.
+                  orderBy: undefined,
+                  orderByColumns: columns,
+                  orderDir: dir === 'desc' ? 'desc' : 'asc',
+                })
               },
             },
             [
-              React.createElement('option', { key: '', value: '' }, t('browse.sortIndexNone')),
-              ...sortOptions.map(option => React.createElement('option', { key: option.label, value: option.columns.join('\u0000') }, option.label)),
+              ...sortOptions.map(option => React.createElement('option', { key: option.value, value: option.value }, option.label)),
+              // 「无」 sits LAST, so the list opens on the indexes and the way to
+              // turn sorting off is at the end rather than in the way.
+              React.createElement('option', { key: '__none__', value: '' }, t('browse.sortIndexNone')),
             ],
-          ),
-          React.createElement(
-            'button',
-            {
-              key: 'dir',
-              type: 'button',
-              className: 'dbm-btn dbm-btn-sm',
-              disabled: activeSort === undefined,
-              title: t('browse.sortTitle'),
-              onClick: () => onQuery({ page: 1, orderDir: query.orderDir === 'asc' ? 'desc' : 'asc' }),
-            },
-            query.orderDir === 'asc' ? t('browse.sortAsc') : t('browse.sortDesc'),
           ),
         ],
     React.createElement('span', { className: 'dbm-hint' }, page === undefined ? '' : t('browse.total', { n: page.total })),

@@ -34,7 +34,16 @@ import { WebSocket } from 'ws'
 
 const EDGE = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
 const DEBUG_PORT = 9351
-const SOURCE_NAME = 'E2E Search'
+/**
+ * The data source name this run creates, unique per run.
+ *
+ * Unique so a leftover from an earlier run cannot be mistaken for this one's, and
+ * so the cleanup at the end removes exactly what this run added. A fixed name had
+ * two costs: the entry accumulated in the user's own configuration, and any
+ * name-based lookup could resolve to an older entry pointing at a different
+ * database file.
+ */
+const SOURCE_NAME = `E2E Search ${process.pid}`
 
 const baseUrl = process.argv[2]
 const sqliteFile = process.argv[3]
@@ -140,12 +149,18 @@ try {
   /**
    * Run one search and return what the grid shows.
    *
+   * @param tag - a per-case tag appended to the source name. Each case reloads the
+   *   page and creates its own source, so a SHARED name would put several
+   *   same-named entries in the user's configuration at once — the ambiguity that
+   *   made an earlier version of the sibling script read the wrong database.
    * @param column - the field to search.
    * @param operator - 'contains' or 'isNull', by the operator's option VALUE
    *   (which is the wire name, not the label).
    * @param text - what to type, or undefined for a unary operator.
    */
-  const runSearch = async (column, operator, text) => {
+  const runSearch = async (tag, column, operator, text) => {
+    /** This case's own source name, so no two entries ever share one. */
+    const sourceName = `${SOURCE_NAME} ${tag}`
     const flow = `(async () => {
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       const waitFor = async (fn, ms) => { const end = Date.now() + ms; for (;;) { const v = fn(); if (v) return v; if (Date.now() > end) return null; await sleep(120); } };
@@ -157,6 +172,7 @@ try {
         setter.call(el, value);
         el.dispatchEvent(new Event('change', { bubbles: true }));
       };
+      const sourceName = ${JSON.stringify(sourceName)};
 
       const row = Array.from(document.querySelectorAll('nav button[aria-label]'))
         .find((b) => ['数据库管理', 'Database'].includes((b.getAttribute('aria-label') || '').trim()));
@@ -176,12 +192,12 @@ try {
         Object.getOwnPropertyDescriptor(proto.prototype, 'value').set.call(el, value);
         el.dispatchEvent(new Event('input', { bubbles: true }));
       };
-      setInput(inputs[0], ${JSON.stringify(SOURCE_NAME)});
+      setInput(inputs[0], sourceName);
       setInput(inputs.find((i) => (i.getAttribute('placeholder') || '').includes('D:/data')), ${JSON.stringify(sqliteFile)});
       await sleep(200);
       click(byExact('.dbm-modal-foot .dbm-btn', '保存') || byExact('.dbm-modal-foot .dbm-btn', 'Save'));
 
-      const listed = await waitFor(() => byIncludes('.dbm-table td', ${JSON.stringify(SOURCE_NAME)}), 10000);
+      const listed = await waitFor(() => byIncludes('.dbm-table td', sourceName), 10000);
       if (!listed) return { fatal: 'the created source is not listed' };
       const connect = Array.from(listed.closest('tr').querySelectorAll('.dbm-actions .dbm-btn'))
         .find((b) => ['连接', 'Connect'].includes(b.textContent.trim()));
@@ -273,7 +289,7 @@ try {
   }
 
   // ---- case 1: contains finds exactly the matching row ---------------------
-  const contains = await runSearch('name', 'contains', 'alph')
+  const contains = await runSearch('contains', 'name', 'contains', 'alph')
   check('the search tab has no raw-WHERE box', contains.hasRawWhere === false, contains.hasRawWhere)
   check('contains matched the single expected row', contains.rows.length === 1 && contains.rows[0].includes('alpha'), contains.rows)
   await reset()
@@ -281,17 +297,17 @@ try {
   // ---- case 2: a wildcard character is a literal --------------------------
   // '100%' is in the note column, so a wildcard interpretation would also match
   // the rows whose note is non-null — and 'x' contains no percent at all.
-  const percent = await runSearch('note', 'contains', '%')
+  const percent = await runSearch('percent', 'note', 'contains', '%')
   check('a percent sign matches only the literal 100% row', percent.rows.length === 1 && percent.rows[0].includes('100%'), percent.rows)
   await reset()
 
   // ---- case 3: an injection-shaped operand is a value ---------------------
-  const injection = await runSearch('name', 'contains', "' OR 1=1 --")
+  const injection = await runSearch('injection', 'name', 'contains', "' OR 1=1 --")
   check('an injection-shaped value matches nothing', injection.rows.length === 0, { rows: injection.rows, count: injection.countText })
   await reset()
 
   // ---- case 4: is NULL, which no text operand can express ----------------
-  const nulls = await runSearch('note', 'isNull', undefined)
+  const nulls = await runSearch('isnull', 'note', 'isNull', undefined)
   check('is NULL returned exactly the two NULL rows', nulls.rows.length === 2, nulls.rows)
   await reset()
 
@@ -299,6 +315,24 @@ try {
   console.log(`\n${checks.length - failed.length}/${checks.length} checks passed`)
   if (failed.length > 0) process.exitCode = 1
 } finally {
+  /*
+   * Delete the data sources this run created.
+   *
+   * Matched by PREFIX, not by the bare run name: each case appends its own tag, so
+   * an equality test finds none of them and leaves them in the user's
+   * configuration. The prefix is this run's unique source name, so nothing else
+   * can match.
+   */
+  try {
+    const origin = baseUrl.replace(/\/\?.*$/, '')
+    const sources = await (await fetch(`${origin}/api/dsh-database/sources`)).json()
+    for (const source of sources.sources.filter(entry => entry.name.startsWith(SOURCE_NAME))) {
+      await fetch(`${origin}/api/dsh-database/sources/${encodeURIComponent(source.id)}`, { method: 'DELETE' })
+      console.error(`note: removed the run's data source (${source.id})`)
+    }
+  } catch (error) {
+    console.error(`note: the run's data sources could not be removed: ${error instanceof Error ? error.message : String(error)}`)
+  }
   try { socket?.close() } catch { /* gone */ }
   child.kill()
   await wait(1000)

@@ -1,20 +1,3 @@
-/**
- * End-to-end browser check of the editing surfaces this plugin gained.
- *
- * The unit and driver tests prove the SQL is right. What they cannot prove is
- * that the panel WIRES the gestures up: that a double-click opens an editor, that
- * a lost focus saves, that a checkbox selects a row, that the sort mark appears
- * where the header was clicked, and that a schema change arrives in the grid.
- * Those are DOM-event questions, so they are answered in a real browser with real
- * mouse and keyboard events over CDP.
- *
- * The script drives a live dsh web UI and asserts on the SERVER'S state where a
- * write is involved — after editing a cell it re-reads the database file through
- * the API, so a panel that showed "saved" without saving fails.
- *
- * Usage: node scripts/e2e-sql-editing.mjs <baseUrl-with-token> <sqliteFile>
- */
-
 import { spawn } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -22,8 +5,42 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { WebSocket } from 'ws'
 
+/**
+ * End-to-end check of the SQL panel's editing surfaces, in a real browser.
+ *
+ * The unit and driver tests prove the SQL is right. What they cannot prove is
+ * that the panel WIRES the gestures up: that a double-click opens an editor, that
+ * a lost focus saves, that a checkbox selects a row, that the sort control offers
+ * each index in both directions, and that a schema change arrives in the grid.
+ * Those are DOM-event questions, so they are answered here, with real mouse and
+ * keyboard events over CDP, and every write is verified by RE-READING THE SERVER
+ * — a panel that showed "saved" without saving must fail.
+ *
+ * Two escaping hazards live in this file, and both have already cost time:
+ *
+ * 1. The page code is a template literal in THIS module, so a backslash inside a
+ *    regex literal is consumed by the outer string: \s arrives as plain s. Use
+ *    plain string methods, or a RegExp constructor with a doubled backslash.
+ * 2. A dollar sign in the page code is only safe when not followed by a brace.
+ *    Avoid both where possible; build URLs by concatenation.
+ *
+ * Run node --check AND scripts/check-template-literals.mjs after editing.
+ *
+ * Usage: node scripts/e2e-sql-editing.mjs <baseUrl-with-token> <sqliteFile>
+ */
+
 const EDGE = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
 const DEBUG_PORT = 9341
+/**
+ * The data source name this run creates, unique per run.
+ *
+ * Unique because the script resolves its source back BY NAME to run the API-side
+ * assertions, and a fixed name made every earlier run resolve to the FIRST match —
+ * a source pointing at an older database file than the one just seeded. Every
+ * "verified against the server" claim was then reading the wrong database. The
+ * tag also makes the run's own leftovers identifiable.
+ */
+const SOURCE_NAME = `E2E Edit ${process.pid}`
 
 const baseUrl = process.argv[2]
 const sqliteFile = process.argv[3]
@@ -32,7 +49,7 @@ if (baseUrl === undefined || sqliteFile === undefined) {
   process.exit(2)
 }
 
-/** Helpers injected into every evaluated snippet. */
+/** Helpers injected into the page. */
 const PRELUDE = `
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const byText = (sel, text) =>
@@ -48,11 +65,16 @@ const waitFor = async (fn, ms) => {
     await sleep(120);
   }
 };
+/** Set a controlled input's value so React's onChange sees it. */
 const setInput = (el, value) => {
   const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement : HTMLInputElement;
-  const setter = Object.getOwnPropertyDescriptor(proto.prototype, 'value').set;
-  setter.call(el, value);
+  Object.getOwnPropertyDescriptor(proto.prototype, 'value').set.call(el, value);
   el.dispatchEvent(new Event('input', { bubbles: true }));
+};
+/** Set a select's value so React's onChange sees it. */
+const setSelect = (el, value) => {
+  Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(el, value);
+  el.dispatchEvent(new Event('change', { bubbles: true }));
 };
 const click = (el) => { el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); el.click(); };
 const dblclick = (el) => {
@@ -62,12 +84,12 @@ const dblclick = (el) => {
   el.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
 };
 /**
- * Take focus away from an element the way a user does.
+ * Take focus away the way a user does: move it to a DIFFERENT element.
  *
- * Moving real focus is the whole point. A synthetic blur or focusout event
- * does NOT update document.activeElement, and measured, the panel sent no
- * request for one while the real gesture saves — so a handler approximated that
- * way reports a product bug that does not exist.
+ * Moving real focus is the whole point. A synthetic blur or focusout event does
+ * NOT update document.activeElement, and measured, the panel sent no request for
+ * one while the real gesture saves — so an approximated handler reports a product
+ * bug that does not exist.
  */
 const blur = (el) => {
   el.focus();
@@ -79,16 +101,9 @@ const blur = (el) => {
   away.focus();
   away.remove();
 };
-/** A cell of the browse grid, located by its data attribute. */
+/** A browse-grid cell, located by its data attribute. */
 const cellAt = (row, column) => document.querySelector('[data-dbm-cell="' + row + ':' + column + '"]');
-/**
- * Call the plugin's own API from the page.
- *
- * It reports a non-OK response as a thrown error rather than returning a body
- * with no fields: a 401 or 404 body has no page field, and the resulting
- * "Cannot read properties of undefined" would point at the assertion instead of
- * at the request that actually failed.
- */
+/** Call the plugin's API, reporting a non-OK response as a thrown error. */
 const api = async (path) => {
   const response = await fetch(path);
   const body = await response.json().catch(() => null);
@@ -97,104 +112,14 @@ const api = async (path) => {
   }
   return body;
 };
-/**
- * The data source this run created, by id.
- *
- * Looked up by NAME and failing loudly when it is absent: falling back to the
- * first source would silently run the later assertions against a different
- * database, which is the failure mode that makes an E2E result worse than none.
- */
-const resolveSource = async () => {
-  const body = await api('/api/dsh-database/sources');
-  const found = body.sources.find((s) => s.name === 'E2E Edit');
-  if (!found) throw new Error('the E2E data source is missing; an earlier step did not create it');
-  return found.id;
-};
 `
-
-/** Seed the SQLite file with the tables the flow needs. */
-function seed(file) {
-  const db = new DatabaseSync(file)
-  db.exec('DROP TABLE IF EXISTS people')
-  db.exec('DROP TABLE IF EXISTS notes')
-  db.exec(
-    'CREATE TABLE people (' +
-    '  id INTEGER PRIMARY KEY AUTOINCREMENT,' +
-    '  name TEXT NOT NULL,' +
-    '  age INTEGER,' +
-    '  active BOOLEAN DEFAULT 1,' +
-    '  joined DATE,' +
-    "  bio TEXT," +
-    "  kind TEXT DEFAULT 'user'" +
-    ')',
-  )
-  db.exec("INSERT INTO people(name, age, active, joined, bio, kind) VALUES ('alice', 30, 1, '2024-01-05', 'first', 'user')")
-  db.exec("INSERT INTO people(name, age, active, joined, bio, kind) VALUES ('bob', 40, 0, '2024-02-06', NULL, 'admin')")
-  db.exec("INSERT INTO people(name, age, active, joined, bio, kind) VALUES ('carol', 50, 1, '2024-03-07', 'third; ok', 'user')")
-  /*
-   * Enough rows that a second page EXISTS at the page sizes the panel offers.
-   *
-   * The smallest size is 50, so a table of three rows has one page — and a
-   * go-to-page control cannot be verified against a single-page table: the
-   * assertion would pass whether or not the jump worked.
-   */
-  const insert = db.prepare('INSERT INTO people(name, age, active, joined, bio, kind) VALUES (?, ?, 1, ?, NULL, ?)')
-  for (let n = 0; n < 60; n++) insert.run(`filler${String(n).padStart(3, '0')}`, 20 + n, '2024-04-01', 'user')
-  db.exec('CREATE INDEX idx_people_name ON people(name)')
-  // A table with no primary key, to prove row editing and batch delete are
-  // refused there rather than silently acting on the wrong rows.
-  db.exec('CREATE TABLE notes(body TEXT, tag TEXT)')
-  db.exec("INSERT INTO notes VALUES ('n1', 'x'), ('n2', 'y')")
-  db.close()
-}
-
-/** Read the database file directly, so a write is verified at the source. */
-function readAll(file, table) {
-  const db = new DatabaseSync(file)
-  const rows = db.prepare(`SELECT * FROM ${table}`).all()
-  db.close()
-  return rows.map(row => ({ ...row }))
-}
-
-/** Launch headless Edge with a fresh profile. */
-function launchBrowser() {
-  const profile = mkdtempSync(join(tmpdir(), 'dbm-e2e-'))
-  const child = spawn(EDGE, [
-    `--remote-debugging-port=${DEBUG_PORT}`,
-    `--user-data-dir=${profile}`,
-    '--headless=new',
-    '--disable-gpu',
-    '--no-first-run',
-    '--no-default-browser-check',
-    '--disable-features=msEdgeSidebarV2',
-    'about:blank',
-  ], { stdio: 'ignore' })
-  return { child, profile }
-}
+void PRELUDE
 
 /**
- * The DevTools websocket for a PAGE target.
+ * The browser launcher, debugger lookup and CDP session.
  *
- * Not the /json/version endpoint, which is the BROWSER level: it accepts no
- * Page.* command at all ("Page.enable was not found"), so a session opened
- * against it cannot navigate or evaluate anything.
+ * Kept outside the flow so the flow stays about the panel.
  */
-async function debuggerUrl() {
-  for (let attempt = 0; attempt < 80; attempt++) {
-    try {
-      const response = await fetch(`http://127.0.0.1:${DEBUG_PORT}/json/list`)
-      const targets = await response.json()
-      const page = targets.find(target => target.type === 'page' && typeof target.webSocketDebuggerUrl === 'string')
-      if (page !== undefined) return page.webSocketDebuggerUrl
-    } catch {
-      /* not up yet */
-    }
-    await new Promise(resolve => setTimeout(resolve, 250))
-  }
-  throw new Error('the debugger endpoint never came up')
-}
-
-/** A minimal CDP session: send a command and await its reply. */
 class Session {
   constructor(socket) {
     this.socket = socket
@@ -219,13 +144,8 @@ class Session {
     })
   }
 
-  /** Evaluate an expression in the page and return its JSON value. */
   async evaluate(expression) {
-    const result = await this.send('Runtime.evaluate', {
-      expression,
-      awaitPromise: true,
-      returnByValue: true,
-    })
+    const result = await this.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true })
     if (result.exceptionDetails !== undefined) {
       throw new Error(`page threw: ${result.exceptionDetails.exception?.description ?? result.exceptionDetails.text}`)
     }
@@ -234,168 +154,269 @@ class Session {
 }
 
 /**
- * The whole flow, run as one awaited promise inside the page.
+ * Seed the SQLite file the flow drives.
  *
- * A module-level template literal rather than an inline argument: this module
- * substitutes the dollar-brace form here (the SQLite path), while what the page
- * compute itself is plain script, so the two cannot be confused.
+ * Enough rows that a second page EXISTS at the smallest page size (50): a
+ * go-to-page control cannot be verified against a single-page table.
+ */
+function seed(file) {
+  const db = new DatabaseSync(file)
+  db.exec('DROP TABLE IF EXISTS people')
+  db.exec('DROP TABLE IF EXISTS notes')
+  db.exec(
+    'CREATE TABLE people (' +
+    '  id INTEGER PRIMARY KEY AUTOINCREMENT,' +
+    '  name TEXT NOT NULL,' +
+    '  age INTEGER,' +
+    '  active BOOLEAN DEFAULT 1,' +
+    '  joined DATE,' +
+    '  bio TEXT,' +
+    "  kind TEXT DEFAULT 'user'" +
+    ')',
+  )
+  db.exec("INSERT INTO people(name, age, active, joined, bio, kind) VALUES ('alice', 30, 1, '2024-01-05', 'first', 'user')")
+  db.exec("INSERT INTO people(name, age, active, joined, bio, kind) VALUES ('bob', 40, 0, '2024-02-06', NULL, 'admin')")
+  db.exec("INSERT INTO people(name, age, active, joined, bio, kind) VALUES ('carol', 50, 1, '2024-03-07', 'third ok', 'user')")
+  const insert = db.prepare('INSERT INTO people(name, age, active, joined, bio, kind) VALUES (?, ?, 1, ?, NULL, ?)')
+  for (let n = 0; n < 60; n++) insert.run(`filler${String(n).padStart(3, '0')}`, 20 + n, '2024-04-01', 'user')
+  db.exec('CREATE INDEX idx_people_name ON people(name)')
+  // A table with no primary key, to prove row editing and batch delete are
+  // refused there rather than acting on the wrong rows.
+  db.exec('CREATE TABLE notes(body TEXT, tag TEXT)')
+  db.exec("INSERT INTO notes VALUES ('n1', 'x'), ('n2', 'y')")
+  db.close()
+}
+
+/** Launch headless Edge with a throwaway profile. */
+function launchBrowser() {
+  const profile = mkdtempSync(join(tmpdir(), 'dbm-e2e-'))
+  const child = spawn(EDGE, [
+    `--remote-debugging-port=${DEBUG_PORT}`,
+    `--user-data-dir=${profile}`,
+    '--headless=new',
+    '--disable-gpu',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-features=msEdgeSidebarV2',
+    'about:blank',
+  ], { stdio: 'ignore' })
+  return { child, profile }
+}
+
+/**
+ * The DevTools websocket for a PAGE target.
+ *
+ * Not the /json/version endpoint, which is the BROWSER level: it accepts no
+ * Page.* command at all, so a session opened against it cannot navigate.
+ */
+async function debuggerUrl() {
+  for (let attempt = 0; attempt < 80; attempt++) {
+    try {
+      const list = await (await fetch(`http://127.0.0.1:${DEBUG_PORT}/json/list`)).json()
+      const page = list.find(entry => entry.type === 'page' && typeof entry.webSocketDebuggerUrl === 'string')
+      if (page !== undefined) return page.webSocketDebuggerUrl
+    } catch {
+      /* not up yet */
+    }
+    await new Promise(resolve => setTimeout(resolve, 250))
+  }
+  throw new Error('the debugger endpoint never came up')
+}
+
+/**
+ * The page-side flow, as one awaited promise.
+ *
+ * A module-level template literal so this module substitutes the SQLite path
+ * while everything the page computes stays plain script. The report's failures
+ * list is the verdict: the process exits non-zero when it is non-empty.
  */
 const FLOW = `(async () => {
 ${PRELUDE}
   const report = { steps: [], failures: [] };
   const step = (name, detail) => report.steps.push({ name, detail: detail === undefined ? null : detail });
   const fail = (name, detail) => report.failures.push({ name, detail });
-
-  /** Assert a condition, recording the outcome instead of throwing. */
   const check = (name, ok, detail) => { if (ok) step(name, detail); else fail(name, detail); };
 
   try {
-    // ---- reach the panel and create the data source ------------------------
+    const sqlitePath = ${JSON.stringify(sqliteFile)};
+
+    // ---- open the panel and create the data source ------------------------
     const row = await waitFor(
       () => Array.from(document.querySelectorAll('nav button[aria-label]'))
         .find((b) => ['数据库管理', 'Database'].includes((b.getAttribute('aria-label') || '').trim())),
       20000,
     );
-    if (!row) return JSON.stringify({ ...report, fatal: 'sidebar row never rendered' });
+    if (!row) { fail('the sidebar row never rendered'); return JSON.stringify(report, null, 2); }
     click(row);
     if (!(await waitFor(() => document.querySelector('.dbm-root'), 10000))) {
-      return JSON.stringify({ ...report, fatal: 'panel did not mount' });
+      fail('the panel did not mount after clicking the row');
+      return JSON.stringify(report, null, 2);
     }
+    step('panel mounted');
 
     const newBtn = await waitFor(() => byIncludes('.dbm-btn', '新增数据库') || byIncludes('.dbm-btn', 'New database'), 5000);
+    if (!newBtn) { fail('no New database button'); return JSON.stringify(report, null, 2); }
     click(newBtn);
     const modal = await waitFor(() => document.querySelector('.dbm-modal'), 5000);
+    if (!modal) { fail('the create dialog did not open'); return JSON.stringify(report, null, 2); }
     const inputs = Array.from(modal.querySelectorAll('input.dbm-input'));
-    const sqlitePath = ${JSON.stringify(sqliteFile)};
-    setInput(inputs[0], 'E2E Edit');
+    setInput(inputs[0], ${JSON.stringify(SOURCE_NAME)});
     setInput(inputs.find((i) => (i.getAttribute('placeholder') || '').includes('D:/data')), sqlitePath);
     await sleep(200);
     click(byText('.dbm-modal-foot .dbm-btn', '保存') || byText('.dbm-modal-foot .dbm-btn', 'Save'));
 
-    const listed = await waitFor(() => byIncludes('.dbm-table td', 'E2E Edit'), 10000);
-    if (!listed) return JSON.stringify({ ...report, fatal: 'created source not listed' });
+    const listed = await waitFor(() => byIncludes('.dbm-table td', ${JSON.stringify(SOURCE_NAME)}), 10000);
+    if (!listed) { fail('the created source is not listed'); return JSON.stringify(report, null, 2); }
 
-    // The id the later API assertions read, resolved by name so it cannot silently
-    // point at somebody else's data source.
-    const sourceId = await resolveSource();
+    /*
+     * The id the API assertions read, resolved by this run's UNIQUE name.
+     *
+     * Exactly one match is required. Falling back to the first entry with a
+     * matching name is what silently ran earlier runs' assertions against an older
+     * database file — the failure mode that makes an E2E result worse than none.
+     */
+    const sources = await api('/api/dsh-database/sources');
+    const matches = sources.sources.filter((s) => s.name === ${JSON.stringify(SOURCE_NAME)});
+    if (matches.length !== 1) {
+      fail('the data source of this run did not resolve to exactly one entry', matches.map((s) => s.id + ' -> ' + s.file));
+      return JSON.stringify(report, null, 2);
+    }
+    const sourceId = matches[0].id;
+    // The file it points at must be the one THIS run seeded, or the assertions
+    // below would be about a different database.
+    report.sourceFile = matches[0].file;
+    if (matches[0].file !== sqlitePath) {
+      fail('the resolved source points at a different file than the seeded one', { expected: sqlitePath, actual: matches[0].file });
+      return JSON.stringify(report, null, 2);
+    }
     step('resolved the source id', sourceId);
 
-    // ---- requirement 2: the group name is a column of the list -------------
+    // ---- requirement 2: the group name is a column of the list -----------
     report.listHeaders = Array.from(document.querySelectorAll('.dbm-table thead th')).map((th) => th.textContent.trim());
-    check('list shows a 分组 column', report.listHeaders.some((h) => h === '分组' || h === 'Group'), report.listHeaders);
+    check('the list shows a 分组 column', report.listHeaders.includes('分组') || report.listHeaders.includes('Group'), report.listHeaders);
 
-    // ---- requirement 3: the engine line is gone from the header ------------
+    // ---- requirement 3: the engine line is gone from the header ----------
     const header = document.querySelector('.dbm-header');
-    check('header no longer spells out the engines', !/引擎|Engines/.test(header.textContent), header.textContent.trim());
+    check('the header no longer spells out the engines', !header.textContent.includes('引擎') && !header.textContent.includes('Engines'), header.textContent.trim());
 
-    // ---- connect -----------------------------------------------------------
+    // ---- connect ---------------------------------------------------------
     const connectBtn = Array.from(listed.closest('tr').querySelectorAll('.dbm-actions .dbm-btn'))
       .find((b) => ['连接', 'Connect'].includes(b.textContent.trim()));
-    if (!connectBtn) return JSON.stringify({ ...report, fatal: 'no Connect button on the created row' });
+    if (!connectBtn) { fail('no Connect button on the created row'); return JSON.stringify(report, null, 2); }
     click(connectBtn);
-    step('connect clicked');
 
     const peopleRow = await waitFor(() => byIncludes('.dbm-side-body .dbm-tree-item', 'people'), 15000);
     if (!peopleRow) {
-      const err = document.querySelector('.dbm-error');
-      return JSON.stringify({ ...report, fatal: 'table tree never appeared', error: err ? err.textContent : null });
+      fail('the table tree never appeared', (document.querySelector('.dbm-error') || {}).textContent);
+      return JSON.stringify(report, null, 2);
     }
     click(peopleRow);
 
-    // ---- requirement 4 + 7: the browse grid, its row actions and in-cell edit
-    const grid = await waitFor(() => document.querySelector('.dbm-data'), 10000);
+    // ---- requirement 4 + 7: the browse grid ------------------------------
+    const grid = await waitFor(() => document.querySelector('.dbm-data'), 12000);
     if (!grid) {
-      const err = document.querySelector('.dbm-error');
-      return JSON.stringify({ ...report, fatal: 'browse grid never rendered', error: err ? err.textContent : null });
+      fail('the browse grid never rendered', (document.querySelector('.dbm-error') || {}).textContent);
+      return JSON.stringify(report, null, 2);
     }
     step('browse grid rendered');
     report.gridHeaders = Array.from(document.querySelectorAll('.dbm-data thead th')).map((th) => th.textContent.trim());
-    check('grid has an actions column', report.gridHeaders.includes('操作') || report.gridHeaders.includes('Actions'), report.gridHeaders);
-    check('grid has a select column', document.querySelector('.dbm-data td.dbm-select-col') !== null ||
-      document.querySelector('.dbm-data thead th.dbm-select-col') !== null);
+    check('the grid has an actions column', report.gridHeaders.includes('操作') || report.gridHeaders.includes('Actions'), report.gridHeaders);
+    check('the grid has a select column', document.querySelector('.dbm-data th.dbm-select-col') !== null);
 
-    // requirement 6: the sort mark is smaller than the header text
+    // ---- requirement 6: the sort mark is smaller than the header ---------
     const sortButton = byIncludes('.dbm-data thead th button', 'name');
-    if (sortButton) {
+    if (!sortButton) {
+      fail('no sortable header button found');
+    } else {
       click(sortButton);
       const mark = await waitFor(() => sortButton.querySelector('.dbm-sort-mark'), 5000);
-      if (mark) {
+      if (!mark) {
+        fail('the sort mark never appeared after clicking the header');
+      } else {
         const markSize = parseFloat(getComputedStyle(mark).fontSize);
         const headerSize = parseFloat(getComputedStyle(sortButton).fontSize);
-        check('sort mark is smaller than the header', markSize < headerSize, { markSize, headerSize });
-      } else {
-        fail('sort mark never appeared after clicking the header');
+        check('the sort mark is smaller than the header', markSize < headerSize, { markSize, headerSize });
       }
-    } else {
-      fail('no sortable header button found');
     }
 
-    // requirement 5: sort by an index
-    const sortSelect = Array.from(document.querySelectorAll('.dbm-toolbar .dbm-select, .dbm-row .dbm-select'))
-      .find((s) => Array.from(s.options).some((o) => /idx_people_name|按主键排序|Sort by key/.test(o.textContent)));
-    if (sortSelect) {
-      const indexOption = Array.from(sortSelect.options).find((o) => o.textContent.includes('idx_people_name'));
-      check('the index is offered as a sort', indexOption !== undefined, Array.from(sortSelect.options).map((o) => o.textContent.trim()));
-      if (indexOption) {
-        const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
-        setter.call(sortSelect, indexOption.value);
-        sortSelect.dispatchEvent(new Event('change', { bubbles: true }));
-        await sleep(800);
-        const names = Array.from(document.querySelectorAll('.dbm-data tbody tr')).map((tr) => (tr.textContent || '').trim());
-        check('rows came back after sorting by the index', names.length > 0, names.length);
-      }
+    // ---- requirement 5: sort by an index, both directions as entries -----
+    const sortSelect = Array.from(document.querySelectorAll('.dbm-row .dbm-select'))
+      .find((s) => Array.from(s.options).some((o) => o.textContent.includes('idx_people_name')));
+    if (!sortSelect) {
+      fail('no index sort control found', Array.from(document.querySelectorAll('.dbm-row .dbm-select')).map((s) => Array.from(s.options).map((o) => o.textContent.trim())));
     } else {
-      fail('no index sort control found');
+      const labels = Array.from(sortSelect.options).map((o) => o.textContent.trim());
+      report.sortOptions = labels;
+      const ascEntry = labels.find((l) => l.startsWith('idx_people_name (') && (l.includes('递增') || l.toLowerCase().includes('asc')));
+      const descEntry = labels.find((l) => l.startsWith('idx_people_name (') && (l.includes('递减') || l.toLowerCase().includes('desc')));
+      check('the index is offered in both directions', ascEntry !== undefined && descEntry !== undefined, labels);
+      check('the primary key is offered first', (labels[0] || '').startsWith('PRIMARY ('), labels[0]);
+      check('「无」 is the last entry', ['无', 'None'].includes(labels[labels.length - 1] || ''), labels[labels.length - 1]);
+      // A separate direction toggle is what was asked to be removed: with both
+      // directions in the list there is nothing left for one to do.
+      const directionButtons = Array.from(document.querySelectorAll('.dbm-row .dbm-btn'))
+        .map((b) => (b.textContent || '').trim())
+        .filter((text) => ['递增', '递减', '升序', '降序', 'asc', 'desc'].includes(text));
+      check('no separate direction button remains', directionButtons.length === 0, directionButtons);
+
+      // Read the grid's first cell, whatever the sort produced.
+      const firstCell = async () => {
+        await sleep(900);
+        const tr = document.querySelector('.dbm-data tbody tr');
+        return tr === null ? null : (tr.textContent || '').trim();
+      };
+      const ascOption = Array.from(sortSelect.options).find((o) => o.textContent.trim() === ascEntry);
+      setSelect(sortSelect, ascOption.value);
+      const ascFirst = await firstCell();
+      const descOption = Array.from(sortSelect.options).find((o) => o.textContent.trim() === descEntry);
+      setSelect(sortSelect, descOption.value);
+      const descFirst = await firstCell();
+      report.sortOrders = { ascFirst, descFirst };
+      check('ascending and descending give different first rows', ascFirst !== null && descFirst !== null && ascFirst !== descFirst, report.sortOrders);
     }
 
-    // requirement 7: double-click a cell, edit it, blur, and verify the SERVER
-    /*
-     * alice's OWN row, found by her value rather than by position.
-     *
-     * The grid may be sorted by the index from the previous step, so row 0 is
-     * not a fixed row: editing "whatever is first" would make the assertion
-     * depend on the sort order instead of on the edit.
-     */
-    const aliceRow = Array.from(document.querySelectorAll('.dbm-data tbody tr'))
+    // ---- requirement 7: double-click a cell, edit, blur, verify SERVER ---
+    // alice's OWN row, found by her value: the grid may be sorted, so row 0 is
+    // not a fixed row.
+    const aliceIndex = Array.from(document.querySelectorAll('.dbm-data tbody tr'))
       .findIndex((tr) => (tr.textContent || '').includes('alice'));
-    const target = aliceRow === -1 ? null : cellAt(aliceRow, 'name');
+    const target = aliceIndex === -1 ? null : cellAt(aliceIndex, 'name');
     if (!target) {
       fail('no editable cell found for alice');
     } else {
       dblclick(target);
       const editor = await waitFor(() => document.querySelector('.dbm-data input.dbm-cell-input'), 5000);
       if (!editor) {
-        fail('double-click did not open an editor');
+        fail('the double-click did not open an editor');
       } else {
-        step('double-click opened an in-cell editor', editor.value);
-        // Record every write the panel attempts, so a missing save can be told
-        // apart from a save that reached the wrong place.
+        step('the double-click opened an in-cell editor', editor.value);
+        setInput(editor, 'alice-edited');
+        // Record the writes the panel attempts, so a missing save can be told
+        // apart from one that went somewhere else.
         report.editTraffic = [];
         const originalFetch = window.fetch;
         window.fetch = function (input, init) {
-          const url = String(input);
           if (init && init.method && init.method !== 'GET') {
-            report.editTraffic.push({ url: url.split('/api/dsh-database/')[1], method: init.method, body: String(init.body || '') });
+            report.editTraffic.push(init.method + ' ' + String(input).split('/api/dsh-database/')[1]);
           }
           return originalFetch.apply(this, arguments);
         };
-        setInput(editor, 'alice-edited');
-        report.editorValueAfterTyping = editor.value;
         blur(editor);
         await sleep(1500);
         window.fetch = originalFetch;
-        report.cellInputPresent = document.querySelector('.dbm-data input.dbm-cell-input') !== null;
-        // Why the save did not happen: the panel reports the reason it refused.
-        report.editErrors = Array.from(document.querySelectorAll('.dbm-error')).map((el) => el.textContent.trim());
-        report.editNotices = Array.from(document.querySelectorAll('.dbm-ok')).map((el) => el.textContent.trim());
-        // The row the editor belonged to, and the key the panel holds for it.
-        report.primaryKeySeen = (await api('/api/dsh-database/sources/' + sourceId + '/rows?table=people&page=1&pageSize=1&mode=browse')).page.primaryKey;
-        report.afterEdit = (await api(\`/api/dsh-database/sources/\${sourceId}/rows?table=people&page=1&pageSize=200&mode=browse\`)).page.rows.map((r) => r.name);
-        check('the edited cell reached the server', report.afterEdit.includes('alice-edited'), report.afterEdit);
+        // Polled: the write and the re-read are two round trips.
+        let names = [];
+        for (let attempt = 0; attempt < 25; attempt++) {
+          names = (await api('/api/dsh-database/sources/' + sourceId + '/rows?table=people&page=1&pageSize=200&mode=browse')).page.rows.map((r) => r.name);
+          if (names.includes('alice-edited')) break;
+          await sleep(300);
+        }
+        report.afterEdit = names;
+        check('the edited cell reached the server', names.includes('alice-edited'), { traffic: report.editTraffic, rows: names.length });
       }
     }
 
-    // requirement 4: multi-select and the batch bar
+    // ---- requirement 4: multi-select and the batch bar -------------------
     const boxes = Array.from(document.querySelectorAll('.dbm-data td.dbm-select-col input[type=checkbox]'));
     check('every row has a selection checkbox', boxes.length >= 3, boxes.length);
     if (boxes.length >= 2) {
@@ -405,59 +426,36 @@ ${PRELUDE}
       check('the batch bar appears with a selection', bar !== null, bar ? bar.textContent.trim() : null);
     }
 
-    // requirement 4: page jump
+    // ---- requirement 4: go to a page by number ---------------------------
     const jump = document.querySelector('[data-dbm-page-jump]');
     check('the pager has a go-to-page field', jump !== null);
     if (jump) {
-      // The 50-row page size, because the smallest offered size leaves the seeded
-      // table with more than one page - a jump cannot be verified on one page.
       const sizeSelect = Array.from(document.querySelectorAll('.dbm-row .dbm-select'))
         .find((s) => Array.from(s.options).some((o) => o.value === '50'));
-      if (sizeSelect) {
-        const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
-        setter.call(sizeSelect, '50');
-        sizeSelect.dispatchEvent(new Event('change', { bubbles: true }));
+      if (!sizeSelect) {
+        fail('no page-size select found to make a second page');
+      } else {
+        setSelect(sizeSelect, '50');
         await sleep(1000);
         report.pagerText = document.querySelector('.dbm-pager').textContent.trim();
         setInput(jump, '2');
         jump.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
         await sleep(1200);
         report.afterJump = document.querySelector('.dbm-pager').textContent.trim();
-        /*
-         * Built with RegExp rather than a literal on purpose.
-         *
-         * This page code travels inside a template literal, so a backslash in a
-         * regex LITERAL is consumed by the outer string and the pattern silently
-         * changes meaning ("第s*2" instead of "第\\s*2"). A constructor takes a
-         * plain string, where the escaping is unambiguous.
-         */
-        check('the jump moved to page 2', new RegExp('第\\\\s*2\\\\s*/|Page\\\\s*2\\\\s*/').test(report.afterJump), report.afterJump);
+        check('the jump moved to page 2', report.afterJump.includes('第 2') || report.afterJump.includes('Page 2'), report.afterJump);
         // An out-of-range page is refused with the range, not silently clamped.
         setInput(jump, '999');
         jump.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
         await sleep(600);
         const rangeError = Array.from(document.querySelectorAll('.dbm-cell-failed')).map((el) => el.textContent.trim());
         check('an out-of-range page is refused with the range', rangeError.length > 0, rangeError);
-      } else {
-        fail('no page-size select found to make a second page');
       }
     }
 
-    /*
-     * The 搜索 tab is verified by 'e2e-sql-search.mjs' instead.
-     *
-     * Its form is a controlled input, and setting one via the native value setter
-     * plus a synthetic 'input' event leaves the DOM correct while React state stays
-     * empty — measured, the form then refuses a condition that looks filled in.
-     * That script types with 'Input.insertText', which goes through the browser and
-     * cannot be approximated wrongly, and it asserts what the SERVER returned for a
-     * substring, a wildcard character and an injection-shaped value.
-     */
-    report.searchVerifiedBy = "e2e-sql-search.mjs";
-    // requirement 10: the insert tab gives per-type controls
+    // ---- requirement 10: the insert tab gives per-type controls ----------
     const insertTab = byText('.dbm-tab', '插入') || byText('.dbm-tab', 'Insert');
     click(insertTab);
-    await sleep(900);
+    await sleep(1200);
     const kindInput = document.querySelector('[data-dbm-insert-for$=":kind"]');
     const joinedInput = document.querySelector('[data-dbm-insert-for$=":joined"]');
     const activeInput = document.querySelector('[data-dbm-insert-for$=":active"]');
@@ -466,9 +464,8 @@ ${PRELUDE}
       joined: joinedInput ? joinedInput.tagName + (joinedInput.type ? ':' + joinedInput.type : '') : null,
       active: activeInput ? activeInput.tagName + (activeInput.type ? ':' + activeInput.type : '') : null,
     };
-    // SQLite has no enum type: the members exist only on MySQL, which reports
-    // them on the wire, so the expected control differs by engine rather than
-    // being skipped.
+    // SQLite has no enum type: its members exist only on MySQL, which reports
+    // them on the wire, so the expected control differs by engine.
     if (report.insertControls.kind !== null && report.insertControls.kind.startsWith('SELECT')) {
       step('an enum column gets a select', report.insertControls.kind);
     } else {
@@ -477,77 +474,76 @@ ${PRELUDE}
     check('a date column gets a date input', report.insertControls.joined === 'INPUT:date', report.insertControls);
     check('a boolean column gets a select', report.insertControls.active !== null && report.insertControls.active.startsWith('SELECT'), report.insertControls);
 
-    // Insert a row through the form, then verify the server has it.
     const nameInput = document.querySelector('[data-dbm-insert-for$=":name"]');
-    if (nameInput) {
+    if (!nameInput) {
+      fail('the insert form has no name field');
+    } else {
       setInput(nameInput, 'inserted-by-form');
-      const ageInput = document.querySelector('[data-dbm-insert-for$=":age"]');
-      setInput(ageInput, '7');
-      // Two buttons both start with 插入 (插入 / 插入并再填一行), so the FIRST
-      // one is chosen by its exact text.
+      setInput(document.querySelector('[data-dbm-insert-for$=":age"]'), '7');
+      // Two buttons both start with 插入, so the first is picked by exact text.
       const insertBtn = byText('.dbm-tab-body .dbm-btn', '插入') || byText('.dbm-tab-body .dbm-btn', 'Insert');
       if (!insertBtn) fail('no insert button');
       else click(insertBtn);
       await sleep(2200);
       report.insertNotice = (document.querySelector('.dbm-ok') || {}).textContent || null;
-      // Polled: the write and the re-read are separate round trips, so a single
-      // read races the commit and would report a correct insert as lost.
       let afterInsert = [];
       for (let attempt = 0; attempt < 25; attempt++) {
-        afterInsert = (await api(\`/api/dsh-database/sources/\${sourceId}/rows?table=people&page=1&pageSize=200&mode=browse\`)).page.rows.map((r) => r.name);
+        afterInsert = (await api('/api/dsh-database/sources/' + sourceId + '/rows?table=people&page=1&pageSize=200&mode=browse')).page.rows.map((r) => r.name);
         if (afterInsert.includes('inserted-by-form')) break;
         await sleep(300);
       }
-      report.afterInsert = afterInsert;
+      report.afterInsert = afterInsert.length;
       check('the form insert reached the server', afterInsert.includes('inserted-by-form'), afterInsert.length);
-    } else {
-      fail('the insert form has no name field');
     }
 
-    // requirement 8: the structure tab
+    // ---- requirement 8: the structure tab --------------------------------
     const structureTab = byText('.dbm-tab', '结构') || byText('.dbm-tab', 'Structure');
     click(structureTab);
-    await sleep(1200);
+    await sleep(1400);
     const addColumn = await waitFor(() => byIncludes('.dbm-btn', '新增列') || byIncludes('.dbm-btn', 'Add column'), 5000);
     check('the structure tab offers adding a column', addColumn !== null);
     check('the structure tab offers editing the key', (byIncludes('.dbm-btn', '编辑主键') || byIncludes('.dbm-btn', 'Edit key')) !== null);
     check('the structure tab offers adding an index', (byIncludes('.dbm-btn', '新增索引') || byIncludes('.dbm-btn', 'Add index')) !== null);
     check('the structure tab offers a distinct count per column', (byIncludes('.dbm-link', '非重复值') || byIncludes('.dbm-link', 'Distinct')) !== null);
+    check('the structure tab offers dropping a column', (byIncludes('.dbm-btn', '删除') || byIncludes('.dbm-btn', 'Drop')) !== null);
 
     if (addColumn) {
       click(addColumn);
       const editor = await waitFor(() => document.querySelector('.dbm-struct-editor'), 5000);
-      if (editor) {
-        step('the add-column editor opened');
-        const nameField = editor.querySelector('input.dbm-input');
-        setInput(nameField, 'added_col');
-        click(byIncludes('.dbm-struct-editor .dbm-btn', '新增') || byIncludes('.dbm-struct-editor .dbm-btn', 'Add'));
-        await sleep(1800);
-        report.afterAddColumn = (await api(\`/api/dsh-database/sources/\${sourceId}/columns?table=people\`)).columns.map((c) => c.name);
-        check('the added column reached the server', report.afterAddColumn.includes('added_col'), report.afterAddColumn);
-      } else {
+      if (!editor) {
         fail('the add-column editor did not open');
+      } else {
+        step('the add-column editor opened');
+        setInput(editor.querySelector('input.dbm-input'), 'added_col');
+        click(byIncludes('.dbm-struct-editor .dbm-btn', '新增') || byIncludes('.dbm-struct-editor .dbm-btn', 'Add'));
+        await sleep(2000);
+        report.afterAddColumn = (await api('/api/dsh-database/sources/' + sourceId + '/columns?table=people')).columns.map((c) => c.name);
+        check('the added column reached the server', report.afterAddColumn.includes('added_col'), report.afterAddColumn);
       }
     }
 
-    // requirement 1: clicking the database returns to its table list
+    // ---- requirement 1: clicking the database returns to its table list --
     const dbNode = document.querySelector('.dbm-side-body .dbm-tree-item[data-active]');
-    const overview = document.querySelector('.dbm-table thead');
-    if (dbNode) {
+    if (!dbNode) {
+      fail('no active database node found');
+    } else {
       click(dbNode);
-      await sleep(1200);
+      await sleep(1400);
       report.backToOverview = {
-        hasTableList: byIncludes('.dbm-table thead', '行数') !== null ||
-          byIncludes('.dbm-table thead', 'Rows') !== null,
+        hasTableList: byIncludes('.dbm-table thead', '行数') !== null || byIncludes('.dbm-table thead', 'Rows') !== null,
         tabsGone: document.querySelector('.dbm-tabs') === null,
       };
       check('clicking the database returns to its table list', report.backToOverview.hasTableList, report.backToOverview);
       check('the table tabs are gone on the database overview', report.backToOverview.tabsGone === true, report.backToOverview);
-    } else {
-      fail('no active database node found');
     }
-    void overview;
+
+    // The 搜索 tab is verified by e2e-sql-search.mjs instead: its form is a
+    // controlled input, and a synthetic input event leaves React's state empty, so
+    // that script types with CDP's Input.insertText.
+    report.searchVerifiedBy = 'e2e-sql-search.mjs';
   } catch (error) {
+    // A thrown step must not discard the steps that already ran: the report is
+    // what locates the failure.
     fail('the flow threw', String(error && error.stack ? error.stack : error));
   }
   return JSON.stringify(report, null, 2);
@@ -556,8 +552,27 @@ ${PRELUDE}
 const { child, profile } = launchBrowser()
 let session
 try {
+  /*
+   * Check the generated page code before handing it to the browser.
+   *
+   * The flow is assembled from a template literal in this module, so a stray
+   * backslash or an unescaped quote produces a script that is merely INVALID —
+   * the failure then arrives as a "page threw" with a position inside the injected
+   * text, which points at the generated code rather than at the line in this file
+   * that mangled it. Parsing it here turns that into a clear local error.
+   */
+  try {
+    // eslint-disable-next-line no-new-func
+    new Function(`return ${FLOW}`)
+  } catch (error) {
+    console.error('the generated page script is not valid JavaScript:')
+    console.error(error instanceof Error ? error.message : String(error))
+    console.error('Check for an unescaped quote or backslash in the FLOW literal.')
+    process.exit(2)
+  }
+
   const url = await debuggerUrl()
-  const socket = new WebSocket(url, { maxPayload: 256 * 1024 * 1024 })
+  const socket = new WebSocket(url, { maxPayload: 64 * 1024 * 1024 })
   await new Promise((resolve, reject) => {
     socket.on('open', resolve)
     socket.on('error', reject)
@@ -569,25 +584,44 @@ try {
    * Make the headless page behave as a FOCUSED window.
    *
    * Without this a real focus move fires no blur event at all: measured, a plain
-   * blur / focusout listener on an input stayed silent when focus moved to
-   * another element, because the page was never the active window. The panel's
-   * in-cell editor saves on blur, so without this call the flow reports "the edit
-   * never reached the server" for a product that works — the harness would be the
-   * broken part, and a wrong bug report is worse than none.
+   * blur or focusout listener stayed silent when focus moved to another element,
+   * because the page was never the active window. The panel's in-cell editor saves
+   * on blur, so without this the flow would report "the edit never reached the
+   * server" for a product that works.
    */
   await session.send('Emulation.setFocusEmulationEnabled', { enabled: true })
 
   seed(sqliteFile)
 
-  // Load the harness UI, then run the whole flow in one page-side promise so the
-  // report survives even when a step bails out early.
   await session.send('Page.navigate', { url: baseUrl })
-  await new Promise(resolve => setTimeout(resolve, 4000))
+  await new Promise(resolve => setTimeout(resolve, 4500))
 
-  const report = await session.evaluate(FLOW)
+  const raw = await session.evaluate(FLOW)
+  const report = JSON.parse(raw)
+  console.log(JSON.stringify(report, null, 2))
 
-  console.log(report)
+  const failures = Array.isArray(report.failures) ? report.failures : []
+  console.log(`\n${report.steps.length} checks passed, ${failures.length} failed`)
+  if (report.fatal !== undefined) console.error(`fatal: ${report.fatal}`)
+  if (failures.length > 0 || report.fatal !== undefined) process.exitCode = 1
 } finally {
+  /*
+   * Delete the data source this run created.
+   *
+   * Left behind, one source per run accumulated in the user's own configuration —
+   * 41 had built up before this was noticed, which is both clutter and the cause
+   * of the name-resolution bug above. Deleting by the run's unique id removes only
+   * this run's entry.
+   */
+  try {
+    const sources = await (await fetch(`${baseUrl.replace(/\/\?.*$/, '')}/api/dsh-database/sources`)).json()
+    for (const source of sources.sources.filter(entry => entry.name === SOURCE_NAME)) {
+      await fetch(`${baseUrl.replace(/\/\?.*$/, '')}/api/dsh-database/sources/${encodeURIComponent(source.id)}`, { method: 'DELETE' })
+      console.error(`note: removed the run's data source (${source.id})`)
+    }
+  } catch (error) {
+    console.error(`note: the run's data source could not be removed: ${error instanceof Error ? error.message : String(error)}`)
+  }
   if (session !== undefined) {
     try {
       await session.send('Browser.close')
@@ -598,21 +632,16 @@ try {
   child.kill()
   await new Promise(resolve => setTimeout(resolve, 1000))
   /*
-   * The throwaway profile is best-effort.
+   * The throwaway profile is best effort.
    *
    * Edge keeps a few of its own files open after the process is gone (measured:
-   * Default/Collections/collectionsSQLite answers EBUSY), and a failing
-   * cleanup would replace the run's actual result with a filesystem error the
-   * reader has to see past. The directory is under the system temp dir, so
-   * leaving one behind is harmless.
+   * Default/Collections/collectionsSQLite answers EBUSY), and a failing cleanup
+   * would replace the run's actual result with a filesystem error the reader has
+   * to see past. The directory is under the system temp dir.
    */
   try {
     rmSync(profile, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 })
   } catch {
     console.error(`note: the throwaway browser profile could not be removed: ${profile}`)
   }
-  // The panel's source id is derived from its name and the dsh instance under
-  // test is the caller's, so nothing else on disk is touched.
-  void readAll
-  void seed
 }
