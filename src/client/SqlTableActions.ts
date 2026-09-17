@@ -177,23 +177,93 @@ export function DatabaseActionDialog(props: DatabaseActionDialogProps): React.Re
   const [includeData, setIncludeData] = React.useState(true)
   const [confirmText, setConfirmText] = React.useState('')
   const [charsets, setCharsets] = React.useState<string[]>([])
+  /**
+   * The default collation of each character set, by name.
+   *
+   * From `SHOW CHARACTER SET`'s own "Default collation" column. It is used to
+   * preselect a sensible collation when a character set is chosen, rather than
+   * leaving the field empty and letting the server decide silently.
+   */
+  const [defaultCollations, setDefaultCollations] = React.useState<Record<string, string>>({})
+  /**
+   * Every collation the server knows, with the character set it belongs to.
+   *
+   * Fetched ONCE and filtered in the browser, rather than asked per character set:
+   * `SHOW COLLATION WHERE Charset = 'x'` cannot be parameter-bound — `SHOW` accepts
+   * no placeholders — so building it would mean pasting a value into a statement.
+   * Fetching the whole list (about 300 rows) once avoids that entirely and is the
+   * same number of round trips.
+   */
+  const [collationsByCharset, setCollationsByCharset] = React.useState<Record<string, string[]>>({})
+  const [collationsLoaded, setCollationsLoaded] = React.useState(false)
 
-  // The character sets come from the SERVER rather than a hard-coded list: a MySQL
-  // release may add one, and a stale list would refuse a value the server accepts.
+  // The character sets and their collations come from the SERVER rather than a
+  // hard-coded list: a MySQL release may add one, and a stale list would refuse a
+  // value the server accepts.
   React.useEffect(() => {
     if (action !== 'charset' && action !== 'create') return
     let live = true
-    // `SHOW CHARACTER SET` is the authority; the query surface is read-only, which
-    // is what this is.
-    void api.runSql(sourceId, { sql: 'SHOW CHARACTER SET', limit: 500 })
-      .then(result => {
+    const load = async (): Promise<void> => {
+      try {
+        // `SHOW CHARACTER SET`: Charset | Description | Default collation | Maxlen
+        const sets = await api.runSql(sourceId, { sql: 'SHOW CHARACTER SET', limit: 500 })
         if (!live) return
-        // The first column is the charset name.
-        setCharsets(result.rows.map(row => String(row[0] ?? '')).filter(value => value !== ''))
-      })
-      .catch(() => { /* the field stays free text, which is still usable */ })
+        const names: string[] = []
+        const defaults: Record<string, string> = {}
+        for (const row of sets.rows) {
+          const charsetName = row[0] === undefined ? '' : String(row[0])
+          if (charsetName === '') continue
+          names.push(charsetName)
+          const fallback = row[2] === undefined ? '' : String(row[2])
+          if (fallback !== '') defaults[charsetName] = fallback
+        }
+        setCharsets(names)
+        setDefaultCollations(defaults)
+      } catch {
+        // The fields fall back to free text, which is still usable.
+      }
+      try {
+        // `SHOW COLLATION`: Collation | Charset | Id | Default | Compiled | Sortlen
+        const collations = await api.runSql(sourceId, { sql: 'SHOW COLLATION', limit: 2000 })
+        if (!live) return
+        const grouped: Record<string, string[]> = {}
+        for (const row of collations.rows) {
+          const collationName = row[0] === undefined ? '' : String(row[0])
+          const charsetName = row[1] === undefined ? '' : String(row[1])
+          if (collationName === '' || charsetName === '') continue
+          ;(grouped[charsetName] ??= []).push(collationName)
+        }
+        setCollationsByCharset(grouped)
+      } catch {
+        // Leave it empty: the collation field then stays free text.
+      } finally {
+        if (live) setCollationsLoaded(true)
+      }
+    }
+    void load()
     return () => { live = false }
   }, [api, sourceId, action])
+
+  /** The collations that belong to the chosen character set. */
+  const collationChoices = React.useMemo(
+    () => (charset === '' ? [] : collationsByCharset[charset] ?? []),
+    [charset, collationsByCharset],
+  )
+
+  /**
+   * Keep the collation consistent with the character set.
+   *
+   * A collation belongs to exactly one character set, so one left over from a
+   * previous choice is invalid: MySQL rejects `CHARACTER SET latin1 COLLATE
+   * utf8mb4_general_ci` with "COLLATION 'x' is not valid for CHARACTER SET 'y'".
+   * Rather than let the user submit that, the collation is reset to the new set's
+   * default (or cleared) whenever the set changes.
+   */
+  React.useEffect(() => {
+    if (collationChoices.length === 0) return
+    if (collationChoices.includes(collate)) return
+    setCollate(defaultCollations[charset] ?? '')
+  }, [charset, collationChoices, collate, defaultCollations])
 
   // SQLite has no charset to change: say so instead of offering a form that fails.
   const charsetUnsupported = action === 'charset' && isSqlite
@@ -288,6 +358,7 @@ export function DatabaseActionDialog(props: DatabaseActionDialogProps): React.Re
                     className: 'dbm-input dbm-mono',
                     value: charset,
                     placeholder: 'utf8mb4',
+                    'data-dbm-dbop-charset': '',
                     onChange: (event: { target: { value: string } }) => setCharset(event.target.value),
                   })
                 : React.createElement(
@@ -295,24 +366,68 @@ export function DatabaseActionDialog(props: DatabaseActionDialogProps): React.Re
                     {
                       className: 'dbm-select',
                       value: charset,
+                      'data-dbm-dbop-charset': '',
                       onChange: (event: { target: { value: string } }) => setCharset(event.target.value),
                     },
                     [React.createElement('option', { key: '', value: '' }, t('common.none')), ...charsets.map(value => React.createElement('option', { key: value, value }, value))],
                   ),
             )
           : null,
+        /*
+         * The collation is a LIST OF THE CHOSEN CHARACTER SET'S OWN COLLATIONS.
+         *
+         * It was a free-text field, which made an invalid pair easy to submit: a
+         * collation belongs to exactly one character set, and MySQL rejects a mismatch
+         * ("COLLATION 'utf8mb4_general_ci' is not valid for CHARACTER SET 'latin1'").
+         * Offering only the ones that belong to the chosen set removes the possibility
+         * rather than reporting it after the fact.
+         *
+         * Empty until a character set is chosen, because "which collations" has no
+         * answer without one. When the server's list could not be read, the field falls
+         * back to free text so the dialog stays usable.
+         */
         action === 'create' || action === 'charset'
           ? React.createElement(
               'div',
               { className: 'dbm-field' },
               React.createElement('label', { className: 'dbm-field-label' }, t('db.op.collate')),
-              React.createElement('input', {
-                className: 'dbm-input dbm-mono',
-                value: collate,
-                placeholder: 'utf8mb4_general_ci',
-                onChange: (event: { target: { value: string } }) => setCollate(event.target.value),
-              }),
-              React.createElement('div', { className: 'dbm-hint' }, t('db.op.collateHint')),
+              collationChoices.length > 0
+                ? React.createElement(
+                    'select',
+                    {
+                      className: 'dbm-select',
+                      value: collate,
+                      'data-dbm-dbop-collate': '',
+                      onChange: (event: { target: { value: string } }) => setCollate(event.target.value),
+                    },
+                    [
+                      React.createElement('option', { key: '', value: '' }, t('db.op.collateDefault')),
+                      ...collationChoices.map(value => React.createElement(
+                        'option',
+                        { key: value, value },
+                        value === defaultCollations[charset] ? `${value} ${t('db.op.collateIsDefault')}` : value,
+                      )),
+                    ],
+                  )
+                : React.createElement('input', {
+                    className: 'dbm-input dbm-mono',
+                    value: collate,
+                    // Disabled while no character set is chosen: typing a collation
+                    // before knowing its set is exactly the mismatch this removes.
+                    disabled: charset === '',
+                    placeholder: charset === '' ? t('db.op.collateNeedsCharset') : 'utf8mb4_general_ci',
+                    'data-dbm-dbop-collate': '',
+                    onChange: (event: { target: { value: string } }) => setCollate(event.target.value),
+                  }),
+              React.createElement(
+                'div',
+                { className: 'dbm-hint' },
+                charset === ''
+                  ? t('db.op.collateNeedsCharset')
+                  : collationChoices.length > 0
+                    ? t('db.op.collateHint', { charset, n: collationChoices.length })
+                    : t('db.op.collateUnavailable'),
+              ),
             )
           : null,
         action === 'copy'

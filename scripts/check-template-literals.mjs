@@ -54,6 +54,7 @@ const files = [
   'scripts/e2e-table-actions.mjs',
   'scripts/probe-side-refresh.mjs',
   'scripts/probe-side-refresh-poll.mjs',
+  'scripts/probe-collate-link.mjs',
   'scripts/measure-tree-number.mjs',
   'scripts/measure-tree-mysql-counts.mjs',
   'scripts/measure-tree-long-names.mjs',
