@@ -282,6 +282,7 @@ npm run build       # lib/index.js（host）+ lib/client.js（browser）
 | `scripts/e2e-table-actions.mjs` | 表批量操作与库操作工具条的端到端（MySQL 29 项 / SQLite 26 项；断言两引擎的差异，如 SQLite 无「新建数据库」、无「修复」） |
 | `scripts/verify-db-ops.mjs` | 对真实 MySQL 逐项核对**破坏性操作的效果**（清空是否真的清了、复制是否带数据、改名是否删掉原库、改编码是否落库），19 项 |
 | `scripts/probe-collate-link.mjs` | 排序规则随字符集联动：拿服务端 `information_schema` 真实列表逐项比对，含切换字符集后旧值不残留 |
+| `scripts/probe-table-stats.mjs` | 表列表的**行数与大小**端到端（9 项）：`TABLE_ROWS` / `DATA_LENGTH` / `INDEX_LENGTH` 在 information_schema 里是 `bigint unsigned`，而连接池开着 `supportBigNumbers` + `bigNumberStrings`（防止 BIGINT 精度丢失），mysql2 因此把这些列一律返回**字符串**——驱动曾用 `typeof === 'number'` 判断，于是每张表的行数都显示「未知」、大小都空白。探针直接读**渲染后的单元格**（而非只看驱动），并和服务端返回逐项对账，同时断言数值是 number 而非数字字符串 |
 | `scripts/probe-create-table.mjs` | 「新建表」端到端：建表后从 `information_schema` 核对列、主键与自增，并实测自增真的生效；同时核对改字符集对话框的预填值 |
 | `scripts/probe-create-table-full.mjs` | 完整建表表单端到端（16 项）：以**几何**断言表单列未被截断（头单元格右边缘须在对话框可视区内、表格宽度须装进正文区），并从服务端核对长度、UNSIGNED、注释、联合索引的列顺序与唯一性、表引擎/整理/注释，以及 UNIQUE 确实被强制 |
 | `scripts/probe-create-table-grid.mjs` | 栅格与自定义类型的往返（9 项）：直接量测控件**右边缘**是否逐列对齐（而非由等宽+标签对齐去推断）、表级四个字段确实是**四列一行**、「自定义类型」换入/返回不丢输入 |

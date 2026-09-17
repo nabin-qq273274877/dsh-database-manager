@@ -377,23 +377,41 @@ export class MysqlDriver implements SqlDriver {
       const record = row as Record<string, unknown>
       const type = String(record['type'] ?? '')
       const comment = toWireValue(record['comment'])
-      const rowCount = toWireValue(record['rows_count'])
+      /*
+       * The three statistics columns arrive as STRINGS, and have to be read as such.
+       *
+       * `TABLE_ROWS`, `DATA_LENGTH` and `INDEX_LENGTH` are all `bigint unsigned` in
+       * information_schema (measured), and the pool is configured with
+       * `supportBigNumbers: true` + `bigNumberStrings: true` so a BIGINT beyond 2^53 cannot lose
+       * precision on its way to the browser. mysql2 therefore hands back every BIGINT as a string,
+       * which is the right default for user data — but it silently broke these three: the code
+       * checked `typeof value === 'number'`, so every count and size failed the test and was
+       * dropped. Measured: 行数 showed 未知 and 大小 showed — for every table of a real MySQL
+       * database, including tables with hundreds of rows, while the same query in a MySQL client
+       * returned numbers.
+       *
+       * `toWireValue` is deliberately NOT used here: it would pass the string straight through, and
+       * the protocol declares these fields as `number`. `toCount` converts and validates in one
+       * place, so a value that is not a finite number stays ABSENT (which the panel renders as
+       * 未知 / —) rather than becoming a lie like 0 or NaN.
+       */
+      const rowCount = toCount(record['rows_count'])
       const engine = toWireValue(record['engine'])
       const collation = toWireValue(record['collation'])
+      const dataBytes = toCount(record['data_bytes'])
+      const indexBytes = toCount(record['index_bytes'])
       // DATA_LENGTH and INDEX_LENGTH are the engine's own byte figures, so this
       // costs nothing extra to read. A view reports NULL for both, which is why
       // the sum is only emitted when at least one of them is a number —
       // otherwise a view would be shown as 0 bytes.
-      const dataBytes = toWireValue(record['data_bytes'])
-      const indexBytes = toWireValue(record['index_bytes'])
       const size =
-        typeof dataBytes === 'number' || typeof indexBytes === 'number'
-          ? (typeof dataBytes === 'number' ? dataBytes : 0) + (typeof indexBytes === 'number' ? indexBytes : 0)
+        dataBytes !== undefined || indexBytes !== undefined
+          ? (dataBytes ?? 0) + (indexBytes ?? 0)
           : undefined
       return {
         name: String(record['name'] ?? ''),
         type: type.includes('VIEW') ? 'view' : 'table',
-        ...(typeof rowCount === 'number' ? { rows: rowCount } : {}),
+        ...(rowCount === undefined ? {} : { rows: rowCount }),
         ...(size === undefined ? {} : { size }),
         ...(typeof comment === 'string' && comment !== '' ? { comment } : {}),
         ...(typeof engine === 'string' && engine !== '' ? { engine } : {}),
@@ -1719,6 +1737,33 @@ function projectRow(row: Record<string, unknown>): Record<string, string | numbe
 /** Coerce a value to a non-empty string, or undefined. */
 function asString(value: unknown): string | undefined {
   return typeof value === 'string' && value !== '' ? value : undefined
+}
+
+/**
+ * Read a statistics column (`TABLE_ROWS`, `DATA_LENGTH`, `INDEX_LENGTH`) as a number.
+ *
+ * These arrive as STRINGS and must not be read as numbers done elsewhere in this file. All three are
+ * `bigint unsigned` in information_schema (measured), and the pool sets `supportBigNumbers: true`
+ * with `bigNumberStrings: true` so a BIGINT beyond 2^53 cannot lose precision before it reaches the
+ * browser — mysql2 consequently hands back EVERY bigint as a string. That default is right for user
+ * data, but the 表列表 read these with `typeof value === 'number'`, so every count and size failed
+ * the check and was dropped: 行数 showed 未知 and 大小 showed — for every table, even ones with
+ * hundreds of rows, while the same query in a MySQL client returned numbers.
+ *
+ * A number is passed through as well, because a driver version or an option change could make
+ * mysql2 return one and the reading must not depend on which.
+ *
+ * @returns the count, or undefined when the value is NULL or is not a finite number — which keeps
+ * the field ABSENT rather than turning an unreadable value into a false 0.
+ */
+function toCount(value: unknown): number | undefined {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined
+  if (typeof value === 'bigint') return Number(value)
+  if (typeof value !== 'string') return undefined
+  const text = value.trim()
+  if (text === '') return undefined
+  const parsed = Number(text)
+  return Number.isFinite(parsed) ? parsed : undefined
 }
 
 /** Human-readable MySQL error, keeping the engine's own error code visible. */

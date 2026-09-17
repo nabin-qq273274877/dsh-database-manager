@@ -115,6 +115,50 @@ describe.skipIf(!reachable)('MysqlDriver without a default schema', () => {
     expect(tablesA[0]?.type).toBe('table')
   })
 
+  /*
+   * The row count and size are read from BIGINT columns, which mysql2 returns as STRINGS.
+   *
+   * The pool sets `supportBigNumbers: true` with `bigNumberStrings: true` so a BIGINT beyond 2^53
+   * cannot lose precision on its way to the browser, and mysql2 therefore hands back every bigint
+   * as a string. `TABLE_ROWS`, `DATA_LENGTH` and `INDEX_LENGTH` are all `bigint unsigned` in
+   * information_schema, so the old `typeof value === 'number'` test rejected every one of them:
+   * the table list showed 行数 未知 and a blank 大小 for every table, on every MySQL server, while
+   * the same query in a client returned numbers.
+   *
+   * Both halves are asserted, because either alone would pass on a broken implementation: with
+   * stats the numbers must be present AND be actual numbers, and without stats they must be absent
+   * (the tree calls this on every expand and must not pay for them).
+   */
+  it('fills in the row count and size when statistics are asked for', async () => {
+    const tables = await driver!.tables(DB_A, { stats: true })
+    const table = tables.find(entry => entry.name === 't')
+    expect(table).toBeDefined()
+    /*
+     * The exact count of the two rows `beforeAll` inserted.
+     *
+     * `TABLE_ROWS` is an ESTIMATE that InnoDB refreshes from its own statistics, so this is not
+     * always exact for a large table — but it is exact for a two-row one (measured stable across
+     * five consecutive reads), and demanding the real number is what fails an implementation that
+     * returns a parseable-but-wrong 0.
+     */
+    expect(table!.rows).toBe(2)
+    expect(typeof table!.rows).toBe('number')
+    // Every non-empty InnoDB table occupies at least one page.
+    expect(typeof table!.size).toBe('number')
+    expect(table!.size).toBeGreaterThan(0)
+  })
+
+  it('omits the row count and size when statistics are not asked for', async () => {
+    const tables = await driver!.tables(DB_A)
+    const table = tables.find(entry => entry.name === 't')
+    expect(table).toBeDefined()
+    // ABSENT means UNKNOWN, which the panel renders as 未知 / — rather than claiming 0.
+    expect(table!.rows).toBeUndefined()
+    expect(table!.size).toBeUndefined()
+    // The cheap columns are still there, since the overview shows them.
+    expect(table!.engine).toBeDefined()
+  })
+
   it('refuses to enumerate tables with no schema named', async () => {
     // No silent fallback: the caller must say which database.
     await expect(driver!.tables(undefined)).rejects.toThrow(/schema is required/)
