@@ -322,6 +322,32 @@ ${PRELUDE}
     report.gridHeaders = Array.from(document.querySelectorAll('.dbm-data thead th')).map((th) => th.textContent.trim());
     check('the grid has an actions column', report.gridHeaders.includes('操作') || report.gridHeaders.includes('Actions'), report.gridHeaders);
     check('the grid has a select column', document.querySelector('.dbm-data th.dbm-select-col') !== null);
+    /*
+     * Requirement 2: the actions column is pinned to the right edge.
+     *
+     * A 'position: sticky' claim has to be checked as geometry, not as a class name:
+     * what matters is that the column stays VISIBLE when the grid is scrolled right.
+     * So the grid is scrolled to the end and the actions cell's right edge must still
+     * be inside the viewport.
+     */
+    const scrollBox = document.querySelector('.dbm-data');
+    const actionsHeader = document.querySelector('.dbm-data th.dbm-row-actions');
+    if (scrollBox === null || actionsHeader === null) {
+      fail('no actions column to check for stickiness');
+    } else {
+      report.actionsSticky = { position: getComputedStyle(actionsHeader).position, right: getComputedStyle(actionsHeader).right };
+      check('the actions column is position:sticky', report.actionsSticky.position === 'sticky', report.actionsSticky);
+      // Scroll fully right and confirm the cell is still on screen.
+      const beforeScroll = actionsHeader.getBoundingClientRect().right;
+      scrollBox.scrollLeft = scrollBox.scrollWidth;
+      await sleep(300);
+      const afterScroll = actionsHeader.getBoundingClientRect().right;
+      const boxRight = scrollBox.getBoundingClientRect().right;
+      report.actionsAfterScroll = { beforeScroll: Math.round(beforeScroll), afterScroll: Math.round(afterScroll), boxRight: Math.round(boxRight) };
+      check('the actions column stays visible when scrolled right', afterScroll <= boxRight + 2 && afterScroll > boxRight - 200, report.actionsAfterScroll);
+      scrollBox.scrollLeft = 0;
+      await sleep(200);
+    }
 
     // ---- requirement 6: the sort mark is smaller than the header ---------
     const sortButton = byIncludes('.dbm-data thead th button', 'name');
@@ -385,11 +411,31 @@ ${PRELUDE}
       fail('no editable cell found for alice');
     } else {
       dblclick(target);
-      const editor = await waitFor(() => document.querySelector('.dbm-data input.dbm-cell-input'), 5000);
+      /*
+       * The editor is a TEXTAREA now, not an input.
+       *
+       * It was changed so a long value can be seen and the box dragged taller, and
+       * this selector has to follow it: querying 'input.dbm-cell-input' would find
+       * nothing and report "the double-click did not open an editor" for an editor
+       * that is open. That is exactly what happened, and the failure described the
+       * harness rather than the product.
+       */
+      const editor = await waitFor(() => document.querySelector('.dbm-data textarea.dbm-cell-input'), 5000);
       if (!editor) {
         fail('the double-click did not open an editor');
       } else {
         step('the double-click opened an in-cell editor', editor.value);
+        // Requirement 3: it is a one-line textarea the user can grow.
+        report.editorShape = {
+          tag: editor.tagName,
+          rows: editor.getAttribute('rows'),
+          resize: getComputedStyle(editor).resize,
+          // A 'resize' that computed to 'none' would mean the handle is absent.
+          resizable: getComputedStyle(editor).resize === 'vertical' || getComputedStyle(editor).resize === 'both',
+          whiteSpace: getComputedStyle(editor).whiteSpace,
+        };
+        check('the in-cell editor is a one-row textarea', report.editorShape.tag === 'TEXTAREA' && report.editorShape.rows === '1', report.editorShape);
+        check('the in-cell editor can be dragged taller by the user', report.editorShape.resizable === true, report.editorShape);
         setInput(editor, 'alice-edited');
         // Record the writes the panel attempts, so a missing save can be told
         // apart from one that went somewhere else.
@@ -509,16 +555,90 @@ ${PRELUDE}
 
     if (addColumn) {
       click(addColumn);
-      const editor = await waitFor(() => document.querySelector('.dbm-struct-editor'), 5000);
-      if (!editor) {
-        fail('the add-column editor did not open');
+      /*
+       * Requirement 9: the add-column form is a vertical dialog, not an inline strip.
+       *
+       * It was an inline row of controls BELOW the column table, which wrapped at the
+       * panel's real width. It is now a modal with one labelled field per row, so the
+       * assertion checks the SHAPE (fields stacked in a dialog) rather than just that
+       * some form appeared — otherwise it would pass for the inline version too.
+       */
+      const editorDialog = await waitFor(() => document.querySelector('.dbm-modal'), 5000);
+      if (!editorDialog) {
+        fail('the add-column dialog did not open');
       } else {
-        step('the add-column editor opened');
-        setInput(editor.querySelector('input.dbm-input'), 'added_col');
-        click(byIncludes('.dbm-struct-editor .dbm-btn', '新增') || byIncludes('.dbm-struct-editor .dbm-btn', 'Add'));
-        await sleep(2000);
+        step('the add-column dialog opened');
+        report.columnDialogShape = {
+          inModal: editorDialog.querySelector('[data-dbm-column-name]') !== null,
+          fieldCount: editorDialog.querySelectorAll('.dbm-field').length,
+          labelledFields: editorDialog.querySelectorAll('.dbm-field > .dbm-field-label').length,
+          // A stacked field puts the label ABOVE the control. If both are on one line
+          // the layout is still the inline one it was supposed to replace.
+          stacked: (() => {
+            const field = editorDialog.querySelector('.dbm-field');
+            if (field === null) return null;
+            const label = field.querySelector('.dbm-field-label');
+            const control = field.querySelector('.dbm-input, .dbm-select');
+            if (label === null || control === null) return null;
+            return control.getBoundingClientRect().top >= label.getBoundingClientRect().bottom - 2;
+          })(),
+        };
+        check('the add-column form is a dialog', report.columnDialogShape.inModal === true, report.columnDialogShape);
+        check('the add-column form stacks several labelled fields', report.columnDialogShape.fieldCount >= 4 && report.columnDialogShape.labelledFields === report.columnDialogShape.fieldCount, report.columnDialogShape);
+        check('each field label sits above its control', report.columnDialogShape.stacked === true, report.columnDialogShape);
+
+        setInput(editorDialog.querySelector('[data-dbm-column-name]'), 'added_col');
+        click(editorDialog.querySelector('[data-dbm-column-submit]'));
+        await sleep(2200);
         report.afterAddColumn = (await api('/api/dsh-database/sources/' + sourceId + '/columns?table=people')).columns.map((c) => c.name);
         check('the added column reached the server', report.afterAddColumn.includes('added_col'), report.afterAddColumn);
+      }
+    }
+
+    /*
+     * Requirement 4: the index creator is a DIALOG with column tick boxes.
+     *
+     * It used to be an inline strip below the column table. The assertion therefore
+     * checks the dialog shape AND that the tick order is recorded — a picker that
+     * only collected a set would lose the column order, which is what decides which
+     * prefixes the index can serve.
+     */
+    const addIndex = byIncludes('.dbm-btn', '新增索引') || byIncludes('.dbm-btn', 'Add index');
+    if (addIndex === null) {
+      fail('no add-index control found');
+    } else {
+      click(addIndex);
+      const indexDialog = await waitFor(() => document.querySelector('[data-dbm-index-name]') === null ? null : document.querySelector('.dbm-modal'), 5000);
+      if (indexDialog === null) {
+        fail('the index dialog did not open');
+      } else {
+        step('the index dialog opened');
+        report.indexDialog = {
+          inModal: indexDialog.querySelector('[data-dbm-index-name]') !== null,
+          pickerRows: indexDialog.querySelectorAll('.dbm-column-picker-row').length,
+          checkboxes: indexDialog.querySelectorAll('[data-dbm-index-column]').length,
+        };
+        check('the index form is a dialog', report.indexDialog.inModal === true, report.indexDialog);
+        check('the columns are offered as tick boxes', report.indexDialog.checkboxes >= 5, report.indexDialog);
+
+        // Tick two columns and confirm the order is shown, not just the membership.
+        const picks = Array.from(indexDialog.querySelectorAll('[data-dbm-index-column]'));
+        setInput(indexDialog.querySelector('[data-dbm-index-name]'), 'ix_e2e_order');
+        click(picks[1]);
+        await sleep(150);
+        click(picks[0]);
+        await sleep(250);
+        const orders = Array.from(indexDialog.querySelectorAll('.dbm-column-order')).map((el) => el.textContent.trim());
+        report.indexOrderMarks = orders.filter((value) => value !== '');
+        check('the tick order is recorded as a position', report.indexOrderMarks.length === 2, report.indexOrderMarks);
+
+        click(indexDialog.querySelector('[data-dbm-index-submit]'));
+        await sleep(2200);
+        const indexes = (await api('/api/dsh-database/sources/' + sourceId + '/indexes?table=people')).indexes;
+        const created = indexes.find((index) => index.name === 'ix_e2e_order');
+        report.createdIndex = created === undefined ? null : created.columns;
+        // The SECOND column was ticked first, so it must come first in the index.
+        check('the created index uses the tick order', created !== undefined && created.columns[0] === picks[1].getAttribute('data-dbm-index-column'), report.createdIndex);
       }
     }
 
