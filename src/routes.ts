@@ -190,6 +190,10 @@ interface SchemaChange {
   rename?: string
   columns?: string[]
   index?: { name: string; columns: string[]; unique: boolean }
+  /** `createTable`: the columns to create. */
+  specs?: ColumnSpec[]
+  /** `createTable`: a table-level primary key over these columns. */
+  primaryKey?: string[]
 }
 
 /**
@@ -208,6 +212,34 @@ function parseSchemaChange(body: Record<string, unknown>): { change: SchemaChang
     const base = { action, table, ...(schema === undefined ? {} : { schema }) }
 
     switch (action) {
+      case 'createTable': {
+        /*
+         * A new table: the column list is the whole request.
+         *
+         * Read from `specs`, NOT from `columns`. `columns` already means "a list of
+         * column NAMES" for `setPrimaryKey`, so using it for full column specs made one
+         * key carry two shapes — and the mismatch was silent in the types (both are
+         * arrays) but fatal at runtime: the first version read `columns`, the client
+         * sent `specs`, and every create failed with "columns must be a non-empty
+         * array". Caught by an end-to-end create, not by the type checker.
+         *
+         * Each column goes through `readColumnSpec`, the validator `addColumn` uses, so
+         * a column created here cannot bypass the checks the column editor is held to.
+         */
+        const columns = body['specs']
+        if (!Array.isArray(columns) || columns.length === 0) {
+          return { error: 'specs must be a non-empty array of column specs for createTable' }
+        }
+        const specs: ColumnSpec[] = []
+        for (const [index, entry] of columns.entries()) {
+          specs.push(readColumnSpec(entry, `columns[${index}]`))
+        }
+        const primaryKey = body['primaryKey']
+        if (primaryKey !== undefined && (!Array.isArray(primaryKey) || primaryKey.some(entry => typeof entry !== 'string' || entry === ''))) {
+          return { error: 'primaryKey must be an array of column names when present' }
+        }
+        return { change: { ...base, specs, ...(primaryKey === undefined ? {} : { primaryKey: primaryKey as string[] }) } }
+      }
       case 'addColumn':
         return { change: { ...base, spec: readColumnSpec(body['column'], 'column') } }
       case 'alterColumn': {
@@ -264,6 +296,14 @@ async function applySchemaChange(driver: SqlDriver, change: SchemaChange): Promi
   })
 
   switch (change.action) {
+    case 'createTable': {
+      const result = await driver.createTable(change.schema, change.table, change.specs ?? [], {
+        ...(change.primaryKey === undefined ? {} : { primaryKey: change.primaryKey }),
+      })
+      // A brand-new table: its columns, indexes and rows are all being seen for the
+      // first time, and the database's table list has one more entry.
+      return finish(result, ['columns', 'indexes', 'rows', 'tables'])
+    }
     case 'addColumn': {
       // The 浏览 grid gains a column, and the overview's row count is unaffected.
       const result = await driver.addColumn(change.schema, change.table, change.spec!)

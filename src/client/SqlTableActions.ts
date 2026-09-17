@@ -151,7 +151,14 @@ export interface DatabaseActionDialogProps {
   action: 'create' | 'rename' | 'copy' | 'drop' | 'charset'
   busy: boolean
   onClose(): void
-  onDone(message: string): void
+  /**
+   * Called with a message and what the operation changed.
+   *
+   * `stale` names the databases whose contents or names are no longer valid (so their
+   * cached statistics and table lists must be dropped); `nowOpen` is the database the
+   * panel should be showing afterwards, or undefined to show the placeholder.
+   */
+  onDone(message: string, changed: { stale: string[]; nowOpen: string | undefined }): void
   onError(message: string): void
   onBusy(value: boolean): void
 }
@@ -251,6 +258,14 @@ export function DatabaseActionDialog(props: DatabaseActionDialogProps): React.Re
   )
 
   /**
+   * The database's current character set and collation, once read.
+   *
+   * Declared before the effects that read it: both close over this state, and a
+   * declaration after its first use is a temporal-dead-zone error at build time.
+   */
+  const [currentDefaults, setCurrentDefaults] = React.useState<{ charset: string; collate: string } | undefined>(undefined)
+
+  /**
    * Keep the collation consistent with the character set.
    *
    * A collation belongs to exactly one character set, so one left over from a
@@ -261,9 +276,62 @@ export function DatabaseActionDialog(props: DatabaseActionDialogProps): React.Re
    */
   React.useEffect(() => {
     if (collationChoices.length === 0) return
+    /*
+     * The database's OWN collation is kept even when the list does not offer it.
+     *
+     * Normally it is in the list. If the server's collation list was read partially
+     * or is older than the database's collation, resetting to the set's default would
+     * silently change a value the user never touched — worse than offering a value
+     * that happens to be missing from the dropdown.
+     */
+    if (currentDefaults !== undefined && collate === currentDefaults.collate) return
     if (collationChoices.includes(collate)) return
     setCollate(defaultCollations[charset] ?? '')
-  }, [charset, collationChoices, collate, defaultCollations])
+  }, [charset, collationChoices, collate, defaultCollations, currentDefaults])
+
+  /**
+   * Prefill the character set and collation the database is USING.
+   *
+   * Reported: 修改字符集 opened with both fields empty, so the user had to remember
+   * what the database was already set to before deciding what to change it to —
+   * which is backwards, since the current value is what the decision is made against.
+   *
+   * The values come from `information_schema.SCHEMATA` rather than from the tree or a
+   * cached list: those hold table statistics, not the schema's own defaults.
+   *
+   * Only the two actions that ACT on a database's charset prefill — `create` has no
+   * current value to read, and pre-filling it with something arbitrary would be an
+   * invented default.
+   */
+  React.useEffect(() => {
+    if (action !== 'charset' || isSqlite) return
+    if (schema === undefined || schema === '') return
+    let live = true
+    /*
+     * The schema name is a VALUE, not an identifier here, so it is compared rather
+     * than interpolated into the statement in a way the server would parse as one.
+     * The API layer binds the parameters this surface accepts; the fallback below
+     * escapes the quote itself for the same reason.
+     */
+    const escaped = schema.replaceAll("'", "''")
+    void api.runSql(sourceId, {
+      sql: `SELECT DEFAULT_CHARACTER_SET_NAME AS cs, DEFAULT_COLLATION_NAME AS co FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '${escaped}'`,
+      limit: 1,
+    }).then(result => {
+      if (!live) return
+      const row = result.rows[0]
+      if (row === undefined) return
+      const charsetName = row[0] === undefined ? '' : String(row[0])
+      const collationName = row[1] === undefined ? '' : String(row[1])
+      if (charsetName === '') return
+      setCurrentDefaults({ charset: charsetName, collate: collationName })
+      // Seeded only if the user has not already typed something, so a slow read
+      // cannot overwrite a choice made while it was in flight.
+      setCharset(current => (current === '' ? charsetName : current))
+      setCollate(current => (current === '' ? collationName : current))
+    }).catch(() => { /* the fields simply start empty, which is the old behaviour */ })
+    return () => { live = false }
+  }, [api, sourceId, action, schema, isSqlite])
 
   // SQLite has no charset to change: say so instead of offering a form that fails.
   const charsetUnsupported = action === 'charset' && isSqlite
@@ -315,7 +383,30 @@ export function DatabaseActionDialog(props: DatabaseActionDialogProps): React.Re
           : action === 'copy' ? t('db.op.copy')
             : action === 'drop' ? t('db.op.drop')
               : t('db.op.charset')
-      onDone(t('db.op.done', { op: label, name: action === 'drop' || action === 'charset' ? (schema ?? '') : trimmed }))
+      const reportName = action === 'drop' || action === 'charset' ? (schema ?? '') : trimmed
+      /*
+       * Report what changed and where to look afterwards, not just a message.
+       *
+       * The caller cannot derive either: `rename` removes the old name and creates a
+       * new one, `create` adds one, `drop` removes the open one. Returning the names
+       * is what lets the panel reload exactly those and land the pane somewhere real —
+       * leaving it pointing at a name that no longer exists showed
+       * 正在读取表和统计信息… forever (measured).
+       */
+      onDone(t('db.op.done', { op: label, name: reportName }), {
+        stale: action === 'create'
+          // A create changes only the list; the new database has no statistics yet.
+          ? []
+          : action === 'drop' || action === 'charset'
+            ? [schema ?? '']
+            : [schema ?? '', trimmed],
+        nowOpen: action === 'drop'
+          ? undefined
+          : action === 'charset'
+            // The charset change does not move the database, so it stays open.
+            ? (schema ?? '')
+            : trimmed,
+      })
       onError('')
     } catch (failure) {
       onError(failure instanceof Error ? failure.message : String(failure))
@@ -334,6 +425,20 @@ export function DatabaseActionDialog(props: DatabaseActionDialogProps): React.Re
             : action === 'copy' ? 'db.op.copyBody'
               : action === 'drop' ? 'db.op.dropBody'
                 : 'db.op.charsetBody' as never)),
+        /*
+         * The database's current values, stated explicitly.
+         *
+         * The fields below are pre-filled from them, and saying so makes the prefill
+         * trustworthy: a value that appeared in a form with no explanation looks like a
+         * default rather than the database's actual setting.
+         */
+        action === 'charset' && currentDefaults !== undefined
+          ? React.createElement(
+              'div',
+              { className: 'dbm-hint dbm-mono', 'data-dbm-dbop-current': '' },
+              t('db.op.charsetCurrent', { charset: currentDefaults.charset, collate: currentDefaults.collate }),
+            )
+          : null,
         React.createElement(
           'div',
           { className: 'dbm-field' },
@@ -468,12 +573,24 @@ export function DatabaseActionDialog(props: DatabaseActionDialogProps): React.Re
         {
           key: 'ok',
           type: 'button',
-          className: `dbm-btn dbm-btn-primary${destructive ? ' dbm-btn-danger' : ''}`,
+          className: `dbm-btn dbm-btn-primary${destructive ? ' dbm-btn-danger' : ''}${busy ? ' dbm-btn-busy' : ''}`,
           disabled: busy || charsetUnsupported,
+          'aria-busy': busy ? 'true' : undefined,
           'data-dbm-dbop-submit': '',
           onClick: () => { void submit() },
         },
-        busy ? t('db.op.busy') : t('db.op.submit'),
+        /*
+         * A SPINNER, not just different words.
+         *
+         * Measured: the busy state is set and the button is disabled, so the feedback
+         * was honest — but the only change was the label, and a rename of a large
+         * database moves every table in one statement, which can run for a long time.
+         * A label that changed once and then sits still for a minute reads as a hang;
+         * the spinner keeps saying "still working".
+         */
+        busy
+          ? [React.createElement('span', { key: 'spin', className: 'dbm-spinner' }), t('db.op.busy')]
+          : t('db.op.submit'),
       ),
     ],
     children: body,

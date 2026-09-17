@@ -279,6 +279,12 @@ npm run build       # lib/index.js（host）+ lib/client.js（browser）
 | `scripts/e2e-sql-editing.mjs` | SQL 面板的编辑流程端到端（29 项，含双击改单元格、批量删除、跳页、按索引排序、按类型插入、结构改列，写入均回读服务端核对） |
 | `scripts/e2e-sql-search.mjs` | 搜索表单端到端：用 `Input.insertText` 走浏览器真实输入，断言绑定语义（`%` 是字符、`' OR 1=1 --` 匹配 0 行） |
 | `scripts/probe-mysql-schema.mts` | 对本地 MySQL 逐步验证结构编辑与导入导出，可重复运行 |
+| `scripts/e2e-table-actions.mjs` | 表批量操作与库操作工具条的端到端（MySQL 29 项 / SQLite 26 项；断言两引擎的差异，如 SQLite 无「新建数据库」、无「修复」） |
+| `scripts/verify-db-ops.mjs` | 对真实 MySQL 逐项核对**破坏性操作的效果**（清空是否真的清了、复制是否带数据、改名是否删掉原库、改编码是否落库），19 项 |
+| `scripts/probe-collate-link.mjs` | 排序规则随字符集联动：拿服务端 `information_schema` 真实列表逐项比对，含切换字符集后旧值不残留 |
+| `scripts/probe-create-table.mjs` | 「新建表」端到端：建表后从 `information_schema` 核对列、主键与自增，并实测自增真的生效；同时核对改字符集对话框的预填值 |
+| `scripts/probe-dbop-pane.mjs` | 库操作后右侧面板的状态（重命名/复制后不应停在「正在读取表和统计信息…」） |
+| `scripts/repro-rename.mjs` | 重命名的最小复现：分别验证空库与有表的库，确认原库被删除 |
 | `scripts/e2e-redis-tree.mjs` | 真实浏览器里走完 Redis 树的展开 / 新建 / 删除，并核对服务端实际状态 |
 | `scripts/e2e-redis-edit.mjs` | 真实浏览器里改值 / 改 TTL / 追加元素 / 改 hash 字段，并核对服务端实际状态 |
 | `scripts/e2e-ttl-countdown.mjs` | 真实浏览器里确认 TTL 倒计时随时间递减、重设后重新锚定、编辑框预填实时余量 |

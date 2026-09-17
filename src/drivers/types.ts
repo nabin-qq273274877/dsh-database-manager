@@ -266,6 +266,20 @@ export interface SqlDriver {
   distinctCount(schema: string | undefined, table: string, column: string): Promise<number>
 
   // ---- schema editing (the 结构 tab) ------------------------------------
+  /**
+   * Create a table from a column list.
+   *
+   * A dedicated method rather than "run this SQL": the panel has to be usable without
+   * the user writing DDL, and building the statement in the driver means the
+   * identifier quoting and the type/default validation are exactly the ones the column
+   * editor already goes through.
+   */
+  createTable(
+    schema: string | undefined,
+    table: string,
+    columns: ColumnSpec[],
+    options?: { primaryKey?: string[] },
+  ): Promise<QueryResult>
   /** Add a column. */
   addColumn(schema: string | undefined, table: string, spec: ColumnSpec): Promise<QueryResult>
   /** Change an existing column's name, type, nullability, default or comment. */

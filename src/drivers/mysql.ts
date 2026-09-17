@@ -283,22 +283,28 @@ export class MysqlDriver implements SqlDriver {
 
     if (op === 'rename') {
       const tables = await this.tableNames(from)
-      if (tables.length === 0) {
-        // A database with no tables still has to move: create the target so the
-        // rename is a rename, not a silent no-op.
-        await this.exec(`CREATE DATABASE ${target}`, [])
-        return { columns: [], rows: [], affected: 0, durationMs: Date.now() - started, write: true, truncated: false }
-      }
       // The target must exist before its tables can be moved into it.
       await this.exec(`CREATE DATABASE ${target}`, [])
-      // ONE statement for every move, so the server applies it as one atomic
-      // operation instead of leaving a half-moved database if a later table fails.
-      const moves = tables
-        .map(table => `${qualifyMysql(from, table.name)} TO ${qualifyMysql(name, table.name)}`)
-        .join(', ')
-      await this.exec(`RENAME TABLE ${moves}`, [])
-      // The now-empty source is dropped: leaving it behind would make "rename"
-      // produce two databases, one of which is an empty shell.
+      if (tables.length > 0) {
+        // ONE statement for every move, so the server applies it as one atomic
+        // operation instead of leaving a half-moved database if a later table fails.
+        const moves = tables
+          .map(table => `${qualifyMysql(from, table.name)} TO ${qualifyMysql(name, table.name)}`)
+          .join(', ')
+        await this.exec(`RENAME TABLE ${moves}`, [])
+      }
+      /*
+       * Drop the source, in BOTH branches.
+       *
+       * An earlier version returned early for a database with no tables, which meant
+       * the empty original was never dropped: renaming an EMPTY database produced TWO
+       * databases, the new one and the old shell. That is exactly the case a
+       * freshly-created database hits, so it was the common path in practice rather
+       * than an edge case — measured, not assumed.
+       *
+       * Leaving it behind would make 重命名 mean "copy the name and keep both", which
+       * is not a rename.
+       */
       await this.exec(`DROP DATABASE ${source}`, [])
       return { columns: [], rows: [], affected: tables.length, durationMs: Date.now() - started, write: true, truncated: false }
     }
@@ -821,6 +827,49 @@ export class MysqlDriver implements SqlDriver {
   // ---- schema editing ----------------------------------------------------
 
   /** Add a column. */
+  /**
+   * Create a table from a column list.
+   *
+   * The definition renderer is the SAME one `addColumn` uses, so a column created
+   * here and one added later cannot diverge in how they are rendered — and both go
+   * through the same type/default validation.
+   *
+   * A primary key is emitted as a table-level constraint rather than inline, because
+   * a composite key has no inline form; using one shape for both keeps the single- and
+   * multi-column cases byte-for-byte the same apart from the column list.
+   *
+   * No `IF NOT EXISTS`: creating a table whose name is taken should say so. Silently
+   * succeeding would leave the user believing they created something.
+   */
+  async createTable(
+    schema: string | undefined,
+    table: string,
+    columns: ColumnSpec[],
+    options: { primaryKey?: string[] } = {},
+  ): Promise<QueryResult> {
+    const target = this.requireSchema(schema)
+    const qualified = qualifyMysql(target, table)
+    if (columns.length === 0) throw new Error('a new table needs at least one column')
+
+    const items = columns.map(spec =>
+      `${requireIdentifier(spec.name, 'column name', quoteMysql)} ${renderMysqlDefinition(spec)}`,
+    )
+
+    const key = options.primaryKey ?? []
+    if (key.length > 0) {
+      // Every key column must be one of the declared columns: MySQL would reject an
+      // unknown name, but the message ("Key column 'x' doesn't exist in table") does
+      // not say which of the two lists is wrong.
+      const names = new Set(columns.map(spec => spec.name))
+      for (const name of key) {
+        if (!names.has(name)) throw new Error(`the primary key names a column that is not being created: ${name}`)
+      }
+      items.push(`PRIMARY KEY (${key.map(name => requireIdentifier(name, 'column name', quoteMysql)).join(', ')})`)
+    }
+
+    return this.exec(`CREATE TABLE ${qualified} (\n  ${items.join(',\n  ')}\n)`, [], target)
+  }
+
   async addColumn(schema: string | undefined, table: string, spec: ColumnSpec): Promise<QueryResult> {
     const target = this.requireSchema(schema)
     const qualified = qualifyMysql(target, table)

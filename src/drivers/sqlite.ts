@@ -753,6 +753,63 @@ export class SqliteDriver implements SqlDriver {
    * cannot be UNIQUE or PRIMARY KEY, and a NOT NULL column needs a non-NULL
    * default.
    */
+  /**
+   * Create a table from a column list.
+   *
+   * Built as a {@link TableShape} and rendered by `renderCreateTable` — the same
+   * renderer a rebuild and a dump use — rather than by string assembly here. That
+   * keeps one place responsible for how a table is spelled, which matters because
+   * SQLite's own quirks (the `INTEGER PRIMARY KEY` rowid alias, `AUTOINCREMENT` being
+   * legal only there) live in that renderer.
+   *
+   * A single-column key is emitted INLINE so it can carry `AUTOINCREMENT`, which
+   * SQLite only accepts on an inline `INTEGER PRIMARY KEY`; a composite key has no
+   * inline form and goes in as a table constraint. That is the renderer's decision,
+   * reached by giving it the key positions.
+   */
+  async createTable(
+    schema: string | undefined,
+    table: string,
+    columns: ColumnSpec[],
+    options: { primaryKey?: string[] } = {},
+  ): Promise<QueryResult> {
+    const qualified = qualifySqlite(schema, table)
+    if (columns.length === 0) throw new Error('a new table needs at least one column')
+
+    const key = options.primaryKey ?? []
+    const names = new Set(columns.map(spec => spec.name))
+    for (const name of key) {
+      if (!names.has(name)) throw new Error(`the primary key names a column that is not being created: ${name}`)
+    }
+    // A duplicate name would make SQLite reject the statement with a message about a
+    // duplicate column, without saying which list is wrong. Cheap to check here.
+    if (names.size !== columns.length) throw new Error('two of the new columns have the same name')
+
+    const definitions = columns.map((spec, position) => {
+      const definition = toDefinition(spec)
+      const keyPosition = key.indexOf(spec.name)
+      return keyPosition === -1 ? definition : { ...definition, primaryKeyPosition: keyPosition + 1 }
+    })
+
+    const shape: TableShape = {
+      name: table,
+      ifNotExists: false,
+      columns: definitions,
+      // A composite key needs a table-level constraint; the renderer puts a
+      // single-column key inline and ignores this one, so it is only added when it is
+      // the form that will actually be used.
+      constraints: key.length > 1
+        ? [{
+            sql: `PRIMARY KEY (${key.map(name => requireIdentifier(name, 'column name', quoteSqlite)).join(', ')})`,
+            kind: 'primary' as const,
+          }]
+        : [],
+      tail: '',
+    }
+
+    return this.exec(renderCreateTable(shape, 'sqlite'), [], schema)
+  }
+
   async addColumn(schema: string | undefined, table: string, spec: ColumnSpec): Promise<QueryResult> {
     const qualified = qualifySqlite(schema, table)
     const definition = renderColumn(toDefinition(spec), 'sqlite')

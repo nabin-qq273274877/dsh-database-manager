@@ -16,20 +16,9 @@ import * as React from 'react'
  *   where it changes.
  */
 
-import type { ColumnInfo, IndexInfo } from '../protocol.ts'
+import type { ColumnInfo, ColumnSpecPayload, IndexInfo } from '../protocol.ts'
 import type { DbApi } from './api.ts'
 import { ErrorBanner, Modal, t } from './ui.ts'
-
-/** One column-spec edit, as the host expects it. */
-export interface ColumnSpecPayload {
-  name: string
-  type: string
-  nullable: boolean
-  defaultValue?: string
-  comment?: string
-  autoIncrement?: boolean
-  unique?: boolean
-}
 
 /** Props for {@link SqlStructureTab}. */
 export interface SqlStructureTabProps {

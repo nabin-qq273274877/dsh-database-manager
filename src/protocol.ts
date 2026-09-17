@@ -344,6 +344,23 @@ export interface MaintenanceOutcome {
 /** One database-level operation. */
 export type DatabaseOpView = 'create' | 'drop' | 'rename' | 'copy' | 'charset'
 
+/**
+ * One column-spec edit, as the host expects it.
+ *
+ * Lives here rather than in a client module because it crosses the wire: the 结构
+ * tab sends it, and the table-creation dialog sends the same shape. Two definitions
+ * would be two things to keep in step.
+ */
+export interface ColumnSpecPayload {
+  name: string
+  type: string
+  nullable: boolean
+  defaultValue?: string
+  comment?: string
+  autoIncrement?: boolean
+  unique?: boolean
+}
+
 /** A table-level schema-change request. */
 export interface SchemaChangePayload {
   schema?: string
@@ -358,6 +375,18 @@ export interface SchemaChangePayload {
     | 'createIndex'
     | 'dropIndex'
     | 'createTable'
+  /**
+   * A new table's columns, for `createTable`.
+   *
+   * Named `specs` rather than `columns` on purpose: `columns` already carries a list
+   * of column NAMES for `setPrimaryKey`, and one key with two shapes is how the create
+   * request came to be read from the wrong field. Reuses the column shape the other
+   * actions take, so a table created here and a column added later go through the same
+   * validation and rendering.
+   */
+  specs?: ColumnSpecPayload[]
+  /** `createTable`: a table-level PRIMARY KEY over these columns. */
+  primaryKey?: string[]
 }
 
 /** Connection test outcome. */

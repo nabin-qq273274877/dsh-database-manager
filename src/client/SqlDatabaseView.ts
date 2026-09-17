@@ -21,6 +21,7 @@ import { SqlInsertTab } from './SqlInsertTab.ts'
 import { SqlSearchTab } from './SqlSearchTab.ts'
 import { SqlStructureTab } from './SqlStructureTab.ts'
 import { DatabaseActionDialog, MaintenanceReportDialog, TableBatchBar } from './SqlTableActions.ts'
+import { CreateTableDialog } from './CreateTableDialog.ts'
 import { ExportDialog, ImportDialog } from './SqlTransferDialogs.ts'
 import { BackButton, ErrorBanner, Empty, Modal, TabStrip, formatBytes, isNull, renderCell, t } from './ui.ts'
 
@@ -142,6 +143,8 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
   const [databaseAction, setDatabaseAction] = React.useState<'create' | 'rename' | 'copy' | 'drop' | 'charset' | undefined>(undefined)
   /** Whether a batch or database action is in flight. */
   const [batchBusy, setBatchBusy] = React.useState(false)
+  /** Whether the 新建表 dialog is open. */
+  const [creatingTable, setCreatingTable] = React.useState(false)
 
   /**
    * Table statistics for the overview pane, per database.
@@ -151,6 +154,16 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
    * cheap name-only list; the overview asks for the counts when it is opened.
    */
   const [statsBySchema, setStatsBySchema] = React.useState<Record<string, TableInfo[] | undefined>>({})
+  /**
+   * The same map, readable without becoming a dependency.
+   *
+   * `loadStats` needs to know whether a database's statistics are already cached, but
+   * taking `statsBySchema` as a dependency gave the callback a new identity on every
+   * update, which cascaded into every effect listing it. The ref answers the same
+   * question without that.
+   */
+  const statsBySchemaRef = React.useRef(statsBySchema)
+  statsBySchemaRef.current = statsBySchema
   const [statsLoading, setStatsLoading] = React.useState(false)
   /** Which destructive action is awaiting confirmation. */
   const [confirming, setConfirming] = React.useState<TableConfirm | undefined>(undefined)
@@ -232,7 +245,14 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
    * the question the user just asked.
    */
   const loadStats = React.useCallback(async (schema: string, force = false): Promise<void> => {
-    if (!force && statsBySchema[schema] !== undefined) return
+    /*
+     * The cache check reads a REF, not the state value.
+     *
+     * Depending on `statsBySchema` made this callback's identity change on every
+     * statistics update, which cascaded into every effect that lists it as a
+     * dependency. A ref answers the same question without that churn.
+     */
+    if (!force && statsBySchemaRef.current[schema] !== undefined) return
     setStatsLoading(true)
     try {
       const list = await api.tables(source.id, schema, true)
@@ -246,7 +266,28 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     } finally {
       setStatsLoading(false)
     }
-  }, [api, source.id, statsBySchema])
+  }, [api, source.id])
+
+  /**
+   * Fetch statistics for whatever database is open, whenever it has none.
+   *
+   * This is what makes "clear the cache" a safe thing to do anywhere. Without it,
+   * dropping a database's cached statistics left the pane showing 正在读取表和统计信息…
+   * forever: clearing the cache is not a reload, and only an explicit call site could
+   * start one. Measured — the pane was still on the loading text 5s after a rename
+   * with nothing in flight.
+   *
+   * An effect rather than a call added to each operation: the invariant is "an open
+   * database has statistics", and stating it once means a future operation that
+   * invalidates them cannot forget to reload.
+   */
+  React.useEffect(() => {
+    if (activeSchema === undefined) return
+    // Already loading, or already known: nothing to do.
+    if (statsLoading) return
+    if (statsBySchema[activeSchema] !== undefined) return
+    void loadStats(activeSchema)
+  }, [activeSchema, statsBySchema, statsLoading, loadStats])
 
   /**
    * Select a database, which is what puts its table list on the right.
@@ -381,13 +422,51 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     }
   }
 
-  /** Refresh everything a database-level operation invalidated. */
-  const reloadAfterDatabaseOp = async (): Promise<void> => {
+  /**
+   * Refresh what a database-level operation invalidated.
+   *
+   * Passed the databases that CHANGED, rather than clearing everything: a rename
+   * moves a database's tables to a new name, so only the two names involved are
+   * stale, and only those are re-read. Clearing the whole map would leave every other
+   * open database re-fetching for no reason.
+   *
+   * `nowOpen` is the database to select afterwards — the operation may have removed
+   * the one that was open (rename, drop) or added a new one, and leaving the pane
+   * pointed at a name that no longer exists is what produced 正在读取表和统计信息…
+   * indefinitely.
+   */
+  const reloadAfterDatabaseOp = async (changed: { stale?: string[]; nowOpen?: string | undefined }): Promise<void> => {
     await loadSchemas()
-    // The open table may be gone with the database that held it.
-    setActiveTable(undefined)
-    setStatsBySchema({})
+    // Forget the statistics of the databases whose contents or names changed.
+    if (changed.stale !== undefined && changed.stale.length > 0) {
+      const forget = new Set(changed.stale)
+      setStatsBySchema(current => {
+        const next: Record<string, TableInfo[] | undefined> = {}
+        for (const [name, tables] of Object.entries(current)) if (!forget.has(name)) next[name] = tables
+        return next
+      })
+      // The tree's cached table lists too: a rename leaves the old name holding a
+      // stale list, and the new name absent.
+      setTablesBySchema(current => {
+        const next: Record<string, TableInfo[]> = {}
+        for (const [name, tables] of Object.entries(current)) if (!forget.has(name)) next[name] = tables
+        return next
+      })
+      setOpenSchemas(current => {
+        const next = { ...current }
+        for (const name of forget) delete next[name]
+        return next
+      })
+    }
     setSelectedTables(new Set())
+    // Point the pane at whatever should be showing now. `setActiveTable(undefined)`
+    // because the table that was open belonged to the old name.
+    setActiveTable(undefined)
+    setActiveSchema(changed.nowOpen)
+    if (changed.nowOpen !== undefined) {
+      setOpenSchemas(current => (current[changed.nowOpen!] === true ? current : { ...current, [changed.nowOpen!]: true }))
+      void loadTables(changed.nowOpen)
+    }
   }
 
   /**
@@ -819,6 +898,7 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
         onMaintain: (op, tables) => { void runMaintenance(activeSchema, tables, op) },
         onExportDatabase: () => setTransfer({ kind: 'export' }),
         onImportDatabase: () => { void openImport(activeSchema) },
+        onCreateTable: () => setCreatingTable(true),
         onDatabaseAction: action => setDatabaseAction(action),
       }),
     )
@@ -1092,6 +1172,27 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
           engineKind: source.kind,
           onClose: () => setMaintenance(undefined),
         }),
+    creatingTable && activeSchema !== undefined
+      ? React.createElement(CreateTableDialog, {
+          key: 'create-table',
+          api,
+          sourceId: source.id,
+          schema: activeSchema,
+          kind: source.kind,
+          existingTables: (statsBySchema[activeSchema] ?? []).map(table => table.name),
+          onClose: () => setCreatingTable(false),
+          onCreated: table => {
+            setCreatingTable(false)
+            setNotice(t('createTable.done', { table }))
+            setError(undefined)
+            // The new table must appear in the tree and the list, and it has no
+            // statistics yet — so both are re-read rather than patched.
+            void loadTables(activeSchema, true)
+            void loadStats(activeSchema, true)
+          },
+          onError: message => { if (message !== '') setError(message) },
+        })
+      : null,
     databaseAction === undefined
       ? null
       : React.createElement(DatabaseActionDialog, {
@@ -1105,13 +1206,14 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
           busy: batchBusy,
           onBusy: setBatchBusy,
           onClose: () => setDatabaseAction(undefined),
-          onDone: message => {
+          onDone: (message, changed) => {
             setDatabaseAction(undefined)
             setNotice(message)
             setError(undefined)
-            // A create/rename/copy/drop changes the database list and can take the
-            // open table with it, so everything derived from the schema is re-read.
-            void reloadAfterDatabaseOp()
+            // A create/rename/copy/drop changes the database list and can take the open
+            // table with it, so what it touched is re-read and the pane lands on a
+            // database that actually exists.
+            void reloadAfterDatabaseOp(changed)
           },
           onError: message => { setError(message === '' ? undefined : message); if (message !== '') setNotice(undefined) },
         }),
@@ -1240,12 +1342,14 @@ function TableOverview(props: {
   onImportDatabase(): void
   /** Open one database-level action dialog. */
   onDatabaseAction(action: 'create' | 'rename' | 'copy' | 'drop' | 'charset'): void
+  /** Open the 新建表 dialog. */
+  onCreateTable(): void
 }): React.ReactElement {
   const {
     schema, tables, filter, onFilter, loading, onOpen, onTruncate, onDrop, onRefresh,
     selected, onSelect, maintenanceSupport, engineKind, busy,
     onBatchTruncate, onBatchDrop, onBatchExport, onMaintain,
-    onExportDatabase, onImportDatabase, onDatabaseAction,
+    onExportDatabase, onImportDatabase, onDatabaseAction, onCreateTable,
   } = props
 
   if (tables === undefined) {
@@ -1370,6 +1474,23 @@ function TableOverview(props: {
       }),
       React.createElement('span', { className: 'dbm-hint' }, t('db.overviewFor', { schema, n: tables.length })),
       React.createElement('span', { className: 'dbm-spacer' }),
+      /*
+       * 新建表 sits on the ROW OF TABLE controls, not with the database actions above.
+       *
+       * It creates a table in this database, so it belongs beside the table list and
+       * its filter — the row whose subject it shares. Putting it among 重命名/复制/
+       * 删除 would file it under "things that act on the database", which it is not.
+       *
+       * A freshly created database has no tables, and until now no way to get one: the
+       * panel could browse, alter and drop tables but had no way to create one.
+       */
+      React.createElement('button', {
+        type: 'button',
+        className: 'dbm-btn dbm-btn-sm',
+        disabled: busy,
+        'data-dbm-dbop': 'create-table',
+        onClick: onCreateTable,
+      }, `+ ${t('db.op.createTable')}`),
       /*
        * The refresh control carries its own busy state, rather than a hint sitting
        * beside it. A listing of a large database can take seconds (the SQLite side
