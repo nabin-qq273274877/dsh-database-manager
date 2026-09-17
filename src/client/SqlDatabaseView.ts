@@ -694,6 +694,36 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     }
   }
 
+  /**
+   * Whether the sidebar's refresh is running.
+   *
+   * A real flag: the previous handler fired its reads with `void` and returned, so
+   * there was nothing to show a busy state for — the button looked inert for as long
+   * as the reads took, which on a server with many databases is seconds.
+   */
+  const [sideRefreshing, setSideRefreshing] = React.useState(false)
+
+  /**
+   * Refresh the sidebar: the database list, plus every database that is expanded.
+   *
+   * A collapsed database is skipped on purpose — it reloads when it is next opened,
+   * and reloading all of them would pay for tables nobody is looking at.
+   *
+   * `await`ed (not `void`ed) so the caller can show that the work is in flight and
+   * finish when it is actually done.
+   */
+  const refreshSide = React.useCallback(async (): Promise<void> => {
+    setSideRefreshing(true)
+    try {
+      await loadSchemas()
+      // Only the databases currently expanded, read from the state at call time.
+      const open = schemas.filter(schema => openSchemas[schema] === true)
+      await Promise.all(open.map(schema => loadTables(schema, true)))
+    } finally {
+      setSideRefreshing(false)
+    }
+  }, [loadSchemas, loadTables, schemas, openSchemas])
+
   const left = React.createElement(
     'div',
     { className: 'dbm-side' },
@@ -707,18 +737,42 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
         placeholder: t('db.searchTable'),
         onChange: (event: { target: { value: string } }) => setTableFilter(event.target.value),
       }),
-      React.createElement('button', {
-        type: 'button',
-        className: 'dbm-btn dbm-btn-sm',
-        title: t('common.refresh'),
-        onClick: () => {
-          void loadSchemas()
-          // Refresh every database that is open, so an expanded node reflects
-          // reality after an external change. A collapsed node reloads the next
-          // time it is opened anyway.
-          for (const schema of schemas) if (openSchemas[schema] === true) void loadTables(schema, true)
+      /*
+       * 新建数据库 sits here, immediately left of the refresh control.
+       *
+       * It was a labelled button in the overview toolbar, which is a long way from
+       * where a database is chosen and reads as an action on the tables below it.
+       * A "+" beside the refresh control is where a user looks for "add another one
+       * of the things this list holds" — the list is the database tree, so the
+       * button belongs to the tree's own header.
+       *
+       * Absent on SQLite, where there is no `CREATE DATABASE`: a SQLite database is a
+       * file, so creating one means creating a data source. Offering the control
+       * there would be a button whose only outcome is an explanation.
+       */
+      source.kind === 'mysql'
+        ? React.createElement('button', {
+            type: 'button',
+            className: 'dbm-btn dbm-btn-sm',
+            title: t('db.op.create'),
+            'aria-label': t('db.op.create'),
+            'data-dbm-side-create': '',
+            onClick: () => setDatabaseAction('create'),
+          }, '+')
+        : null,
+      React.createElement(
+        'button',
+        {
+          type: 'button',
+          className: `dbm-btn dbm-btn-sm${sideRefreshing ? ' dbm-btn-busy' : ''}`,
+          title: t('common.refresh'),
+          disabled: sideRefreshing,
+          'aria-busy': sideRefreshing ? 'true' : undefined,
+          'data-dbm-side-refresh': '',
+          onClick: () => { void refreshSide() },
         },
-      }, '⟳'),
+        sideRefreshing ? React.createElement('span', { className: 'dbm-spinner' }) : '⟳',
+      ),
     ),
     React.createElement('div', { className: 'dbm-side-body' }, tree as never),
   )
@@ -766,9 +820,6 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
         onExportDatabase: () => setTransfer({ kind: 'export' }),
         onImportDatabase: () => { void openImport(activeSchema) },
         onDatabaseAction: action => setDatabaseAction(action),
-        // SQLite's database is a file, and creating one means creating a data source;
-        // offering a CREATE DATABASE that cannot exist would be a lie.
-        canCreateDatabase: source.kind === 'mysql',
       }),
     )
   } else {
@@ -1189,14 +1240,12 @@ function TableOverview(props: {
   onImportDatabase(): void
   /** Open one database-level action dialog. */
   onDatabaseAction(action: 'create' | 'rename' | 'copy' | 'drop' | 'charset'): void
-  /** Whether this engine can create / rename / copy / drop a database at all. */
-  canCreateDatabase: boolean
 }): React.ReactElement {
   const {
     schema, tables, filter, onFilter, loading, onOpen, onTruncate, onDrop, onRefresh,
     selected, onSelect, maintenanceSupport, engineKind, busy,
     onBatchTruncate, onBatchDrop, onBatchExport, onMaintain,
-    onExportDatabase, onImportDatabase, onDatabaseAction, canCreateDatabase,
+    onExportDatabase, onImportDatabase, onDatabaseAction,
   } = props
 
   if (tables === undefined) {
@@ -1250,21 +1299,16 @@ function TableOverview(props: {
      * The database-level toolbar.
      *
      * Separate from the table filter below it, because these act on the DATABASE
-     * rather than on a table: mixing them into one row made "new database" sit next
-     * to "filter tables", which reads as if it filtered something.
+     * rather than on a table: mixing them into one row made the actions sit next to
+     * "filter tables", which reads as if they filtered something.
+     *
+     * 新建数据库 is NOT here: it lives in the sidebar header beside the refresh
+     * control, next to the database list it adds to. See the sidebar's own comment.
      */
     React.createElement(
       'div',
       { className: 'dbm-toolbar', 'data-dbm-db-toolbar': '' },
       React.createElement('span', { className: 'dbm-hint' }, `${t('db.op.title')}：`),
-      canCreateDatabase
-        ? React.createElement('button', {
-            type: 'button',
-            className: 'dbm-btn dbm-btn-sm',
-            'data-dbm-dbop': 'create',
-            onClick: () => onDatabaseAction('create'),
-          }, `+ ${t('db.op.create')}`)
-        : null,
       React.createElement('button', {
         type: 'button',
         className: 'dbm-btn dbm-btn-sm',

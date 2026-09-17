@@ -19,7 +19,7 @@ import { WebSocket } from 'ws'
  *   - the number element's right edge vs the row's right edge (a cut-off number
  *     has the element extending past the row, or clipped by an ancestor's
  *     overflow);
- *   - `box-sizing`, because a 100%-width flex row with padding and
+ *   - 'box-sizing', because a 100%-width flex row with padding and
  *     content-box sizing is wider than its container by the padding.
  *
  * Usage: node scripts/measure-tree-number.mjs <baseUrl-with-token> <sqliteFile>

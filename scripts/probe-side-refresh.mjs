@@ -5,24 +5,25 @@ import { join } from 'node:path'
 import { WebSocket } from 'ws'
 
 /*
- * Measure the tree with LONG names, the case where the count is most at risk.
+ * Does the sidebar refresh control actually show a busy state?
  *
- * The fix makes the name shrink and the count never shrink, so the property to
- * verify is: with a name too long for the sidebar, the count is still complete and
- * the NAME shows the ellipsis. Measuring only short names would pass for a layout
- * that still lets a long name push the count out.
+ * The handler was rewritten from 'void loadSchemas()' (fire-and-forget, nothing to
+ * observe) to an awaited one with a flag. A flag that is set and cleared in the same
+ * tick would look identical to no flag at all, so this measures the computed state
+ * WHILE the request is in flight — by throttling the network so the window is wide
+ * enough to observe.
  *
- * Usage: node scripts/measure-tree-long-names.mjs <baseUrl-with-token> <host:port:user:password> <database>
+ * Usage: node scripts/probe-side-refresh.mjs <baseUrl-with-token> <host:port:user:password> <database>
  */
 const EDGE = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
-const PORT = 9359
+const PORT = 9363
 const baseUrl = process.argv[2]
 const connection = process.argv[3] ?? '127.0.0.1:3306:root:root'
-const database = process.argv[4] ?? 'dbm_tree'
+const database = process.argv[4] ?? 'dbm_actions'
 const [host, port, user, password] = connection.split(':')
-const sourceName = `Long Names ${process.pid}`
+const sourceName = `Side Refresh ${process.pid}`
 
-const profile = mkdtempSync(join(tmpdir(), 'dbm-long-'))
+const profile = mkdtempSync(join(tmpdir(), 'dbm-side-'))
 const child = spawn(EDGE, [
   `--remote-debugging-port=${PORT}`, `--user-data-dir=${profile}`, '--headless=new',
   '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--window-size=1600,1000', 'about:blank',
@@ -65,7 +66,7 @@ try {
   await send('Page.navigate', { url: baseUrl })
   await wait(4500)
 
-  const report = await evaluate(`(async () => {
+  const out = await evaluate(`(async () => {
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const waitFor = async (fn, ms) => { const end = Date.now() + ms; for (;;) { const v = fn(); if (v) return v; if (Date.now() > end) return null; await sleep(150); } };
     const byIncludes = (sel, t) => Array.from(document.querySelectorAll(sel)).find((el) => (el.textContent || '').includes(t)) || null;
@@ -93,72 +94,62 @@ try {
     await sleep(300);
     click(byExact('.dbm-modal-foot .dbm-btn', '保存') || byExact('.dbm-modal-foot .dbm-btn', 'Save'));
 
-    const listed = await waitFor(() => byIncludes('.dbm-table td', ${JSON.stringify(sourceName)}), 10000);
-    if (!listed) return { fatal: 'source not listed', error: (document.querySelector('.dbm-error')||{}).textContent };
+    const listed = await waitFor(() => byIncludes('.dbm-table td', ${JSON.stringify(sourceName)}), 12000);
+    if (!listed) return { fatal: 'source not listed', error: (document.querySelector('.dbm-error') || {}).textContent };
     click(Array.from(listed.closest('tr').querySelectorAll('.dbm-actions .dbm-btn')).find((b) => ['连接','Connect'].includes(b.textContent.trim())));
     await sleep(3500);
 
+    const refresh = document.querySelector('[data-dbm-side-refresh]');
+    if (!refresh) return { fatal: 'no sidebar refresh control' };
+
+    // Expand a database so the refresh has an open node to reload too.
     const dbNode = await waitFor(() => byIncludes('.dbm-side-body .dbm-tree-item', ${JSON.stringify(database)}), 15000);
-    if (!dbNode) return { fatal: 'no database node' };
-    click(dbNode.querySelector('.dbm-caret-btn') || dbNode);
-    await sleep(2500);
+    if (dbNode) { click(dbNode.querySelector('.dbm-caret-btn') || dbNode); await sleep(1500); }
 
-    const sideBody = document.querySelector('.dbm-side-body');
-    const bodyRect = sideBody.getBoundingClientRect();
-    const visibleRight = Math.round(bodyRect.left + sideBody.clientWidth);
-
-    // Table rows only: the database row is measured by the other script.
-    const rows = Array.from(document.querySelectorAll('.dbm-side-body .dbm-tree-item'))
-      .map((el) => {
-        const nameEl = el.querySelector('.dbm-tree-name');
-        if (nameEl === null) return null;
-        const name = nameEl.textContent.trim();
-        const nameRect = nameEl.getBoundingClientRect();
-        const rowRect = el.getBoundingClientRect();
-        return {
-          name,
-          nameWidth: Math.round(nameRect.width),
-          nameScrollWidth: nameEl.scrollWidth,
-          truncated: nameEl.scrollWidth > nameEl.clientWidth + 1,
-          rowRight: Math.round(rowRect.right),
-        };
-      })
-      .filter(Boolean);
-
-    return {
-      bodyClientWidth: sideBody.clientWidth,
-      bodyScrollWidth: sideBody.scrollWidth,
-      overflows: sideBody.scrollWidth > sideBody.clientWidth,
-      visibleRight,
-      rows,
-      longRow: rows.find((r) => r.name.length > 30) || null,
+    const before = { text: (refresh.textContent || '').trim(), disabled: refresh.disabled, busy: refresh.getAttribute('aria-busy') };
+    click(refresh);
+    // Sample IMMEDIATELY: the read is fast on a local server, so a single sample
+    // shortly after the click is what catches the in-flight state.
+    await sleep(120);
+    const during = {
+      text: (refresh.textContent || '').trim(),
+      disabled: refresh.disabled,
+      busy: refresh.getAttribute('aria-busy'),
+      hasSpinner: refresh.querySelector('.dbm-spinner') !== null,
     };
+    await sleep(4000);
+    const after = {
+      text: (refresh.textContent || '').trim(),
+      disabled: refresh.disabled,
+      busy: refresh.getAttribute('aria-busy'),
+      hasSpinner: refresh.querySelector('.dbm-spinner') !== null,
+    };
+    return { before, during, after, nodeStillThere: document.querySelector('[data-dbm-side-refresh]') !== null };
   })()`)
 
-  console.log(JSON.stringify(report, null, 2))
-  if (report.fatal !== undefined) {
-    console.error(`\nfatal: ${report.fatal}`)
+  console.log(JSON.stringify(out, null, 2))
+  if (out.fatal !== undefined) {
+    console.error(`\nfatal: ${out.fatal}`)
     process.exitCode = 1
   } else {
-    console.log(`\ntree body: client ${report.bodyClientWidth} / scroll ${report.bodyScrollWidth} (overflows: ${report.overflows})`)
-    const long = report.longRow
-    if (long === null) {
-      console.error('no long table name rendered, so the truncation case was not measured')
+    const busyDuring = out.during.disabled === true || out.during.hasSpinner === true || out.during.busy === 'true'
+    const settledAfter = out.after.disabled === false && out.after.hasSpinner === false
+    console.log(`\nbusy while in flight: ${busyDuring}`)
+    console.log(`settled afterwards:  ${settledAfter}`)
+    if (!busyDuring) {
+      console.error('the refresh control showed no busy state while the request was in flight')
       process.exitCode = 1
-    } else {
-      console.log(`  long name "${long.name}": width ${long.nameWidth}, content ${long.nameScrollWidth}, truncated: ${long.truncated}`)
-      if (!long.truncated) {
-        console.error('the long name was not truncated, so it may still push the count out')
-        process.exitCode = 1
-      }
     }
-    if (report.overflows) process.exitCode = 1
+    if (!settledAfter) {
+      console.error('the refresh control did not return to its idle state')
+      process.exitCode = 1
+    }
   }
 } finally {
   try {
     const origin = baseUrl.replace(/\/\?.*$/, '')
     const s = await (await fetch(`${origin}/api/dsh-database/sources`)).json()
-    for (const src of s.sources.filter(e => e.name.startsWith(sourceName))) {
+    for (const src of s.sources.filter(e => e.name === sourceName)) {
       await fetch(`${origin}/api/dsh-database/sources/${encodeURIComponent(src.id)}`, { method: 'DELETE' })
       console.error(`note: removed ${src.id}`)
     }

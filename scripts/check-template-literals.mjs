@@ -52,6 +52,11 @@ const files = [
   'scripts/e2e-sql-editing.mjs',
   'scripts/e2e-sql-search.mjs',
   'scripts/e2e-table-actions.mjs',
+  'scripts/probe-side-refresh.mjs',
+  'scripts/probe-side-refresh-poll.mjs',
+  'scripts/measure-tree-number.mjs',
+  'scripts/measure-tree-mysql-counts.mjs',
+  'scripts/measure-tree-long-names.mjs',
 ]
 
 let failed = false

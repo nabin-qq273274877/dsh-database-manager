@@ -10,7 +10,7 @@ import { WebSocket } from 'ws'
  * The reported bug was on MySQL (a database with a dozen tables), and the case
  * that matters most is the one where the NAME is long: the count must still be
  * fully visible, with the name truncated instead. The SQLite measurement in
- * `measure-tree-number.mjs` covers the single-schema engine; this covers the
+ * 'measure-tree-number.mjs' covers the single-schema engine; this covers the
  * multi-table shape the screenshot showed.
  *
  * It exits non-zero if any count is clipped, so it can be run as a check.
@@ -199,7 +199,7 @@ try {
     /*
      * The DATABASE row is what this checks.
      *
-     * The reported bug was the count on a database node (`my91jf  10:` with the
+     * The reported bug was the count on a database node ('my91jf  10:' with the
      * last character cut off). A table row carries a count only once the row
      * statistics have been fetched, so requiring one here would fail for a reason
      * unrelated to the bug.
@@ -228,7 +228,7 @@ try {
   try {
     const origin = baseUrl.replace(/\/\?.*$/, '')
     const sources = await (await fetch(`${origin}/api/dsh-database/sources`)).json()
-    for (const source of sources.sources.filter(entry => entry.name === sourceName)) {
+    for (const source of sources.sources.filter(entry => entry.name.startsWith(sourceName))) {
       await fetch(`${origin}/api/dsh-database/sources/${encodeURIComponent(source.id)}`, { method: 'DELETE' })
       console.error(`note: removed the run's data source (${source.id})`)
     }

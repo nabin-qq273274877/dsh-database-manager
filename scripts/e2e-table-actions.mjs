@@ -207,13 +207,39 @@ try {
     if (!dbToolbar) return { fatal: 'the database toolbar never rendered', error: (document.querySelector('.dbm-error') || {}).textContent };
     out.dbToolbarButtons = Array.from(dbToolbar.querySelectorAll('.dbm-btn')).map((b) => (b.textContent || '').trim());
 
-    // requirement 6: the "new database" entry exists on MySQL and says why not on SQLite.
-    const createBtn = dbToolbar.querySelector('[data-dbm-dbop="create"]');
-    if (${JSON.stringify(engine)} === 'mysql') {
-      check('a new-database entry is offered', createBtn !== null, out.dbToolbarButtons);
+    /*
+     * requirement 6: 新建数据库 lives in the SIDEBAR HEADER, immediately left of the
+     * refresh control.
+     *
+     * Asserted as position, not only as presence: the request was specifically to put
+     * it before the refresh control, and a button that merely exists somewhere would
+     * satisfy a presence check while being in the wrong place. The order is read from
+     * the rendered DOM.
+     */
+    const sideHead = document.querySelector('.dbm-side-head');
+    if (sideHead === null) {
+      check('the sidebar header is present', false);
     } else {
-      // A SQLite database is a file; the entry is absent and the docs say so.
-      check('no CREATE DATABASE is offered for SQLite', createBtn === null, out.dbToolbarButtons);
+      check('the sidebar header is present', true);
+      const createBtn = sideHead.querySelector('[data-dbm-side-create]');
+      const refreshBtn = sideHead.querySelector('[data-dbm-side-refresh]');
+      check('the sidebar header has a refresh control', refreshBtn !== null);
+      if (${JSON.stringify(engine)} === 'mysql') {
+        check('a new-database control is offered in the sidebar', createBtn !== null);
+        if (createBtn !== null && refreshBtn !== null) {
+          // Document order is left-to-right in this row, so create must come first.
+          const order = Array.from(sideHead.querySelectorAll('button')).map((b) => (b.getAttribute('data-dbm-side-create') !== null ? 'create' : b.getAttribute('data-dbm-side-refresh') !== null ? 'refresh' : 'other'));
+          out.sideHeadOrder = order;
+          check('the new-database control sits BEFORE the refresh control', order.indexOf('create') !== -1 && order.indexOf('create') < order.indexOf('refresh'), order);
+        }
+        check('the new-database control is a plus glyph', createBtn !== null && (createBtn.textContent || '').trim() === '+', createBtn === null ? null : createBtn.textContent);
+        // The labelled button must be GONE from the toolbar, not duplicated.
+        check('the overview toolbar no longer carries a create button', dbToolbar.querySelector('[data-dbm-dbop="create"]') === null);
+      } else {
+        // A SQLite database is a file; the control is absent rather than present and
+        // failing.
+        check('no CREATE DATABASE is offered for SQLite', createBtn === null);
+      }
     }
     // requirement 7: the database actions are present.
     for (const op of ['export', 'import', 'rename', 'copy', 'charset', 'drop']) {
