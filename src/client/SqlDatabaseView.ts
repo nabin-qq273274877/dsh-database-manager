@@ -167,13 +167,20 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
    * database would otherwise show its tables on the right while the tree
    * continued to claim it held none.
    *
-   * It deliberately does NOT clear `activeTable` when the database is
-   * unchanged — re-clicking the current database should not throw away the open
-   * table. Switching to a different database does clear it, since that table is
-   * not in the new one.
+   * Clicking a database ALWAYS returns the right pane to that database's table
+   * list, including when a table of that same database is currently open. The
+   * earlier version kept `activeTable` when the database was unchanged (it
+   * wanted a re-click not to discard the open table), with the result that
+   * there was no way back to the database overview: once a table was open, the
+   * right pane stayed on that table and clicking the database did nothing
+   * visible. phpMyAdmin's tree behaves the other way — the database node is the
+   * way UP a level — and that is the gesture users arrive with.
+   *
+   * Returning to a table is one click away anyway (its name in the overview or
+   * in the tree), whereas the overview had no control at all.
    */
   const selectSchema = (schema: string): void => {
-    if (activeSchema !== schema) setActiveTable(undefined)
+    setActiveTable(undefined)
     setActiveSchema(schema)
     setOpenSchemas(current => (current[schema] === true ? current : { ...current, [schema]: true }))
     setError(undefined)

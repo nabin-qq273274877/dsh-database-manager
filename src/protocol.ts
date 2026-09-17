@@ -139,6 +139,30 @@ export interface ColumnInfo {
   key: string
   comment?: string
   extra?: string
+  /**
+   * 1-based position of this column inside the table's primary key.
+   *
+   * Present only for primary-key columns. `key === 'PRI'` says a column takes
+   * part in the key but not where: a composite key's ORDER decides which
+   * leading subsets an index can serve, so the 结构 tab needs the positions to
+   * say "index (a, b)" truthfully and to let a user drop just one column of a
+   * composite key.
+   */
+  primaryKeyPosition?: number
+  /**
+   * enum/set members, in declared order (MySQL). Absent for every other type.
+   *
+   * Carried on the wire rather than parsed by the browser: the members come
+   * from the column's declared type, and a client-side regex on a type string
+   * would have to re-implement MySQL's quoting rules for `enum('a''b')`.
+   */
+  options?: string[]
+  /**
+   * The column's value is computed by the engine and cannot be inserted or
+   * updated. MySQL marks it in `EXTRA`; SQLite reports a generated column only
+   * in the table's `CREATE` text.
+   */
+  generated?: boolean
 }
 
 /** One index description (the 结构 tab). */
@@ -148,6 +172,15 @@ export interface IndexInfo {
   columns: string[]
   /** Engine-specific index algorithm/type when reported. */
   type?: string
+  /**
+   * True for a primary key's own index.
+   *
+   * MySQL reports it as an ordinary index named `PRIMARY`; SQLite reports the
+   * implicit `sqlite_autoindex_*` with `origin = 'pk'`. A user must not be able
+   * to drop it as if it were a separate index — dropping it means dropping the
+   * primary key — so the distinction has to survive normalization.
+   */
+  primary?: boolean
 }
 
 /** A tabular result set. */

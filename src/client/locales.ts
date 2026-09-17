@@ -35,6 +35,7 @@ export const zh = {
 
   'col.kind': '数据库类型',
   'col.name': '名称',
+  'col.group': '分组',
   'col.host': '主机',
   'col.user': '用户',
   'col.auth': '认证',
@@ -368,6 +369,7 @@ export const en: Record<DbKey, string> = {
 
   'col.kind': 'Engine',
   'col.name': 'Name',
+  'col.group': 'Group',
   'col.host': 'Host',
   'col.user': 'User',
   'col.auth': 'Auth',

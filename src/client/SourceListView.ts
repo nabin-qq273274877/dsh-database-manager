@@ -157,7 +157,7 @@ export function SourceListView(props: SourceListViewProps): React.ReactElement {
           { key: `group-${group.label}` },
           React.createElement(
             'td',
-            { colSpan: 7, className: 'dbm-hint', style: { background: 'var(--dsw-alias-interactive-bg-hover)', fontWeight: 500 } },
+            { colSpan: 8, className: 'dbm-hint', style: { background: 'var(--dsw-alias-interactive-bg-hover)', fontWeight: 500 } },
             `${group.label} (${group.items.length})`,
           ),
         ),
@@ -179,6 +179,16 @@ export function SourceListView(props: SourceListViewProps): React.ReactElement {
           ),
           React.createElement('td', { className: 'dbm-mono' }, hostOf(source)),
           React.createElement('td', null, source.kind === 'mysql' ? (source.user ?? t('common.none')) : t('common.none')),
+          /*
+           * 分组 as its own column, not only as the grouping header.
+           *
+           * The group was previously reachable ONLY by switching the toolbar to
+           * 「按分组」, so a source's group was invisible in the default list — the
+           * one thing a user scans the list to learn. Showing it per row also
+           * makes 「按分组」 a rearrangement of information already on screen
+           * rather than the only way to see it.
+           */
+          React.createElement('td', null, source.group === '' ? t('common.none') : source.group),
           React.createElement(
             'td',
             null,
@@ -300,7 +310,7 @@ export function SourceListView(props: SourceListViewProps): React.ReactElement {
                 React.createElement(
                   'tr',
                   null,
-                  ...[t('col.kind'), t('col.name'), t('col.host'), t('col.user'), t('col.auth'), t('col.tags'), t('col.actions')].map(label =>
+                  ...[t('col.kind'), t('col.name'), t('col.group'), t('col.host'), t('col.user'), t('col.auth'), t('col.tags'), t('col.actions')].map(label =>
                     React.createElement('th', { key: label }, label),
                   ),
                 ),
@@ -355,11 +365,14 @@ export function SourceListView(props: SourceListViewProps): React.ReactElement {
       React.createElement('span', { className: 'dbm-title' }, t('panel.title')),
       React.createElement('span', { className: 'dbm-subtitle' }, t('panel.subtitle')),
       React.createElement('span', { className: 'dbm-spacer' }),
-      React.createElement(
-        'span',
-        { className: 'dbm-hint' },
-        `${t('panel.engines')}: ${engines.map(engine => `${engine.kind}${engine.available ? '' : ' ✗'}`).join(' · ')}`,
-      ),
+      /*
+       * The engine-availability line used to sit in this corner, spelling out
+       * 「引擎: sqlite · mysql · redis」 on every screen — which repeats the
+       * Engine column of the list right below it and says nothing at all when
+       * all three are present. A MISSING driver is the only fact worth
+       * surfacing here, and it is already rendered as its own banner above the
+       * table (see the `unavailable` block), where it names the reason.
+       */
     ),
     ...children as never[],
   )

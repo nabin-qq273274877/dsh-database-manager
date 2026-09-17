@@ -33,21 +33,82 @@ export interface RowQuery {
   table: string
   page: number
   pageSize: number
-  /** Column to sort by; must be an existing column of the table. */
+  /**
+   * Column to sort by; must be an existing column of the table.
+   *
+   * `orderByIndex` takes precedence when set: sorting by the table's PRIMARY KEY
+   * is the common case (phpMyAdmin's 「按主键排序」) and an index's column list is
+   * not the same as the key's, so the two are named separately.
+   */
   orderBy?: string
   orderDir?: 'asc' | 'desc'
   /**
-   * Which tab produced this read, which decides how the filter is applied:
-   * - 'browse' — no filter.
-   * - 'search' — `where` is a free-text term matched against every text column.
-   * - 'sql'    — `where` is a raw SQL condition appended verbatim to WHERE.
+   * Sort by the given columns, in order, instead of `orderBy`.
+   *
+   * Used by the 浏览 tab's 按索引排序: a table with no primary key still has
+   * indexes, and sorting by one is how a user answers "show me the duplicates"
+   * or "is this index actually used". Each entry is an existing column name.
+   */
+  orderByColumns?: string[]
+  /**
+   * Which filter this read applies:
+   * - 'browse' — no filter unless `condition` is set.
+   * - 'search' — the structured `filters` list, ANDed or ORed by `filterJoin`.
+   * - 'sql'    — a raw SQL condition appended verbatim (the SQL tab's own path).
    */
   mode: 'browse' | 'search'
-  /** Search term (mode 'search'). */
+  /** Free-text term matched against every text column (the quick search box). */
   term?: string
-  /** Raw SQL condition (privileged path used only by the row editor's SQL box). */
+  /** Raw SQL condition (privileged path; single condition, no separator). */
   condition?: string
+  /** Structured search conditions from the 搜索 tab's column form. */
+  filters?: RowFilter[]
+  /** How the structured filters combine. Defaults to 'AND'. */
+  filterJoin?: 'and' | 'or'
 }
+
+/**
+ * One condition from the 搜索 tab.
+ *
+ * Structured rather than a SQL fragment so the operator decides the SQL shape:
+ * `contains` is `LIKE %v%` (a bound pattern), `is null` is `IS NULL` (no bound
+ * value at all), `in` is a list of bound parameters. Building this as text would
+ * put the user's operand back into the statement.
+ */
+export interface RowFilter {
+  /** Column the condition applies to; must exist on the table. */
+  column: string
+  /** Comparison to apply. */
+  operator: RowFilterOperator
+  /** Operand; ignored by the unary operators (`is null`, `is not null`). */
+  value?: string
+  /**
+   * True when the operand is a pre-built operator fragment rather than the
+   * column's own type. Set by the 结构 tab's 「非重复值」 shortcut, not by a user
+   * typing; it is not exposed in the 搜索 tab's operator list.
+   */
+  raw?: boolean
+  /** For `between`: the upper bound. */
+  value2?: string
+}
+
+/**
+ * The comparison operators the 搜索 tab offers.
+ *
+ * Deliberately a closed set: each one maps to a SQL shape this plugin writes,
+ * so the operand is always a bound parameter and never part of the statement.
+ */
+export type RowFilterOperator =
+  | 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte'
+  | 'contains' | 'notContains' | 'startsWith' | 'endsWith'
+  | 'isNull' | 'isNotNull' | 'between' | 'in'
+
+/** Canonical operator order, for validation and the UI's select. */
+export const ROW_FILTER_OPERATORS: readonly RowFilterOperator[] = [
+  'eq', 'neq', 'gt', 'gte', 'lt', 'lte',
+  'contains', 'notContains', 'startsWith', 'endsWith',
+  'between', 'in', 'isNull', 'isNotNull',
+]
 
 /** A key/value pair identifying one row for an update or delete. */
 export interface RowKey {
@@ -59,6 +120,29 @@ export interface RowKey {
 export interface RowValue {
   column: string
   value: string | number | boolean | null
+}
+
+/**
+ * One column's definition for a schema change.
+ *
+ * Distinct from {@link RowValue}: this is DDL, so `defaultValue` is an
+ * expression and `type` is a declared type — both validated by the driver
+ * before they reach a statement.
+ */
+export interface ColumnSpec {
+  name: string
+  type: string
+  nullable: boolean
+  defaultValue?: string
+  /** Part of the primary key, in the position given. */
+  primaryKeyPosition?: number
+  /** Autoincrement / rowid alias. */
+  autoIncrement?: boolean
+  /** Attached UNIQUE constraint. */
+  unique?: boolean
+  comment?: string
+  /** True when this column starts a new one rather than replacing an existing one. */
+  added?: boolean
 }
 
 /** Options for a table listing. */
@@ -99,10 +183,42 @@ export interface SqlDriver {
   exec(sql: string, params: unknown[], schema?: string): Promise<QueryResult>
   /** Insert one row. */
   insertRow(schema: string | undefined, table: string, values: RowValue[]): Promise<QueryResult>
+  /** Insert several rows in one transaction; returns the total rows affected. */
+  insertRows(schema: string | undefined, table: string, rows: RowValue[][]): Promise<QueryResult>
   /** Update rows matched by `keys`. */
   updateRow(schema: string | undefined, table: string, values: RowValue[], keys: RowKey[]): Promise<QueryResult>
   /** Delete rows matched by `keys`. */
   deleteRow(schema: string | undefined, table: string, keys: RowKey[]): Promise<QueryResult>
+  /**
+   * Delete every row matched by any of `keySets`, in ONE transaction.
+   *
+   * The batch form of {@link deleteRow}, for the 浏览 tab's multi-select. One
+   * statement per key set rather than an `IN` list, because a key may be
+   * composite or contain NULL and neither survives an `IN (…)` unchanged.
+   */
+  deleteRows(schema: string | undefined, table: string, keySets: RowKey[][]): Promise<QueryResult>
+  /**
+   * How many distinct values a column holds (COUNT(DISTINCT col)).
+   *
+   * Nullable columns report the count of non-NULL distinct values; the UI says
+   * SO rather than adding one for the NULL group, which would be a different
+   * number from what the query returns.
+   */
+  distinctCount(schema: string | undefined, table: string, column: string): Promise<number>
+
+  // ---- schema editing (the 结构 tab) ------------------------------------
+  /** Add a column. */
+  addColumn(schema: string | undefined, table: string, spec: ColumnSpec): Promise<QueryResult>
+  /** Change an existing column's name, type, nullability, default or comment. */
+  alterColumn(schema: string | undefined, table: string, spec: ColumnSpec, options?: { rename?: string }): Promise<QueryResult>
+  /** Drop a column. */
+  dropColumn(schema: string | undefined, table: string, column: string): Promise<QueryResult>
+  /** Replace the table's primary key with `columns`, in that order (empty drops it). */
+  setPrimaryKey(schema: string | undefined, table: string, columns: string[]): Promise<QueryResult>
+  /** Create an index. */
+  createIndex(schema: string | undefined, table: string, spec: { name: string; columns: string[]; unique: boolean }): Promise<QueryResult>
+  /** Drop an index. Refuses a primary key's own index. */
+  dropIndex(schema: string | undefined, table: string, name: string): Promise<QueryResult>
   /**
    * Remove every row of a table, keeping the table itself.
    *

@@ -9,8 +9,9 @@
  */
 
 import type { ColumnInfo, DataSourceEntry, IndexInfo, QueryResult, SchemaInfo, TableInfo, TablePage, TestResult } from '../protocol.ts'
-import { assertSingleStatement, looksReadOnly, pushDownLimit, qualifyMysql, quoteMysql, requireIdentifier, toWireValue } from '../sql-util.ts'
-import type { RowKey, RowQuery, RowValue, SqlDriver, TableListOptions } from './types.ts'
+import { assertSingleStatement, buildSearchWhere, looksReadOnly, pushDownLimit, qualifyMysql, quoteMysql, requireIdentifier, toWireValue } from '../sql-util.ts'
+import { identifier, normalizeDefault, normalizeType } from '../sql-schema.ts'
+import type { ColumnSpec, RowKey, RowQuery, RowValue, SqlDriver, TableListOptions } from './types.ts'
 
 /** Structural view of the mysql2/promise surface this driver uses. */
 interface MysqlConnection {
@@ -222,20 +223,47 @@ export class MysqlDriver implements SqlDriver {
         'FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION',
       values: [target, table],
     })
+    // The primary key's column order comes from STATISTICS, not from COLUMNS:
+    // a composite key's order decides which leading subsets an index can serve,
+    // and `COLUMN_KEY = 'PRI'` says only that a column takes part in it.
+    const [keyRows] = await (await this.open()).query({
+      sql:
+        'SELECT COLUMN_NAME AS name, SEQ_IN_INDEX AS seq FROM information_schema.STATISTICS ' +
+        "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = 'PRIMARY' ORDER BY SEQ_IN_INDEX",
+      values: [target, table],
+    })
+    const keyPositions = new Map<string, number>()
+    if (Array.isArray(keyRows)) {
+      for (const row of keyRows) {
+        const record = row as Record<string, unknown>
+        const name = String(record['name'] ?? '')
+        if (name !== '') keyPositions.set(name, Number(record['seq'] ?? 0))
+      }
+    }
+
     const list = Array.isArray(rows) ? rows : []
     return list.map(row => {
       const record = row as Record<string, unknown>
+      const name = String(record['name'] ?? '')
       const dflt = toWireValue(record['dflt'])
       const comment = toWireValue(record['comment'])
       const extra = toWireValue(record['extra'])
+      const position = keyPositions.get(name)
+      const options = readEnumOptions(String(record['type'] ?? ''))
       return {
-        name: String(record['name'] ?? ''),
+        name,
         type: String(record['type'] ?? ''),
         nullable: String(record['nullable'] ?? 'YES').toUpperCase() === 'YES',
         ...(dflt === null ? {} : { defaultValue: String(dflt) }),
         key: String(record['col_key'] ?? ''),
         ...(typeof comment === 'string' && comment !== '' ? { comment } : {}),
         ...(typeof extra === 'string' && extra !== '' ? { extra } : {}),
+        ...(position === undefined ? {} : { primaryKeyPosition: position }),
+        ...(options === undefined ? {} : { options }),
+        // `EXTRA` is where MySQL says a column is computed. A generated column
+        // cannot be inserted into or updated, so the 插入 and 浏览 surfaces must
+        // not offer it as an editable input.
+        ...(typeof extra === 'string' && /GENERATED/i.test(extra) ? { generated: true } : {}),
       } satisfies ColumnInfo
     })
   }
@@ -267,6 +295,10 @@ export class MysqlDriver implements SqlDriver {
       unique: entry.unique,
       columns: entry.columns.sort((a, b) => a.seq - b.seq).map(item => item.name),
       ...(entry.type === undefined ? {} : { type: entry.type }),
+      // MySQL reports the primary key as an ordinary index named PRIMARY. It
+      // cannot be dropped as an index — that means dropping the key — so the
+      // flag has to reach the browser.
+      ...(name === 'PRIMARY' ? { primary: true } : {}),
     }) satisfies IndexInfo)
   }
 
@@ -275,8 +307,26 @@ export class MysqlDriver implements SqlDriver {
     const columns = await this.columns(schema, query.table)
     if (columns.length === 0) throw new Error(`no such table: ${schema}.${query.table}`)
     const qualified = qualifyMysql(schema, query.table)
-    const known = new Set(columns.map(column => column.name))
-    const { where, params } = buildFilter(query, columns)
+    const pages = await this.rowsInternal(schema, qualified, query, columns, false)
+    return pages
+  }
+
+  /**
+   * One page of rows.
+   *
+   * @param forEditor - true when the caller will turn these rows into edits, so
+   *   rows must be identifiable. See the primary-key caveat below.
+   */
+  private async rowsInternal(
+    schema: string,
+    qualified: string,
+    query: RowQuery,
+    columns: ColumnInfo[],
+    forEditor: boolean,
+  ): Promise<TablePage> {
+    void forEditor
+    const known = new Set(columns.map(column => column.name.toLowerCase()))
+    const { where, params } = buildFilter(query, columns, known)
 
     const [countRows] = await (await this.open()).query({
       sql: `SELECT COUNT(*) AS n FROM ${qualified}${where}`,
@@ -285,9 +335,7 @@ export class MysqlDriver implements SqlDriver {
     const first = Array.isArray(countRows) ? (countRows[0] as Record<string, unknown> | undefined) : undefined
     const total = Number(toWireValue(first?.['n'] ?? 0) ?? 0)
 
-    const order = query.orderBy !== undefined && known.has(query.orderBy)
-      ? ` ORDER BY ${quoteMysql(query.orderBy)} ${query.orderDir === 'desc' ? 'DESC' : 'ASC'}`
-      : ''
+    const order = buildOrder(query, columns)
     const limit = Math.max(1, Math.min(query.pageSize, 5000))
     const offset = Math.max(0, (query.page - 1) * limit)
     const [dataRows] = await (await this.open()).query({
@@ -411,6 +459,42 @@ export class MysqlDriver implements SqlDriver {
     return this.exec(`INSERT INTO ${qualified} (${names}) VALUES (${placeholders})`, values.map(item => item.value), target)
   }
 
+  /**
+   * Insert several rows as ONE multi-row statement.
+   *
+   * MySQL makes this cheap: a single `INSERT … VALUES (…),(…)` is one statement,
+   * one round trip and one implicit transaction, so a large CSV import does not
+   * pay per-row latency. Rows are chunked, because `max_allowed_packet` caps the
+   * statement size and one packet per 500 rows is well inside every default.
+   *
+   * Column order is taken from the FIRST row and enforced for the rest: a batch
+   * naming different columns per row cannot be one statement, and filling the
+   * gaps with NULL would be a data-corruption bug rather than an error.
+   */
+  async insertRows(schema: string | undefined, table: string, rows: RowValue[][]): Promise<QueryResult> {
+    if (rows.length === 0) throw new Error('insert requires at least one row')
+    const target = this.requireSchema(schema)
+    const qualified = qualifyMysql(target, table)
+    const columns = rows[0]!.map(item => item.column)
+    for (const row of rows) {
+      if (row.length !== columns.length || row.some((item, index) => item.column !== columns[index])) {
+        throw new Error('every row in one insert must name the same columns, in the same order')
+      }
+    }
+    const names = columns.map(name => requireIdentifier(name, 'column name', quoteMysql)).join(', ')
+    const started = Date.now()
+    let affected = 0
+    const CHUNK = 500
+    for (let at = 0; at < rows.length; at += CHUNK) {
+      const chunk = rows.slice(at, at + CHUNK)
+      const placeholders = chunk.map(() => `(${columns.map(() => '?').join(', ')})`).join(', ')
+      const params = chunk.flatMap(row => row.map(item => item.value))
+      const result = await this.runQuery(`INSERT INTO ${qualified} (${names}) VALUES ${placeholders}`, params, 0, target)
+      affected += result.affected
+    }
+    return { columns: [], rows: [], affected, durationMs: Date.now() - started, write: true, truncated: false }
+  }
+
   async updateRow(schema: string | undefined, table: string, values: RowValue[], keys: RowKey[]): Promise<QueryResult> {
     if (values.length === 0) throw new Error('update requires at least one column value')
     if (keys.length === 0) throw new Error('update requires a row key')
@@ -431,6 +515,241 @@ export class MysqlDriver implements SqlDriver {
     const qualified = qualifyMysql(target, table)
     const where = keys.map(item => `${requireIdentifier(item.column, 'column name', quoteMysql)} <=> ?`).join(' AND ')
     return this.exec(`DELETE FROM ${qualified} WHERE ${where}`, keys.map(item => item.value), target)
+  }
+
+  /**
+   * Delete several rows in one transaction.
+   *
+   * One statement per key set rather than a single `IN (…)`: a key may be
+   * composite, and a composite key's tuple cannot be expressed as an `IN` over
+   * one column. Wrapped in a transaction so a mid-list failure leaves the table
+   * as it was, rather than half-deleted with no record of where it stopped.
+   */
+  async deleteRows(schema: string | undefined, table: string, keySets: RowKey[][]): Promise<QueryResult> {
+    if (keySets.length === 0) throw new Error('delete requires at least one row key')
+    const target = this.requireSchema(schema)
+    const qualified = qualifyMysql(target, table)
+    const started = Date.now()
+    const pool = await this.open()
+    const connection = await pool.getConnection()
+    try {
+      await connection.query({ sql: `USE ${quoteMysql(target)}` })
+      await connection.query({ sql: 'START TRANSACTION' })
+      let affected = 0
+      try {
+        for (const keys of keySets) {
+          if (keys.length === 0) throw new Error('delete requires a row key')
+          const where = keys.map(item => `${requireIdentifier(item.column, 'column name', quoteMysql)} <=> ?`).join(' AND ')
+          const [result] = await connection.query({
+            sql: `DELETE FROM ${qualified} WHERE ${where}`,
+            values: keys.map(item => item.value),
+          })
+          const summary = (result ?? {}) as Record<string, unknown>
+          affected += Number(toWireValue(summary['affectedRows'] ?? 0) ?? 0)
+        }
+        await connection.query({ sql: 'COMMIT' })
+      } catch (error) {
+        try {
+          await connection.query({ sql: 'ROLLBACK' })
+        } catch {
+          /* the transaction is already gone */
+        }
+        throw error
+      }
+      return { columns: [], rows: [], affected, durationMs: Date.now() - started, write: true, truncated: false }
+    } finally {
+      // Same reset-on-release rule as runQuery: a pooled connection must not
+      // carry the previous statement's default database.
+      try {
+        await connection.query({ sql: 'USE `information_schema`' })
+        connection.release()
+      } catch {
+        connection.destroy()
+      }
+    }
+  }
+
+  /** How many distinct non-NULL values a column holds. */
+  async distinctCount(schema: string | undefined, table: string, column: string): Promise<number> {
+    const target = this.requireSchema(schema)
+    const qualified = qualifyMysql(target, table)
+    const quoted = requireIdentifier(column, 'column name', quoteMysql)
+    const [rows] = await (await this.open()).query({ sql: `SELECT COUNT(DISTINCT ${quoted}) AS n FROM ${qualified}` })
+    const first = Array.isArray(rows) ? (rows[0] as Record<string, unknown> | undefined) : undefined
+    return Number(toWireValue(first?.['n'] ?? 0) ?? 0)
+  }
+
+  // ---- schema editing ----------------------------------------------------
+
+  /** Add a column. */
+  async addColumn(schema: string | undefined, table: string, spec: ColumnSpec): Promise<QueryResult> {
+    const target = this.requireSchema(schema)
+    const qualified = qualifyMysql(target, table)
+    return this.exec(`ALTER TABLE ${qualified} ADD COLUMN ${renderMysqlColumn(spec)}`, [], target)
+  }
+
+  /**
+   * Change an existing column.
+   *
+   * `MODIFY COLUMN` rewrites the whole column definition, so the spec has to
+   * carry every attribute that must survive — which is why the 结构 tab loads
+   * the column first and submits what it read back, rather than sending only the
+   * changed field. `CHANGE COLUMN` is used when the name also changes.
+   *
+   * A primary-key column's `NOT NULL` and its position in the key are added
+   * here rather than trusted from the spec: MySQL rejects a nullable primary-key
+   * column, and dropping one out of a composite key by accident would change
+   * which rows the key can identify.
+   */
+  async alterColumn(schema: string | undefined, table: string, spec: ColumnSpec, options: { rename?: string } = {}): Promise<QueryResult> {
+    const target = this.requireSchema(schema)
+    const qualified = qualifyMysql(target, table)
+    const existing = (await this.columns(target, table)).find(column => column.name === spec.name)
+    if (existing === undefined) throw new Error(`no such column: ${spec.name}`)
+    const definition = renderMysqlColumn(spec, { generated: existing.generated, extra: existing.extra })
+
+    if (options.rename !== undefined && options.rename !== spec.name) {
+      return this.exec(
+        `ALTER TABLE ${qualified} CHANGE COLUMN ${requireIdentifier(spec.name, 'column name', quoteMysql)} ` +
+        `${requireIdentifier(options.rename, 'column name', quoteMysql)} ${definition}`,
+        [],
+        target,
+      )
+    }
+    return this.exec(
+      `ALTER TABLE ${qualified} MODIFY COLUMN ${requireIdentifier(spec.name, 'column name', quoteMysql)} ${definition}`,
+      [],
+      target,
+    )
+  }
+
+  /**
+   * Drop a column.
+   *
+   * MySQL drops the column out of every index that covers it by itself, and
+   * REFUSES the statement when the column is the only one left in an index
+   * ("cannot drop column … needed in a foreign key constraint" / "check that
+   * column exists"). That refusal is the right outcome and is passed through
+   * unchanged, rather than pre-empted here with a guess about which index MySQL
+   * would have tolerated.
+   */
+  async dropColumn(schema: string | undefined, table: string, column: string): Promise<QueryResult> {
+    const target = this.requireSchema(schema)
+    const qualified = qualifyMysql(target, table)
+    const columns = await this.columns(target, table)
+    if (columns.length <= 1) throw new Error('a table must keep at least one column')
+    return this.exec(`ALTER TABLE ${qualified} DROP COLUMN ${requireIdentifier(column, 'column name', quoteMysql)}`, [], target)
+  }
+
+  /**
+   * Replace the table's primary key.
+   *
+   * Two statements in one transaction: MySQL will not accept a table with two
+   * primary keys even momentarily, so the old one is dropped first. The
+   * transaction is what keeps the table key-less for anything but this caller —
+   * without it, a failure between the two statements would leave a table with no
+   * primary key at all.
+   *
+   * Every key column is made NOT NULL first, because that is a precondition
+   * MySQL enforces (error 1171) and a nullable column in a key is usually a
+   * leftover from a table that never had one.
+   */
+  async setPrimaryKey(schema: string | undefined, table: string, columns: string[]): Promise<QueryResult> {
+    const target = this.requireSchema(schema)
+    const qualified = qualifyMysql(target, table)
+    const existing = await this.columns(target, table)
+    const known = new Map(existing.map(column => [column.name.toLowerCase(), column]))
+    for (const name of columns) {
+      if (!known.has(name.toLowerCase())) throw new Error(`no such column: ${name}`)
+    }
+
+    const statements: string[] = []
+    // MySQL's AUTO_INCREMENT column has to be a key. Dropping the key before
+    // setting the new one would be rejected for a table whose auto-increment
+    // column is not in the new key, so the column's auto-increment is removed
+    // first and the caller is told by the engine if it wanted otherwise.
+    for (const column of existing) {
+      if (column.extra !== undefined && /auto_increment/i.test(column.extra) && !columns.includes(column.name)) {
+        statements.push(
+          `ALTER TABLE ${qualified} MODIFY COLUMN ${requireIdentifier(column.name, 'column name', quoteMysql)} ` +
+          `${renderMysqlColumn(toSpec(column))}`,
+        )
+      }
+    }
+    for (const name of columns) {
+      const column = known.get(name.toLowerCase())!
+      if (!column.nullable) continue
+      statements.push(`ALTER TABLE ${qualified} MODIFY COLUMN ${renderMysqlColumn({ ...toSpec(column), nullable: false })}`)
+    }
+    if (existing.some(column => column.key === 'PRI')) statements.push(`ALTER TABLE ${qualified} DROP PRIMARY KEY`)
+    if (columns.length > 0) {
+      statements.push(`ALTER TABLE ${qualified} ADD PRIMARY KEY (${columns.map(name => requireIdentifier(name, 'column name', quoteMysql)).join(', ')})`)
+    }
+    if (statements.length === 0) return { columns: [], rows: [], affected: 0, durationMs: 0, write: true, truncated: false }
+    return this.execTransaction(statements, target)
+  }
+
+  /** Create an index on one or more existing columns. */
+  async createIndex(schema: string | undefined, table: string, spec: { name: string; columns: string[]; unique: boolean }): Promise<QueryResult> {
+    if (spec.columns.length === 0) throw new Error('an index needs at least one column')
+    const target = this.requireSchema(schema)
+    const qualified = qualifyMysql(target, table)
+    const columns = await this.columns(target, table)
+    const known = new Map(columns.map(column => [column.name.toLowerCase(), column.name]))
+    const resolved = spec.columns.map(name => {
+      const found = known.get(name.toLowerCase())
+      if (found === undefined) throw new Error(`no such column: ${name}`)
+      return found
+    })
+    const name = requireIdentifier(spec.name, 'index name', quoteMysql)
+    return this.exec(
+      `ALTER TABLE ${qualified} ADD ${spec.unique ? 'UNIQUE ' : ''}INDEX ${name} (${resolved.map(column => quoteMysql(column)).join(', ')})`,
+      [],
+      target,
+    )
+  }
+
+  /**
+   * Drop an index.
+   *
+   * Refuses `PRIMARY`: that index is the table's primary key, and MySQL's own
+   * message for `DROP INDEX PRIMARY` ("check that column/key exists") does not
+   * say so. Dropping the key is a separate action the 结构 tab offers.
+   */
+  async dropIndex(schema: string | undefined, table: string, name: string): Promise<QueryResult> {
+    if (name.toUpperCase() === 'PRIMARY') {
+      throw new Error('PRIMARY is the table\'s primary key; change the key instead of dropping it as an index')
+    }
+    const target = this.requireSchema(schema)
+    const qualified = qualifyMysql(target, table)
+    return this.exec(`ALTER TABLE ${qualified} DROP INDEX ${requireIdentifier(name, 'index name', quoteMysql)}`, [], target)
+  }
+
+  /**
+   * Run several statements on one pooled connection, scoped to `schema`.
+   *
+   * Needed wherever a schema change is not expressible as one statement — a
+   * primary-key replacement is the case here. MySQL's DDL is not transactional
+   * (each `ALTER TABLE` commits itself), so the statements are ordered so that
+   * the intermediate state is the least harmful one: dropped rather than
+   * duplicated, since the engine refuses a second primary key outright.
+   */
+  private async execTransaction(statements: string[], schema: string): Promise<QueryResult> {
+    const pool = await this.open()
+    const connection = await pool.getConnection()
+    const started = Date.now()
+    try {
+      await connection.query({ sql: `USE ${quoteMysql(schema)}` })
+      for (const statement of statements) await connection.query({ sql: statement })
+      return { columns: [], rows: [], affected: 0, durationMs: Date.now() - started, write: true, truncated: false }
+    } finally {
+      try {
+        await connection.query({ sql: 'USE `information_schema`' })
+        connection.release()
+      } catch {
+        connection.destroy()
+      }
+    }
   }
 
   /**
@@ -465,21 +784,124 @@ export class MysqlDriver implements SqlDriver {
   }
 }
 
-/** Build the WHERE clause for a table read (searches match every textual column). */
-function buildFilter(query: RowQuery, columns: ColumnInfo[]): { where: string; params: unknown[] } {
+/** The ORDER BY clause for one read, with every column checked against the table. */
+function buildOrder(query: RowQuery, columns: ColumnInfo[]): string {
+  const byName = new Map(columns.map(column => [column.name.toLowerCase(), column.name]))
+  const direction = query.orderDir === 'desc' ? 'DESC' : 'ASC'
+  if (query.orderByColumns !== undefined && query.orderByColumns.length > 0) {
+    const resolved = query.orderByColumns.map(name => byName.get(name.toLowerCase()))
+    if (resolved.some(name => name === undefined)) return ''
+    return ` ORDER BY ${resolved.map(name => `${quoteMysql(name!)} ${direction}`).join(', ')}`
+  }
+  if (query.orderBy === undefined) return ''
+  const resolved = byName.get(query.orderBy.toLowerCase())
+  if (resolved === undefined) return ''
+  return ` ORDER BY ${quoteMysql(resolved)} ${direction}`
+}
+
+/** Build the WHERE clause for a table read. */
+function buildFilter(query: RowQuery, columns: ColumnInfo[], known: Set<string>): { where: string; params: unknown[] } {
+  // The structured form (the 搜索 tab) wins when present: it is what the user
+  // arranged, and mixing it with the free-text box would apply two filters.
+  if (query.filters !== undefined && query.filters.length > 0) {
+    return buildSearchWhere(query.filters, query.filterJoin === 'or' ? 'or' : 'and', quoteMysql, known)
+  }
   if (query.mode === 'search') {
     const term = query.term ?? ''
     if (term === '') return { where: '', params: [] }
     const target = columns.filter(column => isTextual(column.type))
     const chosen = target.length > 0 ? target : columns
-    const clauses = chosen.map(column => `${quoteMysql(column.name)} LIKE ?`)
-    return { where: ` WHERE (${clauses.join(' OR ')})`, params: chosen.map(() => `%${term}%`) }
+    // `%`/`_` in the term are characters to find, not wildcards, so they are
+    // escaped and the clause declares the escape character.
+    const pattern = `%${term.replace(/[\\%_]/g, match => `\\${match}`)}%`
+    const clauses = chosen.map(column => `${quoteMysql(column.name)} LIKE ? ESCAPE '\\\\'`)
+    return { where: ` WHERE (${clauses.join(' OR ')})`, params: chosen.map(() => pattern) }
   }
   if (query.condition !== undefined && query.condition.trim() !== '') {
     assertSingleStatement(`SELECT 1 WHERE ${query.condition}`)
     return { where: ` WHERE (${query.condition})`, params: [] }
   }
   return { where: '', params: [] }
+}
+
+/**
+ * The enum/set members of a declared type, or undefined for every other type.
+ *
+ * Read on the host because the members come from MySQL's own type text with
+ * MySQL's own quoting rules; a browser-side regex on the type string would have
+ * to re-implement them.
+ */
+function readEnumOptions(type: string): string[] | undefined {
+  const match = /^(enum|set)\s*\(([\s\S]*)\)$/i.exec(type.trim())
+  if (match === null) return undefined
+  const members: string[] = []
+  const body = match[2]!
+  let i = 0
+  while (i < body.length) {
+    if (body[i] === "'") {
+      let j = i + 1
+      let value = ''
+      while (j < body.length) {
+        if (body[j] === '\\') { value += body[j + 1] ?? ''; j += 2; continue }
+        if (body[j] === "'") {
+          if (body[j + 1] === "'") { value += "'"; j += 2; continue }
+          break
+        }
+        value += body[j]
+        j++
+      }
+      members.push(value)
+      i = j + 1
+      continue
+    }
+    i++
+  }
+  return members
+}
+
+/** Render a {@link ColumnSpec} as a MySQL column definition. */
+function renderMysqlColumn(spec: ColumnSpec, carry: { generated?: boolean; extra?: string } = {}): string {
+  const brand: string[] = [requireIdentifier(spec.name, 'column name', quoteMysql)]
+  const declared = spec.type.trim() === '' ? '' : normalizeType(spec.type, 'mysql')
+  if (declared === '') throw new Error('a MySQL column needs a type')
+  brand.push(declared)
+
+  // A generated column's expression lives in EXTRA. Rewriting the column
+  // without it would turn a computed column into an ordinary one and lose the
+  // expression, so the whole EXTRA tail is carried through verbatim.
+  if (carry.generated === true) {
+    if (carry.extra === undefined || carry.extra.trim() === '') {
+      throw new Error('a generated column cannot be modified: its expression is not available')
+    }
+    brand.push(carry.extra.replace(/DEFAULT_GENERATED\s*/i, '').trim())
+    return brand.join(' ')
+  }
+
+  brand.push(spec.primaryKeyPosition === undefined && spec.nullable ? 'NULL' : 'NOT NULL')
+  if (spec.defaultValue !== undefined) {
+    const value = normalizeDefault(spec.defaultValue, 'mysql')
+    if (value !== undefined) brand.push(`DEFAULT ${value}`)
+  }
+  if (spec.autoIncrement === true) brand.push('AUTO_INCREMENT')
+  if (spec.unique === true) brand.push('UNIQUE')
+  if (spec.comment !== undefined && spec.comment !== '') {
+    if (spec.comment.includes('\\')) throw new Error('a column comment cannot contain a backslash')
+    brand.push(`COMMENT '${spec.comment.replace(/'/g, "''")}'`)
+  }
+  return brand.join(' ')
+}
+
+/** Project a {@link ColumnInfo} back onto a {@link ColumnSpec} for a rewrite. */
+function toSpec(column: ColumnInfo): ColumnSpec {
+  return {
+    name: column.name,
+    type: column.type,
+    nullable: column.nullable,
+    ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
+    ...(column.primaryKeyPosition === undefined ? {} : { primaryKeyPosition: column.primaryKeyPosition }),
+    ...(column.extra !== undefined && /auto_increment/i.test(column.extra) ? { autoIncrement: true } : {}),
+    ...(column.comment === undefined ? {} : { comment: column.comment }),
+  }
 }
 
 /** Whether a MySQL column type is textual enough for a LIKE search. */

@@ -15,8 +15,24 @@ import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { expandHome } from '../dsh-home.ts'
 import type { ColumnInfo, DataSourceEntry, IndexInfo, QueryResult, SchemaInfo, TableInfo, TablePage, TestResult } from '../protocol.ts'
-import { assertSingleStatement, looksReadOnly, pushDownLimit, qualifySqlite, quoteSqlite, requireIdentifier, toWireValue } from '../sql-util.ts'
-import type { RowKey, RowQuery, RowValue, SqlDriver, TableListOptions } from './types.ts'
+import { assertSingleStatement, buildSearchWhere, looksReadOnly, pushDownLimit, qualifySqlite, quoteSqlite, requireIdentifier, toWireValue } from '../sql-util.ts'
+import {
+  type ColumnDefinition,
+  type TableShape,
+  identifier,
+  matchingBracket,
+  normalizeDefault,
+  normalizeType,
+  parseCreateTable,
+  renderColumn,
+  renderCreateTable,
+  setPrimaryKey,
+  splitTopLevel,
+} from '../sql-schema.ts'
+import type { ColumnSpec, RowKey, RowQuery, RowValue, SqlDriver, TableListOptions } from './types.ts'
+
+/** Suffix of the temporary table a rebuild builds alongside the original. */
+const REBUILD_SUFFIX = '__dbm_rebuild'
 
 /** Minimal structural view of the `node:sqlite` surface this driver uses. */
 interface SqliteStatement {
@@ -204,19 +220,38 @@ export class SqliteDriver implements SqlDriver {
     const target = schema === undefined || schema === '' ? 'main' : schema
     const qualified = qualifySqlite(target === 'main' ? undefined : target, table)
     return this.run(db => {
-      const rows = db.prepare(`PRAGMA ${quoteSqlite(target)}.table_info(${quoteSqlite(table)})`).all() as Array<Record<string, unknown>>
-      return rows.map(row => {
-        const name = String(row['name'] ?? '')
-        const pk = Number(row['pk'] ?? 0)
-        return {
-          name,
-          type: String(row['type'] ?? ''),
-          nullable: Number(row['notnull'] ?? 0) === 0,
-          ...(row['dflt_value'] === null || row['dflt_value'] === undefined ? {} : { defaultValue: String(row['dflt_value']) }),
-          key: pk > 0 ? 'PRI' : '',
-          extra: '',
-        } satisfies ColumnInfo
-      })
+      /*
+       * `table_xinfo`, not `table_info`.
+       *
+       * `PRAGMA table_info` OMITS a generated column entirely — measured on a
+       * table whose middle column is `GENERATED ALWAYS AS (…) STORED`, it
+       * returned only the other two. Editing a table's structure from that list
+       * would build a replacement table missing the generated column and delete
+       * it on drop, and the 浏览 grid would silently lose a column as well.
+       *
+       * `table_xinfo` adds a `hidden` flag: 0 for an ordinary column, 2 for a
+       * VIRTUAL generated column, 3 for a STORED one. Hidden=1 marks a virtual
+       * table's hidden column, which is not part of this plugin's editable
+       * surface and is left out.
+       */
+      const rows = db.prepare(`PRAGMA ${quoteSqlite(target)}.table_xinfo(${quoteSqlite(table)})`).all() as Array<Record<string, unknown>>
+      return rows
+        .filter(row => Number(row['hidden'] ?? 0) !== 1)
+        .map(row => {
+          const name = String(row['name'] ?? '')
+          const pk = Number(row['pk'] ?? 0)
+          const hidden = Number(row['hidden'] ?? 0)
+          return {
+            name,
+            type: String(row['type'] ?? ''),
+            nullable: Number(row['notnull'] ?? 0) === 0,
+            ...(row['dflt_value'] === null || row['dflt_value'] === undefined ? {} : { defaultValue: String(row['dflt_value']) }),
+            key: pk > 0 ? 'PRI' : '',
+            extra: '',
+            ...(pk > 0 ? { primaryKeyPosition: pk } : {}),
+            ...(hidden === 2 || hidden === 3 ? { generated: true } : {}),
+          } satisfies ColumnInfo
+        })
     }).then(async columns => {
       // `pk` marks composite primary keys too; a single-column PK additionally
       // reports its rowid alias. Nothing else to add — but verify the table
@@ -247,11 +282,16 @@ export class SqliteDriver implements SqlDriver {
         } catch {
           /* expression indexes report no columns here */
         }
+        const origin = String(entry['origin'] ?? '')
         return {
           name,
           unique: Number(entry['unique'] ?? 0) === 1,
           columns,
-          type: String(entry['origin'] ?? ''),
+          type: origin,
+          // `origin = 'pk'` is the primary key's own index. It cannot be dropped
+          // on its own — dropping it means dropping the key — so the flag has to
+          // reach the browser.
+          ...(origin === 'pk' ? { primary: true } : {}),
         } satisfies IndexInfo
       })
     })
@@ -261,13 +301,11 @@ export class SqliteDriver implements SqlDriver {
     const schema = query.schema === undefined || query.schema === '' ? 'main' : query.schema
     const columns = await this.columns(schema, query.table)
     if (columns.length === 0) throw new Error(`no such table: ${query.table}`)
-    const known = new Set(columns.map(column => column.name))
+    const known = new Set(columns.map(column => column.name.toLowerCase()))
     const qualified = qualifySqlite(schema === 'main' ? undefined : schema, query.table)
 
     const { where, params } = this.buildFilter(query, columns.map(column => column.name), known)
-    const order = query.orderBy !== undefined && known.has(query.orderBy)
-      ? ` ORDER BY ${quoteSqlite(query.orderBy)} ${query.orderDir === 'desc' ? 'DESC' : 'ASC'}`
-      : ''
+    const order = this.buildOrder(query, columns)
     const offset = Math.max(0, (query.page - 1) * query.pageSize)
 
     const total = await this.run(db => {
@@ -291,15 +329,47 @@ export class SqliteDriver implements SqlDriver {
     }
   }
 
+  /**
+   * The ORDER BY clause for one read.
+   *
+   * Three shapes, in precedence order: an explicit column list (the 按索引排序
+   * control), a single column (a header click), or nothing. Every column is
+   * checked against the table's own list, so a stale browser cannot order by a
+   * column that has since been renamed away.
+   */
+  private buildOrder(query: RowQuery, columns: ColumnInfo[]): string {
+    const byName = new Map(columns.map(column => [column.name.toLowerCase(), column.name]))
+    const direction = query.orderDir === 'desc' ? 'DESC' : 'ASC'
+
+    if (query.orderByColumns !== undefined && query.orderByColumns.length > 0) {
+      const resolved = query.orderByColumns.map(name => byName.get(name.toLowerCase()))
+      if (resolved.some(name => name === undefined)) return ''
+      return ` ORDER BY ${resolved.map(name => `${quoteSqlite(name!)} ${direction}`).join(', ')}`
+    }
+    if (query.orderBy === undefined) return ''
+    const resolved = byName.get(query.orderBy.toLowerCase())
+    if (resolved === undefined) return ''
+    return ` ORDER BY ${quoteSqlite(resolved)} ${direction}`
+  }
+
   /** Build the WHERE clause and its bound parameters for a table read. */
   private buildFilter(query: RowQuery, allColumns: string[], known: Set<string>): { where: string; params: unknown[] } {
+    // The structured form (the 搜索 tab) wins when it is present: it is what the
+    // user arranged on screen, and mixing it with a free-text term would apply
+    // two different filters to one read.
+    if (query.filters !== undefined && query.filters.length > 0) {
+      return buildSearchWhere(query.filters, query.filterJoin === 'or' ? 'or' : 'and', quoteSqlite, known)
+    }
     if (query.mode === 'search') {
       const term = query.term ?? ''
       if (term === '') return { where: '', params: [] }
       // Match against every column: SQLite has no per-column type guarantee,
-      // so casting through TEXT is the only filter that cannot error.
-      const clauses = allColumns.map(column => `CAST(${quoteSqlite(column)} AS TEXT) LIKE ?`)
-      return { where: ` WHERE (${clauses.join(' OR ')})`, params: allColumns.map(() => `%${term}%`) }
+      // so casting through TEXT is the only filter that cannot error. The term
+      // is bound, never interpolated; its `%`/`_` are escaped so a literal
+      // percent sign is a character to find rather than a wildcard.
+      const pattern = `%${term.replace(/[\\%_]/g, match => `\\${match}`)}%`
+      const clauses = allColumns.map(column => `CAST(${quoteSqlite(column)} AS TEXT) LIKE ? ESCAPE '\\'`)
+      return { where: ` WHERE (${clauses.join(' OR ')})`, params: allColumns.map(() => pattern) }
     }
     if (query.condition !== undefined && query.condition.trim() !== '') {
       // Privileged path: a raw SQL condition typed by the user in the GUI. It
@@ -387,6 +457,57 @@ export class SqliteDriver implements SqlDriver {
     return result
   }
 
+  /**
+   * Insert several rows in one transaction.
+   *
+   * One transaction, not one autocommit per row: a 10 000-row CSV import would
+   * otherwise fsync 10 000 times, and a failure halfway would leave the table
+   * holding an unknown prefix of the file with no way to tell how much landed.
+   * Either every row is in or none is.
+   */
+  async insertRows(schema: string | undefined, table: string, rows: RowValue[][]): Promise<QueryResult> {
+    if (rows.length === 0) throw new Error('insert requires at least one row')
+    const qualified = qualifySqlite(schema, table)
+    // Column order is taken from the FIRST row and enforced for the rest: a
+    // batch that names different columns per row cannot be one statement, and
+    // silently inserting NULLs for the columns a later row omitted would be a
+    // data-corruption bug rather than an error.
+    const columns = rows[0]!.map(item => item.column)
+    for (const row of rows) {
+      if (row.length !== columns.length || row.some((item, index) => item.column !== columns[index])) {
+        throw new Error('every row in one insert must name the same columns, in the same order')
+      }
+    }
+    const names = columns.map(name => requireIdentifier(name, 'column name', quoteSqlite)).join(', ')
+    const placeholders = columns.map(() => '?').join(', ')
+    const sql = `INSERT INTO ${qualified} (${names}) VALUES (${placeholders})`
+    const started = Date.now()
+    return this.run(db => {
+      let affected = 0
+      db.exec('BEGIN')
+      try {
+        const statement = db.prepare(sql)
+        for (const row of rows) affected += Number(statement.run(...row.map(item => item.value)).changes ?? 0)
+        db.exec('COMMIT')
+      } catch (error) {
+        try {
+          db.exec('ROLLBACK')
+        } catch {
+          /* the transaction is already gone */
+        }
+        throw error
+      }
+      return {
+        columns: [],
+        rows: [],
+        affected,
+        durationMs: Date.now() - started,
+        write: true,
+        truncated: false,
+      } satisfies QueryResult
+    })
+  }
+
   async updateRow(schema: string | undefined, table: string, values: RowValue[], keys: RowKey[]): Promise<QueryResult> {
     if (values.length === 0) throw new Error('update requires at least one column value')
     if (keys.length === 0) throw new Error('update requires a row key')
@@ -404,6 +525,350 @@ export class SqliteDriver implements SqlDriver {
     const where = keys.map(item => `${requireIdentifier(item.column, 'column name', quoteSqlite)} IS ?`).join(' AND ')
     const sql = `DELETE FROM ${qualified} WHERE ${where}`
     return this.exec(sql, keys.map(item => item.value), schema)
+  }
+
+  /**
+   * Delete several rows in one transaction.
+   *
+   * One `DELETE … WHERE key` per key set rather than a single statement with an
+   * `IN` list: a key may be composite, and a composite key cannot be expressed
+   * as an `IN` over one column. `@`-style row values are not needed either,
+   * since SQLite's rowid tables have a real rowid to fall back on but a
+   * `WITHOUT ROWID` table does not — so the key columns are what identifies a
+   * row, always.
+   */
+  async deleteRows(schema: string | undefined, table: string, keySets: RowKey[][]): Promise<QueryResult> {
+    if (keySets.length === 0) throw new Error('delete requires at least one row key')
+    const qualified = qualifySqlite(schema, table)
+    const started = Date.now()
+    return this.run(db => {
+      let affected = 0
+      db.exec('BEGIN')
+      try {
+        for (const keys of keySets) {
+          if (keys.length === 0) throw new Error('delete requires a row key')
+          const where = keys.map(item => `${requireIdentifier(item.column, 'column name', quoteSqlite)} IS ?`).join(' AND ')
+          const statement = db.prepare(`DELETE FROM ${qualified} WHERE ${where}`)
+          affected += Number(statement.run(...keys.map(item => item.value)).changes ?? 0)
+        }
+        db.exec('COMMIT')
+      } catch (error) {
+        try {
+          db.exec('ROLLBACK')
+        } catch {
+          /* the transaction is already gone */
+        }
+        throw error
+      }
+      return {
+        columns: [],
+        rows: [],
+        affected,
+        durationMs: Date.now() - started,
+        write: true,
+        truncated: false,
+      } satisfies QueryResult
+    })
+  }
+
+  /** How many distinct non-NULL values a column holds. */
+  async distinctCount(schema: string | undefined, table: string, column: string): Promise<number> {
+    const qualified = qualifySqlite(schema, table)
+    const quoted = requireIdentifier(column, 'column name', quoteSqlite)
+    const result = await this.run(db => {
+      const row = db.prepare(`SELECT COUNT(DISTINCT ${quoted}) AS n FROM ${qualified}`).get() as { n?: unknown } | undefined
+      return Number(row?.n ?? 0)
+    })
+    return result
+  }
+
+  // ---- schema editing ----------------------------------------------------
+
+  /**
+   * Add a column.
+   *
+   * ADD COLUMN is one of the few schema changes SQLite does natively, so it is
+   * used directly rather than through a rebuild — a rebuild of a large table
+   * copies every row, and there is no reason to pay that for an appended
+   * column.
+   *
+   * SQLite's own restrictions apply and are reported as they are: a new column
+   * cannot be UNIQUE or PRIMARY KEY, and a NOT NULL column needs a non-NULL
+   * default.
+   */
+  async addColumn(schema: string | undefined, table: string, spec: ColumnSpec): Promise<QueryResult> {
+    const qualified = qualifySqlite(schema, table)
+    const definition = renderColumn(toDefinition(spec), 'sqlite')
+    // A PRIMARY KEY cannot be added by ALTER: the column would have to be the
+    // table's only key, which ALTER cannot establish. Say so rather than
+    // letting the engine reject it with a message about the table's shape.
+    if (spec.primaryKeyPosition !== undefined) {
+      throw new Error('SQLite cannot add a PRIMARY KEY column with ALTER TABLE; set the key on an existing column instead')
+    }
+    return this.exec(`ALTER TABLE ${qualified} ADD COLUMN ${definition}`, [], schema)
+  }
+
+  /**
+   * Change an existing column.
+   *
+   * Changing a name alone is native (`ALTER TABLE … RENAME COLUMN`); changing
+   * the declared type, the nullability, the default or the primary key is not,
+   * and goes through {@link rebuildTable}. The two are not interchangeable:
+   * RENAME COLUMN updates every reference to the column in the schema, whereas
+   * a rebuild recreates the table and would need those references rebuilt too,
+   * so the cheap native path is taken whenever it is sufficient.
+   */
+  async alterColumn(schema: string | undefined, table: string, spec: ColumnSpec, options: { rename?: string } = {}): Promise<QueryResult> {
+    const target = schema === undefined || schema === '' ? 'main' : schema
+    const shape = await this.readShape(target, table)
+    const index = shape.columns.findIndex(column => column.name === spec.name)
+    if (index === -1) throw new Error(`no such column: ${spec.name}`)
+    const current = shape.columns[index]!
+
+    // Validate the new definition BEFORE deciding the path, so a refusal names
+    // the field rather than surfacing after a partial write.
+    const next = toDefinition(spec)
+    renderColumn(next, 'sqlite')
+
+    const newName = options.rename ?? spec.name
+    const onlyRenamed =
+      newName !== spec.name
+      && normalizeType(next.type, 'sqlite') === normalizeType(current.type, 'sqlite')
+      && next.nullable === current.nullable
+      && normalizeDefault(next.defaultValue, 'sqlite') === normalizeDefault(current.defaultValue, 'sqlite')
+      && next.unique === current.unique
+      && current.primaryKeyPosition === undefined
+
+    if (onlyRenamed) {
+      const qualified = qualifySqlite(schema, table)
+      return this.exec(
+        `ALTER TABLE ${qualified} RENAME COLUMN ${identifier(spec.name, 'column name', 'sqlite')} TO ${identifier(newName, 'column name', 'sqlite')}`,
+        [],
+        schema,
+      )
+    }
+
+    const edited: ColumnDefinition = {
+      ...current,
+      ...next,
+      name: newName,
+      // `extras` and `check` belong to the ORIGINAL column, not to the new
+      // spec: they are clauses this plugin does not model, and dropping them
+      // because the type changed would silently delete a CHECK constraint.
+      extras: current.extras,
+      ...(current.check === undefined ? {} : { check: current.check }),
+    }
+    shape.columns[index] = edited
+    return this.rebuildTable(target, table, shape)
+  }
+  /** Drop a column, by rebuilding the table (SQLite has no native form here). */
+  async dropColumn(schema: string | undefined, table: string, column: string): Promise<QueryResult> {
+    const target = schema === undefined || schema === '' ? 'main' : schema
+    const shape = await this.readShape(target, table)
+    const index = shape.columns.findIndex(candidate => candidate.name === column)
+    if (index === -1) throw new Error(`no such column: ${column}`)
+    // A column the table's own constraints still name cannot simply vanish: the
+    // rebuilt CREATE would reference a column that does not exist, and SQLite
+    // would reject the whole statement with a message about the constraint.
+    const remaining = shape.columns.filter((_, position) => position !== index)
+    if (remaining.length === 0) throw new Error('a table must keep at least one column')
+    shape.columns = remaining
+    assertConstraintsUsable(shape)
+    return this.rebuildTable(target, table, shape)
+  }
+
+  /** Replace the table's primary key, by rebuilding it. */
+  async setPrimaryKey(schema: string | undefined, table: string, columns: string[]): Promise<QueryResult> {
+    const target = schema === undefined || schema === '' ? 'main' : schema
+    const shape = await this.readShape(target, table)
+    setPrimaryKey(shape, columns, 'sqlite')
+    return this.rebuildTable(target, table, shape)
+  }
+
+  /** Create an index on one or more existing columns. */
+  async createIndex(schema: string | undefined, table: string, spec: { name: string; columns: string[]; unique: boolean }): Promise<QueryResult> {
+    if (spec.columns.length === 0) throw new Error('an index needs at least one column')
+    const target = schema === undefined || schema === '' ? 'main' : schema
+    const columns = await this.columns(target, table)
+    const known = new Map(columns.map(column => [column.name.toLowerCase(), column.name]))
+    const resolved = spec.columns.map(name => {
+      const found = known.get(name.toLowerCase())
+      if (found === undefined) throw new Error(`no such column: ${name}`)
+      return found
+    })
+    // The index name lives in the same namespace as the table's, so it is
+    // validated with the identifier grammar rather than trusted.
+    const name = requireIdentifier(spec.name, 'index name', quoteSqlite)
+    const qualified = qualifySqlite(schema, table)
+    const suffix = target === 'main' ? '' : ` ON ${quoteSqlite(target)}`
+    void suffix
+    return this.exec(
+      `CREATE ${spec.unique ? 'UNIQUE ' : ''}INDEX ${name} ON ${qualified} (${resolved.map(column => quoteSqlite(column)).join(', ')})`,
+      [],
+      schema,
+    )
+  }
+
+  /**
+   * Drop an index.
+   *
+   * Refuses SQLite's implicit `sqlite_autoindex_*`: it exists only because a
+   * UNIQUE or PRIMARY KEY constraint asked for it, and `DROP INDEX` on it is
+   * either an error or — worse — silently leaves the constraint without its
+   * index. Dropping the constraint is the way to remove it, which the 结构 tab
+   * offers separately.
+   */
+  async dropIndex(schema: string | undefined, table: string, name: string): Promise<QueryResult> {
+    if (name.startsWith('sqlite_autoindex_')) {
+      throw new Error('this index belongs to a PRIMARY KEY or UNIQUE constraint; drop the constraint instead of the index')
+    }
+    const target = schema === undefined || schema === '' ? 'main' : schema
+    requireIdentifier(name, 'index name', quoteSqlite)
+    return this.exec(`DROP INDEX ${quoteSqlite(target)}.${quoteSqlite(name)}`, [], schema)
+  }
+
+  /**
+   * Read and parse one table's `CREATE TABLE` statement.
+   *
+   * The statement text — not `PRAGMA table_info` — is the source for a rebuild,
+   * because `table_info` omits CHECK constraints, foreign keys, COLLATE clauses
+   * and the `WITHOUT ROWID` / `STRICT` keywords. A rebuild driven by it would
+   * quietly drop all of them.
+   */
+  private async readShape(schema: string, table: string): Promise<TableShape> {
+    requireIdentifier(table, 'table name', quoteSqlite)
+    const sql = await this.run(db => {
+      const row = db
+        .prepare(`SELECT sql FROM ${quoteSqlite(schema)}.sqlite_master WHERE type = 'table' AND name = ?`)
+        .get(table) as { sql?: unknown } | undefined
+      return row?.sql === undefined || row.sql === null ? undefined : String(row.sql)
+    })
+    if (sql === undefined) throw new Error(`no such table: ${table}`)
+    return parseCreateTable(sql, 'sqlite')
+  }
+
+  /**
+   * Rebuild one table from an edited shape, inside a single transaction.
+   *
+   * This is SQLite's documented 12-step procedure. Four details are load
+   * bearing, and each was reproduced in a probe before being written down:
+   *
+   * 1. **The replacement is created under a NEW name and the ORIGINAL is
+   *    dropped, rather than renaming the original aside.** Renaming the original
+   *    first is the tempting order, but the `DROP TABLE` then fails with
+   *    "FOREIGN KEY constraint failed" whenever another table references it —
+   *    the reference was rewritten to follow the rename and now dangles.
+   *    Creating the replacement first and dropping the original keeps every
+   *    reference pointing at the name being replaced.
+   *
+   * 2. **`legacy_alter_table` is ON for the duration.** With it off (the default
+   *    since 3.25) `ALTER TABLE … RENAME TO` rewrites every reference to the
+   *    renamed table — including the foreign keys and views of OTHER tables,
+   *    which would be repointed at the temporary name. Worse, the rewrite makes
+   *    the rename itself fail with "error in view …: no such table", leaving the
+   *    database unusable in the same transaction. With it on, the rename only
+   *    changes the table's own name.
+   *
+   * 3. **`foreign_keys` is turned OFF OUTSIDE the transaction.** SQLite
+   *    SILENTLY IGNORES this pragma inside a transaction — measured: setting it
+   *    after `BEGIN` left `PRAGMA foreign_keys` reading 1. Both pragmas are
+   *    therefore applied before `BEGIN` and restored in a `finally`, to the
+   *    value the connection already had (a user may legitimately run with them
+   *    off). The pool hands this same connection back, so leaving either pragma
+   *    changed would alter the behaviour of everything that runs afterwards.
+   *
+   * 4. **Indexes and triggers are recreated from their original SQL, and the
+   *    `sqlite_sequence` row is restored.** A table's indexes and triggers are
+   *    dropped along with it, so a rebuild that recreated only the table would
+   *    silently remove every index and trigger on it. `AUTOINCREMENT`'s
+   *    high-water mark lives in `sqlite_sequence` and would otherwise reset to
+   *    the largest id still present — handing out the ids of deleted rows again.
+   */
+  private async rebuildTable(schema: string, table: string, shape: TableShape): Promise<QueryResult> {
+    requireIdentifier(table, 'table name', quoteSqlite)
+    const temporary = `${table}${REBUILD_SUFFIX}`
+    if (table.endsWith(REBUILD_SUFFIX)) throw new Error(`cannot rebuild a table whose name ends with ${REBUILD_SUFFIX}`)
+
+    const started = Date.now()
+    return this.run(db => {
+      const existing = db
+        .prepare(`SELECT name FROM ${quoteSqlite(schema)}.sqlite_master WHERE name = ?`)
+        .get(temporary) as { name?: unknown } | undefined
+      if (existing !== undefined) {
+        throw new Error(`"${temporary}" already exists; rename or drop it before changing this table`)
+      }
+
+      const before = readSchemaObjects(db, schema, table)
+      const sequence = readSequenceValue(db, table)
+      const hadForeignKeys = readPragmaFlag(db, 'foreign_keys')
+      const hadLegacyAlter = readPragmaFlag(db, 'legacy_alter_table')
+
+      // Both pragmas must be set BEFORE `BEGIN`; see point 3 above.
+      if (hadForeignKeys === true) db.exec('PRAGMA foreign_keys = OFF')
+      if (hadLegacyAlter !== true) db.exec('PRAGMA legacy_alter_table = ON')
+
+      let inTransaction = false
+      try {
+        db.exec('BEGIN')
+        inTransaction = true
+        db.exec(renderCreateTable(shape, 'sqlite', { name: temporary }))
+        if (shape.columns.length > 0) {
+          // A generated column cannot be inserted into — SQLite answers "cannot
+          // INSERT into generated column" — so it is left out of both sides of
+          // the copy and the engine recomputes it from the columns that remain.
+          const source = shape.columns.filter(column => column.generated !== true)
+          if (source.length > 0) {
+            const names = source.map(column => quoteSqlite(column.name)).join(', ')
+            db.exec(`INSERT INTO ${quoteSqlite(temporary)} (${names}) SELECT ${names} FROM ${quoteSqlite(table)}`)
+          }
+        }
+        db.exec(`DROP TABLE ${quoteSqlite(table)}`)
+        db.exec(`ALTER TABLE ${quoteSqlite(temporary)} RENAME TO ${quoteSqlite(table)}`)
+        // Indexes and triggers were dropped with the table; recreate them from
+        // the text the engine recorded, which is the only place an expression
+        // index or a trigger body exists.
+        for (const object of before) {
+          if (object.sql === undefined) continue
+          db.exec(object.sql)
+        }
+        if (sequence !== undefined) {
+          // The row for this table was deleted along with it. Restoring the
+          // high-water mark is what keeps AUTOINCREMENT monotonic across a
+          // rebuild: without it the next insert reuses a deleted row's id.
+          db.prepare('DELETE FROM sqlite_sequence WHERE name = ?').run(table)
+          db.prepare('INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)').run(table, Math.trunc(sequence))
+        }
+        db.exec('COMMIT')
+        inTransaction = false
+      } catch (error) {
+        if (inTransaction) {
+          try {
+            db.exec('ROLLBACK')
+          } catch {
+            /* the transaction is already gone */
+          }
+        }
+        throw error
+      } finally {
+        // Restore what the connection had, not a hard-coded default: the user's
+        // session may legitimately run with foreign keys off, and forcing them
+        // on would change the meaning of every later statement.
+        try {
+          if (hadForeignKeys === true) db.exec('PRAGMA foreign_keys = ON')
+          if (hadLegacyAlter !== true) db.exec('PRAGMA legacy_alter_table = OFF')
+        } catch {
+          /* the connection is going away anyway */
+        }
+      }
+      return {
+        columns: [],
+        rows: [],
+        affected: 0,
+        durationMs: Date.now() - started,
+        write: true,
+        truncated: false,
+      } satisfies QueryResult
+    })
   }
 
   /**
@@ -477,6 +942,106 @@ function readTableRowCounts(db: SqliteDatabase, schema: string): Map<string, num
     // normal state, not an error.
   }
   return counts
+}
+
+/**
+ * The schema objects a table owns that a `DROP TABLE` would take with it.
+ *
+ * Indexes and triggers are dropped along with their table, so a rebuild has to
+ * recreate them. Their SQL text is captured from `sqlite_master` — an
+ * expression index and a trigger body exist nowhere else. The table's own
+ * implicit indexes (`sqlite_autoindex_*`, from a UNIQUE or PRIMARY KEY
+ * constraint) are skipped: they have no SQL and are recreated by the new
+ * `CREATE TABLE` itself.
+ *
+ * Rows are returned in `sqlite_master` order, which puts a table's own indexes
+ * before its triggers, so an index a trigger depends on exists first.
+ */
+function readSchemaObjects(db: SqliteDatabase, schema: string, table: string): Array<{ type: string; name: string; sql: string | undefined }> {
+  const rows = db
+    .prepare(
+      `SELECT type, name, sql FROM ${quoteSqlite(schema)}.sqlite_master ` +
+        "WHERE tbl_name = ? AND type IN ('index','trigger') AND name NOT LIKE 'sqlite_autoindex_%'",
+    )
+    .all(table) as Array<Record<string, unknown>>
+  return rows.map(row => ({
+    type: String(row['type'] ?? ''),
+    name: String(row['name'] ?? ''),
+    sql: row['sql'] === null || row['sql'] === undefined ? undefined : String(row['sql']),
+  }))
+}
+
+/** The `AUTOINCREMENT` high-water mark a table has recorded, if any. */
+function readSequenceValue(db: SqliteDatabase, table: string): number | undefined {
+  try {
+    const row = db.prepare('SELECT seq FROM sqlite_sequence WHERE name = ?').get(table) as { seq?: unknown } | undefined
+    if (row?.seq === undefined) return undefined
+    const value = Number(row.seq)
+    return Number.isFinite(value) ? value : undefined
+  } catch {
+    // `sqlite_sequence` exists only once some table uses AUTOINCREMENT.
+    return undefined
+  }
+}
+
+/** Whether a connection-level boolean pragma reads as ON (1). */
+function readPragmaFlag(db: SqliteDatabase, name: string): boolean | undefined {
+  try {
+    const row = db.prepare(`PRAGMA ${name}`).get() as Record<string, unknown> | undefined
+    if (row === undefined) return undefined
+    const value = Object.values(row)[0]
+    return Number(value) === 1
+  } catch {
+    return undefined
+  }
+}
+
+/** Turn a wire {@link ColumnSpec} into a renderable column definition. */
+function toDefinition(spec: ColumnSpec): ColumnDefinition {
+  return {
+    name: spec.name,
+    // The caller's own casing is kept: it is what a user typed or what the
+    // engine already had, and normalizing it would make a no-op edit改写 the
+    // table's definition.
+    type: spec.type,
+    // A primary-key column is NOT NULL by definition; the caller's checkbox is
+    // not allowed to say otherwise.
+    nullable: spec.primaryKeyPosition === undefined ? spec.nullable : false,
+    ...(spec.defaultValue === undefined || spec.defaultValue === '' ? {} : { defaultValue: spec.defaultValue }),
+    ...(spec.primaryKeyPosition === undefined ? {} : { primaryKeyPosition: spec.primaryKeyPosition }),
+    ...(spec.autoIncrement === true ? { autoIncrement: true, sqliteAutoincrement: true } : {}),
+    ...(spec.unique === true ? { unique: true } : {}),
+    extras: [],
+  }
+}
+
+/**
+ * Assert that every table-level constraint still names a surviving column.
+ *
+ * A rebuild re-emits the constraint clauses verbatim, so dropping a column a
+ * UNIQUE or FOREIGN KEY clause still names would produce a `CREATE TABLE` that
+ * references a column which no longer exists. The engine would reject it with a
+ * message about the constraint rather than about the edit, so the failure is
+ * caught here where the column can be named.
+ */
+function assertConstraintsUsable(shape: TableShape): void {
+  const present = new Set(shape.columns.map(column => column.name.toLowerCase()))
+  for (const constraint of shape.constraints) {
+    if (constraint.kind === 'check') continue
+    const listMatch = /\(\s*([\s\S]*?)\s*\)/.exec(constraint.sql)
+    if (listMatch === null) continue
+    for (const part of splitTopLevel(listMatch[1]!)) {
+      const name = /^\s*(?:"([^"]+)"|`([^`]+)`|\[([^\]]+)\]|([A-Za-z_][A-Za-z0-9_$]*))/.exec(part)
+      const value = name?.[1] ?? name?.[2] ?? name?.[3] ?? name?.[4]
+      if (value === undefined) continue
+      // `FOREIGN KEY (a) REFERENCES b(c)` names a column of the OTHER table
+      // inside the same bracket group, so only the first list is checked.
+      if (!present.has(value.toLowerCase())) {
+        throw new Error(`"${value}" is used by a table constraint (${constraint.sql}) and cannot be dropped`)
+      }
+      break
+    }
+  }
 }
 
 /** Project one raw SQLite row onto the wire shape. */

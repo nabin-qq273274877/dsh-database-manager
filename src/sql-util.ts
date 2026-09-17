@@ -270,3 +270,116 @@ export function toWireValue(value: unknown): string | number | boolean | null {
     return String(value)
   }
 }
+
+/** One structured search condition, mirrored from the driver contract. */
+export interface SearchFilter {
+  column: string
+  operator: string
+  value?: string
+  value2?: string
+}
+
+/** The comparison operators a search filter may name. */
+const FILTER_OPERATORS = new Set([
+  'eq', 'neq', 'gt', 'gte', 'lt', 'lte',
+  'contains', 'notContains', 'startsWith', 'endsWith',
+  'isNull', 'isNotNull', 'between', 'in',
+])
+
+/** A `LIKE` pattern with the pattern's own wildcards escaped. */
+function likePattern(value: string, position: 'contains' | 'startsWith' | 'endsWith'): string {
+  // `%` and `_` typed by the user are characters to find, not wildcards — a
+  // search for `100%` must not match every row. The escape character itself
+  // goes first, or it would escape the escapes added after it.
+  const escaped = value.replace(/[\\%_]/g, match => `\\${match}`)
+  if (position === 'startsWith') return `${escaped}%`
+  if (position === 'endsWith') return `%${escaped}`
+  return `%${escaped}%`
+}
+
+/**
+ * Build a `WHERE` clause from the 搜索 tab's structured conditions.
+ *
+ * Every operand is a bound parameter and every column name is quoted after
+ * validation, so the shape — not the text — decides the SQL. That is the whole
+ * difference from the raw-condition path this replaced: a user can no longer
+ * put a fragment of SQL into a search box and have it reach the engine.
+ *
+ * @param filters - the conditions, in the order the user arranged them.
+ * @param join - how the conditions combine; nested parentheses keep `OR` from
+ *   leaking across the `AND`s around it.
+ * @param quote - the dialect's identifier quoter.
+ * @param known - the table's column names, lower-cased, for validation.
+ * @returns the clause text (empty when nothing applies) and its parameters.
+ * @throws when a filter names an unknown column or operator, or omits a value.
+ */
+export function buildSearchWhere(
+  filters: readonly SearchFilter[],
+  join: 'and' | 'or',
+  quote: (name: string) => string,
+  known: ReadonlySet<string>,
+): { where: string; params: unknown[] } {
+  const clauses: string[] = []
+  const params: unknown[] = []
+
+  for (const filter of filters) {
+    const column = filter.column
+    if (!known.has(column.toLowerCase())) throw new Error(`no such column: ${JSON.stringify(column)}`)
+    if (!FILTER_OPERATORS.has(filter.operator)) throw new Error(`unsupported operator: ${JSON.stringify(filter.operator)}`)
+    const quoted = quote(column)
+    const value = filter.value ?? ''
+
+    switch (filter.operator) {
+      case 'isNull':
+        clauses.push(`${quoted} IS NULL`)
+        continue
+      case 'isNotNull':
+        clauses.push(`${quoted} IS NOT NULL`)
+        continue
+      case 'between': {
+        if (value === '' || (filter.value2 ?? '') === '') throw new Error('between needs two values')
+        clauses.push(`${quoted} BETWEEN ? AND ?`)
+        params.push(value, filter.value2)
+        continue
+      }
+      case 'in': {
+        // A comma-separated list, each member its own bound parameter.
+        const members = value.split(',').map(member => member.trim()).filter(member => member !== '')
+        if (members.length === 0) throw new Error('in needs at least one value')
+        clauses.push(`${quoted} IN (${members.map(() => '?').join(', ')})`)
+        params.push(...members)
+        continue
+      }
+      case 'contains':
+      case 'notContains':
+      case 'startsWith':
+      case 'endsWith': {
+        const position = filter.operator === 'contains' || filter.operator === 'notContains'
+          ? 'contains'
+          : filter.operator === 'startsWith' ? 'startsWith' : 'endsWith'
+        const negated = filter.operator === 'notContains'
+        // `LIKE … ESCAPE '\'` so the escaping in `likePattern` is honoured.
+        clauses.push(`${quoted} ${negated ? 'NOT ' : ''}LIKE ? ESCAPE '\\'`)
+        params.push(likePattern(value, position))
+        continue
+      }
+      default: {
+        const operator = filter.operator === 'eq' ? '='
+          : filter.operator === 'neq' ? '<>'
+            : filter.operator === 'gt' ? '>'
+              : filter.operator === 'gte' ? '>='
+                : filter.operator === 'lt' ? '<' : '<='
+        if (value === '') throw new Error(`${filter.operator} needs a value`)
+        clauses.push(`${quoted} ${operator} ?`)
+        params.push(value)
+      }
+    }
+  }
+
+  if (clauses.length === 0) return { where: '', params: [] }
+  const joiner = join === 'or' ? ' OR ' : ' AND '
+  // One pair of brackets around the whole conjunction: without them a caller
+  // appending another `AND` (a mode's own scope) would bind to the last clause
+  // only.
+  return { where: ` WHERE (${clauses.join(joiner)})`, params }
+}
