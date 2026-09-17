@@ -11,17 +11,23 @@ import { WebSocket } from 'ws'
  * A separate script from 'e2e-sql-editing.mjs' because the search step needs a
  * different KIND of input. Measured while writing the bigger flow: writing into
  * a controlled input with the native value setter and dispatching
- * 'new Event('input')' leaves the DOM correct while React's state stays EMPTY —
+ * 'new Event("input")' leaves the DOM correct while React's state stays EMPTY —
  * the form then refuses a condition whose box visibly holds the text. So the
  * typing here goes through the browser with 'Input.insertText', which is the only
  * way to exercise a controlled input honestly.
  *
- * What it proves, against the server:
- *   - a 'contains' condition returns exactly the matching rows;
- *   - the operand is BOUND, not interpolated: '100%' matches one row, and
- *     '' OR 1=1 --' matches none;
- *   - 'is NULL' returns only the NULL rows;
- *   - the tab has no raw-WHERE box at all.
+ * Every case is an ASSERTION with an exit code, not a printed observation: the
+ * earlier version printed what it saw and left the reader to decide, which is not
+ * a test. The cases, chosen because each one distinguishes this form from the raw
+ * WHERE box it replaced:
+ *
+ *   - CONTAINS finds exactly the matching rows;
+ *   - a PERCENT SIGN is a character to find, not a wildcard: searching '%' on a
+ *     column holding '100%' returns that one row, where interpolation would
+ *     return every row;
+ *   - an INJECTION-SHAPED value matches nothing, because it is bound as a value;
+ *   - IS NULL returns only the NULL rows, which no text operand can express;
+ *   - the tab has no raw-WHERE input at all.
  *
  * Usage: node scripts/e2e-sql-search.mjs <baseUrl-with-token> <sqliteFile>
  */
@@ -37,7 +43,13 @@ if (baseUrl === undefined || sqliteFile === undefined) {
   process.exit(2)
 }
 
-/** Seed a table with the values the assertions need. */
+/**
+ * Seed the values the cases need.
+ *
+ * 'note' is where the wildcard and null cases point: a literal '100%' and two
+ * NULLs. Pointing them at 'name' would have made the wildcard case pass for the
+ * wrong reason — a '%' that matched nothing because the value was not there.
+ */
 function seed(file) {
   const db = new DatabaseSync(file)
   db.exec('DROP TABLE IF EXISTS items')
@@ -92,6 +104,13 @@ const child = spawn(EDGE, [
   'about:blank',
 ], { stdio: 'ignore' })
 
+/** Accumulated outcomes, printed and used for the exit code. */
+const checks = []
+const check = (name, ok, detail) => {
+  checks.push({ name, ok, detail })
+  console.log(`${ok ? 'OK  ' : 'FAIL'} ${name}${detail === undefined ? '' : ' → ' + JSON.stringify(detail)}`)
+}
+
 let socket
 try {
   let target
@@ -118,8 +137,15 @@ try {
   await session.send('Page.navigate', { url: baseUrl })
   await wait(4500)
 
-  /** Run the flow, typing 'text' into the search field when it asks for it. */
-  const runSearch = async (text) => {
+  /**
+   * Run one search and return what the grid shows.
+   *
+   * @param column - the field to search.
+   * @param operator - 'contains' or 'isNull', by the operator's option VALUE
+   *   (which is the wire name, not the label).
+   * @param text - what to type, or undefined for a unary operator.
+   */
+  const runSearch = async (column, operator, text) => {
     const flow = `(async () => {
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       const waitFor = async (fn, ms) => { const end = Date.now() + ms; for (;;) { const v = fn(); if (v) return v; if (Date.now() > end) return null; await sleep(120); } };
@@ -176,71 +202,102 @@ try {
       const hasRawWhere = document.querySelector('.dbm-tab-body textarea[placeholder*="WHERE"]') !== null
         || document.querySelector('.dbm-tab-body input[placeholder*="WHERE"]') !== null;
 
-      // Column = name, operator = contains.
+      // The field, by the wire value of its option.
       const selects = cond.querySelectorAll('select');
-      const nameOption = Array.from(selects[0].options).find((o) => o.value === 'name');
-      if (!nameOption) return { fatal: 'the form offers no name column' };
-      setSelect(selects[0], nameOption.value);
+      const fieldOption = Array.from(selects[0].options).find((o) => o.value === ${JSON.stringify(column)});
+      if (!fieldOption) return { fatal: 'the form offers no ' + ${JSON.stringify(column)} + ' column', options: Array.from(selects[0].options).map((o) => o.value) };
+      setSelect(selects[0], fieldOption.value);
       await sleep(400);
+
       const ops = cond.querySelectorAll('select')[1];
-      const contains = Array.from(ops.options).find((o) => /contains|包含/.test(o.textContent));
-      if (!contains) return { fatal: 'the form offers no contains operator', ops: Array.from(ops.options).map((o) => o.textContent) };
-      setSelect(ops, contains.value);
+      const opOption = Array.from(ops.options).find((o) => o.value === ${JSON.stringify(operator)});
+      if (!opOption) return { fatal: 'the form offers no ' + ${JSON.stringify(operator)} + ' operator', options: Array.from(ops.options).map((o) => o.value) };
+      setSelect(ops, opOption.value);
       await sleep(300);
 
-      // Let the driver type real input into the value field.
-      window.__dbmWaitingForTyping = true;
+      // Type real input into the value field, or skip it for a unary operator.
       const valueField = cond.querySelector('input.dbm-input');
+      ${text === undefined
+        ? 'if (valueField) return { fatal: "a unary operator still shows a value field" };'
+        : `if (!valueField) return { fatal: 'the operator has no value field' };
       valueField.focus();
+      window.__dbmWaitingForTyping = true;
       window.__dbmTyped = () => { window.__dbmWaitingForTyping = false; };
       const started = Date.now();
-      while (window.__dbmWaitingForTyping && Date.now() - started < 20000) await sleep(120);
+      while (window.__dbmWaitingForTyping && Date.now() - started < 20000) await sleep(120);`}
 
       const searchBtn = Array.from(document.querySelectorAll('.dbm-btn'))
         .find((b) => (b.textContent || '').trim() === '搜索' || (b.textContent || '').trim() === 'Search');
       if (!searchBtn) return { fatal: 'no search button' };
       click(searchBtn);
-      await sleep(2200);
+
+      // Wait for the reported count, which is what identifies the NEW result: the
+      // grid keeps the previous page while the query runs.
+      const countLine = await waitFor(() => {
+        const el = Array.from(document.querySelectorAll('.dbm-hint'))
+          .find((e) => /(匹配到|matched)\\s*\\d/.test(e.textContent || ''));
+        return el || null;
+      }, 10000);
+      await sleep(400);
 
       return {
         hasRawWhere,
-        typed: valueField.value,
+        countText: countLine === null ? null : countLine.textContent.trim(),
         rows: Array.from(document.querySelectorAll('.dbm-data tbody tr')).map((tr) => (tr.textContent || '').trim()),
         errors: Array.from(document.querySelectorAll('.dbm-error')).map((el) => el.textContent.trim()),
       };
     })()`
 
     const flowPromise = session.evaluate(flow)
-    // Type with the browser as soon as the flow asks for it.
-    for (let attempt = 0; attempt < 250; attempt++) {
-      const waiting = await session.evaluate('window.__dbmWaitingForTyping === true')
-      if (waiting === true) {
-        await session.send('Input.insertText', { text })
-        await wait(300)
-        await session.evaluate('window.__dbmTyped && window.__dbmTyped()')
-        break
+    // Type with the browser as soon as the flow asks for it. Skipped for a unary
+    // operator, which has no value field.
+    if (text !== undefined) {
+      for (let attempt = 0; attempt < 250; attempt++) {
+        const waiting = await session.evaluate('window.__dbmWaitingForTyping === true')
+        if (waiting === true) {
+          await session.send('Input.insertText', { text })
+          await wait(300)
+          await session.evaluate('window.__dbmTyped && window.__dbmTyped()')
+          break
+        }
+        await wait(120)
       }
-      await wait(120)
     }
     return flowPromise
   }
 
-  const results = {}
+  /** Reload so each case starts from a fresh panel with its own source. */
+  const reset = async () => {
+    await session.evaluate('location.reload()')
+    await wait(4500)
+  }
 
-  // A 'contains' condition finds exactly one row.
-  results.contains = await runSearch('alph')
-  await session.evaluate('location.reload()')
-  await wait(4500)
+  // ---- case 1: contains finds exactly the matching row ---------------------
+  const contains = await runSearch('name', 'contains', 'alph')
+  check('the search tab has no raw-WHERE box', contains.hasRawWhere === false, contains.hasRawWhere)
+  check('contains matched the single expected row', contains.rows.length === 1 && contains.rows[0].includes('alpha'), contains.rows)
+  await reset()
 
-  // A percent sign is a character to find, not a wildcard: only the '100%' row.
-  results.percent = await runSearch('%')
-  await session.evaluate('location.reload()')
-  await wait(4500)
+  // ---- case 2: a wildcard character is a literal --------------------------
+  // '100%' is in the note column, so a wildcard interpretation would also match
+  // the rows whose note is non-null — and 'x' contains no percent at all.
+  const percent = await runSearch('note', 'contains', '%')
+  check('a percent sign matches only the literal 100% row', percent.rows.length === 1 && percent.rows[0].includes('100%'), percent.rows)
+  await reset()
 
-  // An operand that looks like SQL is a VALUE: nothing matches it.
-  results.injection = await runSearch("' OR 1=1 --")
+  // ---- case 3: an injection-shaped operand is a value ---------------------
+  const injection = await runSearch('name', 'contains', "' OR 1=1 --")
+  check('an injection-shaped value matches nothing', injection.rows.length === 0, { rows: injection.rows, count: injection.countText })
+  await reset()
 
-  console.log(JSON.stringify(results, null, 2))
+  // ---- case 4: is NULL, which no text operand can express ----------------
+  const nulls = await runSearch('note', 'isNull', undefined)
+  check('is NULL returned exactly the two NULL rows', nulls.rows.length === 2, nulls.rows)
+  await reset()
+
+  const failed = checks.filter(entry => !entry.ok)
+  console.log(`\n${checks.length - failed.length}/${checks.length} checks passed`)
+  if (failed.length > 0) process.exitCode = 1
 } finally {
   try { socket?.close() } catch { /* gone */ }
   child.kill()
