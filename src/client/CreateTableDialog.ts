@@ -443,7 +443,16 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
   const typeCell = (column: DraftColumn, index: number): React.ReactElement => {
     const groups = TYPE_GROUPS[kind] ?? TYPE_GROUPS.mysql!
     const offered = groups.flatMap(group => group.types)
-    const isCustom = customTypeRows.has(column.id) || !offered.includes(column.type)
+    const isListed = offered.includes(column.type)
+    /*
+     * Edit mode is VIEW state, and a blank type counts as editing.
+     *
+     * It used to also be true whenever the type was not in the list, which made the
+     * back-to-list button pointless for a custom value: the select would immediately swap
+     * back out to the text field. Keeping the two conditions separate is what lets a
+     * custom value live in the list as its own entry.
+     */
+    const isCustom = customTypeRows.has(column.id) || column.type.trim() === ''
 
     if (isCustom) {
       return React.createElement(
@@ -456,15 +465,21 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
           'aria-label': t('createTable.typeText'),
           'data-dbm-newtable-coltype-text': String(index),
           spellcheck: false,
+          // The element mounts when the cell switches to custom mode, so this focuses it
+          // once — which is what makes typing immediately possible after choosing 自定义.
           autoFocus: true,
           onChange: (event: { target: { value: string } }) => patch(column.id, { type: event.target.value }),
         }),
         /*
          * A way back to the list.
          *
-         * Without it, choosing 自定义 is one-way: the dropdown is gone and the only way
-         * to a listed type is the 删除该字段 button. A small button rather than a second
+         * Without it, choosing 自定义 is one-way: the dropdown is gone and the only way to
+         * a listed type is the 删除该字段 button. A small button rather than a second
          * dropdown, to keep the cell one control wide.
+         *
+         * It does NOT change the type: the first version reset it to the first listed
+         * type, which silently discarded what the user had typed (measured: DECIMAL(10,2)
+         * became TINYINT). The value is kept, and the list shows it as its own entry.
          */
         React.createElement('button', {
           type: 'button',
@@ -477,9 +492,6 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
               next.delete(column.id)
               return next
             })
-            // Fall back to a listed type so the dropdown has something selected; keeping
-            // the typed text would leave the dropdown showing 自定义 again.
-            patch(column.id, { type: groups[0]!.types[0]! })
           },
         }, '↺'),
       )
@@ -489,12 +501,17 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
       'select',
       {
         className: 'dbm-select dbm-mono',
-        value: column.type,
+        // A custom value has no option of its own, so it is represented by the synthetic
+        // entry below; without that the controlled select would show an unrelated type
+        // while the state still held the custom one.
+        value: isListed ? column.type : '__customValue__',
         'aria-label': t('createTable.columnType'),
         'data-dbm-newtable-coltype': String(index),
         onChange: (event: { target: { value: string } }) => {
           const value = event.target.value
-          if (value === '__custom__') {
+          if (value === '__custom__' || value === '__customValue__') {
+            // Choosing the custom entry (or the current custom value) opens the text field
+            // so it can be edited, rather than replacing it with anything.
             setCustomTypeRows(current => new Set(current).add(column.id))
             return
           }
@@ -507,8 +524,13 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
           { key: group.label, label: t(group.label as never) },
           ...group.types.map(value => React.createElement('option', { key: value, value }, value)),
         )),
+        // The current custom value, kept selectable so returning to the list does not
+        // discard it and the dropdown can still show what will be declared.
+        isListed
+          ? null
+          : React.createElement('option', { key: '__customValue__', value: '__customValue__' }, `${column.type} ${t('createTable.typeCustomMark')}`),
         React.createElement('option', { key: '__custom__', value: '__custom__' }, t('createTable.typeCustom')),
-      ],
+      ].filter(entry => entry !== null),
     )
   }
 

@@ -167,9 +167,20 @@ try {
     const names = Array.from(ct.querySelectorAll('[data-dbm-newtable-colname]'));
     const types = Array.from(ct.querySelectorAll('[data-dbm-newtable-coltype]'));
     setInput(names[0], 'id');
-    setInput(types[0], 'INT');
+    /*
+     * The type control is a SELECT of grouped options now, so it is set with a change
+     * event.
+     *
+     * Using the input setter on it throws Illegal invocation — the setter is bound to
+     * HTMLInputElement — which is how this probe broke when the panel changed. The value
+     * must also be one the list offers, because a select cannot hold an arbitrary string:
+     * 'VARCHAR' rather than 'VARCHAR(50)', with the length in its own field.
+     */
+    setSelect(types[0], 'INT');
     setInput(names[1], 'name');
-    setInput(types[1], 'VARCHAR(50)');
+    setSelect(types[1], 'VARCHAR');
+    const lengthFields = Array.from(ct.querySelectorAll('[data-dbm-newtable-collength]'));
+    if (lengthFields[1] !== undefined) setInput(lengthFields[1], '50');
     await sleep(200);
     out.beforeSubmit = {
       names: names.map((el) => el.value),

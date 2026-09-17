@@ -236,6 +236,8 @@ export const zh = {
   'createTable.group.spatial': '空间类型',
   'createTable.group.other': '其他',
   'createTable.typeCustom': '自定义…',
+  /* Marks the synthetic entry that carries a custom value back into the list. */
+  'createTable.typeCustomMark': '（自定义）',
   'createTable.typeCustomPlaceholder': '例如 decimal(10,2) unsigned',
   'createTable.typeText': '自定义类型',
   'createTable.typeBackToList': '返回类型列表',
@@ -921,6 +923,7 @@ export const en: Record<DbKey, string> = {
   'createTable.group.spatial': 'Spatial',
   'createTable.group.other': 'Other',
   'createTable.typeCustom': 'Custom…',
+  'createTable.typeCustomMark': '(custom)',
   'createTable.typeCustomPlaceholder': 'e.g. decimal(10,2) unsigned',
   'createTable.typeText': 'Custom type',
   'createTable.typeBackToList': 'Back to the type list',
