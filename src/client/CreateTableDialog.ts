@@ -58,17 +58,48 @@ interface DraftColumn {
   indexName: string
 }
 
-/** Common column types per engine, matching the 结构 tab's own list. */
-const TYPES: Record<string, string[]> = {
+/**
+ * Column types, GROUPED as the type dropdown presents them.
+ *
+ * A flat list of thirty types is hard to scan, and the choice is naturally two-step
+ * ("a number, then which number"). Grouping is what was asked for.
+ */
+const TYPE_GROUPS: Record<string, Array<{ label: string; types: string[] }>> = {
   mysql: [
-    'INT', 'BIGINT', 'SMALLINT', 'MEDIUMINT', 'TINYINT', 'DECIMAL', 'FLOAT', 'DOUBLE', 'BIT',
-    'VARCHAR', 'CHAR', 'TEXT', 'TINYTEXT', 'MEDIUMTEXT', 'LONGTEXT',
-    'BINARY', 'VARBINARY', 'BLOB', 'TINYBLOB', 'MEDIUMBLOB', 'LONGBLOB',
-    'DATE', 'DATETIME', 'TIMESTAMP', 'TIME', 'YEAR',
-    'ENUM', 'SET', 'JSON', 'BOOLEAN',
-    'GEOMETRY', 'POINT', 'LINESTRING', 'POLYGON',
+    { label: 'createTable.group.integer', types: ['TINYINT', 'SMALLINT', 'MEDIUMINT', 'INT', 'BIGINT'] },
+    { label: 'createTable.group.float', types: ['FLOAT', 'DOUBLE', 'DECIMAL'] },
+    { label: 'createTable.group.string', types: ['CHAR', 'VARCHAR', 'TINYTEXT', 'TEXT', 'MEDIUMTEXT', 'LONGTEXT', 'ENUM', 'SET', 'JSON'] },
+    { label: 'createTable.group.binary', types: ['BIT', 'BINARY', 'VARBINARY', 'TINYBLOB', 'BLOB', 'MEDIUMBLOB', 'LONGBLOB'] },
+    { label: 'createTable.group.temporal', types: ['DATE', 'TIME', 'DATETIME', 'TIMESTAMP', 'YEAR'] },
+    { label: 'createTable.group.spatial', types: ['GEOMETRY', 'POINT', 'LINESTRING', 'POLYGON', 'MULTIPOINT', 'MULTILINESTRING', 'MULTIPOLYGON', 'GEOMETRYCOLLECTION'] },
   ],
-  sqlite: ['INTEGER', 'REAL', 'TEXT', 'BLOB', 'NUMERIC', 'VARCHAR(255)', 'BOOLEAN', 'DATE', 'DATETIME'],
+  /*
+   * SQLite has no type system — a type name is an affinity hint — so these are the
+   * conventional names rather than an exhaustive set. Writing a length into the type
+   * (`VARCHAR(20)`) is the normal thing to do there, so a couple of those are listed.
+   */
+  sqlite: [
+    { label: 'createTable.group.integer', types: ['INTEGER', 'INT', 'TINYINT', 'SMALLINT', 'BIGINT'] },
+    { label: 'createTable.group.float', types: ['REAL', 'DOUBLE', 'FLOAT', 'NUMERIC', 'DECIMAL'] },
+    { label: 'createTable.group.string', types: ['TEXT', 'VARCHAR(255)', 'CHAR(1)', 'CLOB'] },
+    { label: 'createTable.group.binary', types: ['BLOB'] },
+    { label: 'createTable.group.temporal', types: ['DATE', 'DATETIME', 'TIMESTAMP', 'TIME'] },
+    { label: 'createTable.group.other', types: ['BOOLEAN'] },
+  ],
+}
+
+/** Column attributes, as the attribute dropdown lists them. */
+const ATTRIBUTE_ITEMS: Array<{ id: ColumnAttribute; label: string }> = [
+  { id: 'unsigned', label: 'UNSIGNED' },
+  { id: 'zerofill', label: 'ZEROFILL' },
+  { id: 'binary', label: 'BINARY' },
+  { id: 'onUpdateCurrentTimestamp', label: 'ON UPDATE CURRENT_TIMESTAMP' },
+]
+
+/** The flat list of every offered type, for suggestions. */
+const TYPES: Record<string, string[]> = {
+  mysql: TYPE_GROUPS.mysql!.flatMap(group => group.types),
+  sqlite: TYPE_GROUPS.sqlite!.flatMap(group => group.types),
 }
 
 /** The collations offered per engine, as a starting point. */
@@ -127,11 +158,28 @@ const blank = (kind: string, first: boolean): DraftColumn => ({
  *   alias), so it needs the key AND the exact type `INTEGER` — `INT` is accepted as a
  *   type name but is NOT the rowid alias, so it would silently not auto-increment.
  */
+/**
+ * Why an auto-increment column is not possible here, or undefined when it is.
+ *
+ * Returns the REASON rather than a boolean, because the reason has to be SHOWN. The
+ * previous shape returned a boolean and the caller used it to disable the checkbox with
+ * the reason in a `title` — so the control could not be clicked and nothing on screen
+ * said why. Reproduced exactly: after deleting the default column the checkbox was
+ * disabled with `title: 自增字段必须是主键` and no visible text anywhere.
+ *
+ * The reasons are ordered as a user would fix them, so the message names the first thing
+ * to change rather than a requirement that may already hold.
+ */
+function autoIncrementBlocker(kind: string, column: DraftColumn): 'notKey' | 'notInteger' | 'notNumeric' | undefined {
+  if (column.indexKind !== 'primary') return 'notKey'
+  if (kind === 'sqlite') return column.type.trim().toUpperCase() === 'INTEGER' ? undefined : 'notInteger'
+  if (!NUMERIC_TYPES.test(column.type) && !/\bINTEGER\b/i.test(column.type)) return 'notNumeric'
+  return undefined
+}
+
+/** Whether an auto-increment column is expressible on this engine. */
 function autoIncrementAllowed(kind: string, column: DraftColumn): boolean {
-  if (column.indexKind !== 'primary') return false
-  if (!NUMERIC_TYPES.test(column.type) && !/\bINTEGER\b/i.test(column.type)) return false
-  if (kind === 'sqlite') return column.type.trim().toUpperCase() === 'INTEGER'
-  return true
+  return autoIncrementBlocker(kind, column) === undefined
 }
 
 /** Props for {@link CreateTableDialog}. */
@@ -383,24 +431,144 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
     }
   }
 
-  /** One attribute checkbox, disabled with the reason when the type cannot carry it. */
-  const attributeBox = (column: DraftColumn, attribute: ColumnAttribute, label: string): React.ReactElement => {
-    const available = attributeAvailable(attribute, column)
+  /**
+   * Which type cells are showing their text field instead of the dropdown.
+   *
+   * Keyed by column id and held here rather than on the column, because it is a view
+   * state: whether the custom field is open is not part of the table being defined.
+   */
+  const [customTypeRows, setCustomTypeRows] = React.useState<Set<number>>(new Set())
+
+  /** The grouped type dropdown, or the text field it swaps to, for one cell. */
+  const typeCell = (column: DraftColumn, index: number): React.ReactElement => {
+    const groups = TYPE_GROUPS[kind] ?? TYPE_GROUPS.mysql!
+    const offered = groups.flatMap(group => group.types)
+    const isCustom = customTypeRows.has(column.id) || !offered.includes(column.type)
+
+    if (isCustom) {
+      return React.createElement(
+        'div',
+        { className: 'dbm-type-cell' },
+        React.createElement('input', {
+          className: 'dbm-input dbm-mono',
+          value: column.type,
+          placeholder: t('createTable.typeCustomPlaceholder'),
+          'aria-label': t('createTable.typeText'),
+          'data-dbm-newtable-coltype-text': String(index),
+          spellcheck: false,
+          autoFocus: true,
+          onChange: (event: { target: { value: string } }) => patch(column.id, { type: event.target.value }),
+        }),
+        /*
+         * A way back to the list.
+         *
+         * Without it, choosing 自定义 is one-way: the dropdown is gone and the only way
+         * to a listed type is the 删除该字段 button. A small button rather than a second
+         * dropdown, to keep the cell one control wide.
+         */
+        React.createElement('button', {
+          type: 'button',
+          className: 'dbm-btn dbm-btn-sm',
+          title: t('createTable.typeBackToList'),
+          'data-dbm-newtable-coltype-list': String(index),
+          onClick: () => {
+            setCustomTypeRows(current => {
+              const next = new Set(current)
+              next.delete(column.id)
+              return next
+            })
+            // Fall back to a listed type so the dropdown has something selected; keeping
+            // the typed text would leave the dropdown showing 自定义 again.
+            patch(column.id, { type: groups[0]!.types[0]! })
+          },
+        }, '↺'),
+      )
+    }
+
     return React.createElement(
-      'label',
-      { className: 'dbm-check dbm-check-tight', key: attribute, title: available ? undefined : t('createTable.attributeUnavailable') },
-      React.createElement('input', {
-        type: 'checkbox',
-        checked: column.attributes.includes(attribute),
-        disabled: !available,
-        'data-dbm-newtable-attr': `${column.id}:${attribute}`,
-        onChange: (event: { target: { checked: boolean } }) => {
-          const next = column.attributes.filter(entry => entry !== attribute)
-          if (event.target.checked) next.push(attribute)
+      'select',
+      {
+        className: 'dbm-select dbm-mono',
+        value: column.type,
+        'aria-label': t('createTable.columnType'),
+        'data-dbm-newtable-coltype': String(index),
+        onChange: (event: { target: { value: string } }) => {
+          const value = event.target.value
+          if (value === '__custom__') {
+            setCustomTypeRows(current => new Set(current).add(column.id))
+            return
+          }
+          patch(column.id, { type: value })
+        },
+      },
+      [
+        ...groups.map(group => React.createElement(
+          'optgroup',
+          { key: group.label, label: t(group.label as never) },
+          ...group.types.map(value => React.createElement('option', { key: value, value }, value)),
+        )),
+        React.createElement('option', { key: '__custom__', value: '__custom__' }, t('createTable.typeCustom')),
+      ],
+    )
+  }
+
+  /**
+   * The attribute dropdown for one column.
+   *
+   * A `multiple` select is the direct reading of "use a dropdown, not checkboxes", but
+   * it is awkward with a mouse (ctrl-click to add) and its closed state shows only one
+   * value. This keeps the dropdown shape and makes each option a TOGGLE, with the closed
+   * state listing what is chosen — so `UNSIGNED ZEROFILL` is expressible and visible.
+   *
+   * Attributes the current type cannot carry are DISABLED and their option text says so,
+   * rather than being hidden: a user who expects ZEROFILL on a text column is told why
+   * they cannot have it.
+   */
+  const attributeSelect = (column: DraftColumn, index: number): React.ReactElement => {
+    const chosen = column.attributes
+    const summary = chosen.length === 0
+      ? t('common.none')
+      : chosen.map(id => ATTRIBUTE_ITEMS.find(item => item.id === id)?.label ?? id).join(' ')
+    return React.createElement(
+      'select',
+      {
+        className: 'dbm-select',
+        // The select's own value is unused (options are toggles), so it always shows the
+        // placeholder; the summary is rendered as the option text below.
+        value: '',
+        'aria-label': t('createTable.columnAttributes'),
+        'data-dbm-newtable-attr-select': String(index),
+        title: t('createTable.attributesHint'),
+        onChange: (event: { target: { value: string } }) => {
+          const value = event.target.value as ColumnAttribute | '__clear__'
+          if (value === '__clear__') { patch(column.id, { attributes: [] }); return }
+          const next = chosen.includes(value) ? chosen.filter(entry => entry !== value) : [...chosen, value]
           patch(column.id, { attributes: next })
         },
-      }),
-      label,
+      },
+      [
+        React.createElement('option', { key: '__summary__', value: '' }, summary),
+        ...ATTRIBUTE_ITEMS.map(item => {
+          const available = attributeAvailable(item.id, column)
+          return React.createElement(
+            'option',
+            {
+              key: item.id,
+              value: item.id,
+              disabled: !available,
+              // The reason is the option's own text, so it is readable in the open list
+              // instead of hidden in a tooltip.
+              'data-dbm-newtable-attr-option': `${index}:${item.id}`,
+            },
+            available
+              ? `${chosen.includes(item.id) ? '✓ ' : ''}${item.label}`
+              : `${item.label} — ${t('createTable.attributeUnavailable')}`,
+          )
+        }),
+        chosen.length === 0
+          ? null
+          : React.createElement('option', { key: '__clear__', value: '__clear__' }, t('createTable.attributesClear')),
+      ].filter(entry => entry !== null),
     )
   }
 
@@ -432,8 +600,23 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
     )
 
   /** One row of the column table. */
-  const rowFor = (column: DraftColumn, index: number): React.ReactElement =>
-    React.createElement(
+  const rowFor = (column: DraftColumn, index: number): React.ReactElement => {
+    const autoBlocker = autoIncrementBlocker(kind, column)
+    /**
+     * The sentence shown when 自增 cannot be used; nothing when it can.
+     *
+     * ON SCREEN, not in a title: the reported problem was a checkbox that could not be
+     * ticked and gave no reason, because the reason lived only in a tooltip.
+     */
+    const autoHint = autoBlocker === undefined
+      ? null
+      : autoBlocker === 'notKey'
+        ? t('createTable.autoNeedsKey')
+        : autoBlocker === 'notInteger'
+          ? t('createTable.autoNeedsInteger', { name: column.name.trim() === '' ? t('createTable.thisColumn') : column.name.trim() })
+          : t('createTable.autoNeedsNumeric', { name: column.name.trim() === '' ? t('createTable.thisColumn') : column.name.trim() })
+
+    return React.createElement(
       'tr',
       { key: column.id, 'data-dbm-newtable-row': String(index) },
       /* 字段名 */
@@ -446,17 +629,18 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
         spellcheck: false,
         onChange: (event: { target: { value: string } }) => patch(column.id, { name: event.target.value }),
       })),
-      /* 类型 */
-      React.createElement('td', null, React.createElement('input', {
-        className: 'dbm-input dbm-mono',
-        value: column.type,
-        placeholder: typeList[0],
-        'aria-label': t('createTable.columnType'),
-        'data-dbm-newtable-coltype': String(index),
-        spellcheck: false,
-        list: `dbm-types-${kind}`,
-        onChange: (event: { target: { value: string } }) => patch(column.id, { type: event.target.value }),
-      })),
+      /*
+       * 类型: a GROUPED dropdown, which swaps to a text field IN THE SAME CELL.
+       *
+       * Grouped because a flat list of thirty types is hard to scan and the choice is
+       * two-step ("a number, then which"). The custom entry is needed because MySQL
+       * accepts more type text than any list holds (`decimal(10,2) unsigned`,
+       * `enum('a','b')`) and SQLite accepts essentially anything.
+       *
+       * The swap is in place rather than a separate column: the form is already wide and
+       * width was the complaint, so the custom affordance must not add a column.
+       */
+      React.createElement('td', null, typeCell(column, index)),
       /* 长度/值 */
       React.createElement('td', null, React.createElement('input', {
         className: 'dbm-input dbm-mono',
@@ -481,15 +665,8 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
         },
         collationList.map(value => React.createElement('option', { key: value === '' ? '__none__' : value, value }, value === '' ? t('common.none') : value)),
       )),
-      /* 属性 */
-      React.createElement(
-        'td',
-        { className: 'dbm-attrs' },
-        attributeBox(column, 'unsigned', 'UNSIGNED'),
-        attributeBox(column, 'zerofill', 'ZEROFILL'),
-        attributeBox(column, 'binary', 'BINARY'),
-        attributeBox(column, 'onUpdateCurrentTimestamp', t('createTable.attrOnUpdate')),
-      ),
+      /* 属性: a dropdown, as asked */
+      React.createElement('td', null, attributeSelect(column, index)),
       /* 索引 */
       React.createElement('td', null, indexSelect(column, index)),
       /* 索引名（联合索引用） */
@@ -527,21 +704,30 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
         spellcheck: false,
         onChange: (event: { target: { value: string } }) => patch(column.id, { defaultValue: event.target.value }),
       })),
-      /* 自增 */
-      React.createElement('td', null, React.createElement('label', { className: 'dbm-check' },
-        React.createElement('input', {
-          type: 'checkbox',
-          checked: column.autoIncrement,
-          // Disabled where the engine cannot express it, with the reason — see
-          // `autoIncrementAllowed`.
-          disabled: !autoIncrementAllowed(kind, column),
-          title: column.indexKind !== 'primary'
-            ? t('createTable.autoNeedsKey')
-            : (isSqlite ? t('createTable.autoNeedsInteger') : t('createTable.autoNeedsNumeric')),
-          'data-dbm-newtable-auto': String(index),
-          onChange: (event: { target: { checked: boolean } }) => patch(column.id, { autoIncrement: event.target.checked }),
-        }),
-      )),
+      /*
+       * 自增, WITH ITS REASON ON SCREEN.
+       *
+       * The combination the engine cannot express is still refused, but the user is told
+       * what to change instead of facing a control that silently does nothing.
+       */
+      React.createElement('td', { className: 'dbm-auto-cell' },
+        React.createElement('label', { className: 'dbm-check' },
+          React.createElement('input', {
+            type: 'checkbox',
+            checked: column.autoIncrement,
+            disabled: autoBlocker !== undefined,
+            'data-dbm-newtable-auto': String(index),
+            onChange: (event: { target: { checked: boolean } }) => patch(column.id, { autoIncrement: event.target.checked }),
+          }),
+        ),
+        autoHint === null
+          ? null
+          : React.createElement(
+              'div',
+              { className: 'dbm-hint dbm-auto-hint', 'data-dbm-newtable-auto-hint': String(index) },
+              autoHint,
+            ),
+      ),
       /* 注释 */
       React.createElement('td', null, React.createElement('input', {
         className: 'dbm-input',
@@ -563,6 +749,7 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
         onClick: () => removeRow(column.id),
       }, '×')),
     )
+  }
 
   /** The header for the column table. */
   const columnHeaders = [
@@ -583,30 +770,38 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
   const body = React.createElement(
     'div',
     null,
-    /* ---- the table itself ---- */
+    /* ---- the table itself ------------------------------------------------ *
+     *
+     * One grid: label on the left, control on the right, two fields per row. The dialog
+     * is wide enough for two, and a single column of fields at this width left long empty
+     * stretches beside every control.
+     */
     React.createElement(
       'div',
-      { className: 'dbm-field' },
-      React.createElement('label', { className: 'dbm-field-label' }, t('createTable.tableName')),
-      React.createElement('input', {
-        className: 'dbm-input dbm-mono',
-        value: name,
-        placeholder: 'my_table',
-        'aria-label': t('createTable.tableName'),
-        'data-dbm-newtable-name': '',
-        spellcheck: false,
-        autoFocus: true,
-        onChange: (event: { target: { value: string } }) => setName(event.target.value),
-      }),
-      React.createElement('div', { className: 'dbm-hint' }, t('createTable.intoSchema', { schema })),
-    ),
-    React.createElement(
-      'div',
-      { className: 'dbm-field dbm-field-row' },
-      React.createElement('div', null,
-        React.createElement('label', { className: 'dbm-field-label' }, t('createTable.tableComment')),
+      { className: 'dbm-grid2' },
+      React.createElement(
+        'div',
+        { className: 'dbm-grid-row' },
+        React.createElement('label', { className: 'dbm-grid-label', htmlFor: 'dbm-newtable-name' }, t('createTable.tableName')),
         React.createElement('input', {
-          className: 'dbm-input',
+          className: 'dbm-input dbm-mono dbm-grid-control',
+          id: 'dbm-newtable-name',
+          value: name,
+          placeholder: 'my_table',
+          'aria-label': t('createTable.tableName'),
+          'data-dbm-newtable-name': '',
+          spellcheck: false,
+          autoFocus: true,
+          onChange: (event: { target: { value: string } }) => setName(event.target.value),
+        }),
+      ),
+      React.createElement(
+        'div',
+        { className: 'dbm-grid-row' },
+        React.createElement('label', { className: 'dbm-grid-label', htmlFor: 'dbm-newtable-tablecomment' }, t('createTable.tableComment')),
+        React.createElement('input', {
+          className: 'dbm-input dbm-grid-control',
+          id: 'dbm-newtable-tablecomment',
           value: tableComment,
           disabled: isSqlite,
           placeholder: isSqlite ? t('createTable.sqliteNoTableCommentShort') : t('common.none'),
@@ -615,33 +810,14 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
           onChange: (event: { target: { value: string } }) => setTableComment(event.target.value),
         }),
       ),
-      React.createElement('div', null,
-        React.createElement('label', { className: 'dbm-field-label' }, t('createTable.tableCollate')),
+      React.createElement(
+        'div',
+        { className: 'dbm-grid-row' },
+        React.createElement('label', { className: 'dbm-grid-label', htmlFor: 'dbm-newtable-tableengine' }, t('createTable.tableEngine')),
         isSqlite
           ? React.createElement('input', {
-              className: 'dbm-input dbm-mono',
-              value: '',
-              disabled: true,
-              placeholder: t('createTable.sqliteNoTableCollateShort'),
-              'data-dbm-newtable-tablecollate': '',
-              title: t('createTable.sqliteNoTableCollate'),
-            })
-          : React.createElement(
-              'select',
-              {
-                className: 'dbm-select',
-                value: tableCollate,
-                'data-dbm-newtable-tablecollate': '',
-                onChange: (event: { target: { value: string } }) => setTableCollate(event.target.value),
-              },
-              collationList.map(value => React.createElement('option', { key: value === '' ? '__none__' : value, value }, value === '' ? t('createTable.tableCollateDefault') : value)),
-            ),
-      ),
-      React.createElement('div', null,
-        React.createElement('label', { className: 'dbm-field-label' }, t('createTable.tableEngine')),
-        isSqlite
-          ? React.createElement('input', {
-              className: 'dbm-input dbm-mono',
+              className: 'dbm-input dbm-mono dbm-grid-control',
+              id: 'dbm-newtable-tableengine',
               value: '',
               disabled: true,
               placeholder: t('createTable.sqliteNoEngineShort'),
@@ -651,7 +827,8 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
           : React.createElement(
               'select',
               {
-                className: 'dbm-select',
+                className: 'dbm-select dbm-grid-control',
+                id: 'dbm-newtable-tableengine',
                 value: tableEngine,
                 'data-dbm-newtable-tableengine': '',
                 onChange: (event: { target: { value: string } }) => setTableEngine(event.target.value),
@@ -659,40 +836,73 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
               ENGINES.map(value => React.createElement('option', { key: value, value }, value)),
             ),
       ),
-      // SQLite's own trailing keywords, which have no MySQL equivalent.
-      isSqlite
-        ? React.createElement('div', null,
-            React.createElement('label', { className: 'dbm-field-label' }, t('createTable.tableTail')),
-            React.createElement('label', { className: 'dbm-check' },
-              React.createElement('input', {
-                type: 'checkbox',
-                checked: withoutRowid,
-                'data-dbm-newtable-withoutrowid': '',
-                onChange: (event: { target: { checked: boolean } }) => setWithoutRowid(event.target.checked),
-              }),
-              'WITHOUT ROWID',
+      React.createElement(
+        'div',
+        { className: 'dbm-grid-row' },
+        React.createElement('label', { className: 'dbm-grid-label', htmlFor: 'dbm-newtable-tablecollate' }, t('createTable.tableCollate')),
+        isSqlite
+          ? React.createElement('input', {
+              className: 'dbm-input dbm-mono dbm-grid-control',
+              id: 'dbm-newtable-tablecollate',
+              value: '',
+              disabled: true,
+              placeholder: t('createTable.sqliteNoTableCollateShort'),
+              'data-dbm-newtable-tablecollate': '',
+              title: t('createTable.sqliteNoTableCollate'),
+            })
+          : React.createElement(
+              'select',
+              {
+                className: 'dbm-select dbm-grid-control',
+                id: 'dbm-newtable-tablecollate',
+                value: tableCollate,
+                'data-dbm-newtable-tablecollate': '',
+                onChange: (event: { target: { value: string } }) => setTableCollate(event.target.value),
+              },
+              collationList.map(value => React.createElement('option', { key: value === '' ? '__none__' : value, value }, value === '' ? t('createTable.tableCollateDefault') : value)),
             ),
-            React.createElement('label', { className: 'dbm-check' },
-              React.createElement('input', {
-                type: 'checkbox',
-                checked: strict,
-                'data-dbm-newtable-strict': '',
-                onChange: (event: { target: { checked: boolean } }) => setStrict(event.target.checked),
-              }),
-              'STRICT',
+      ),
+      /*
+       * SQLite's own trailing keywords, which have no MySQL equivalent. Two checkboxes in
+       * ONE grid row, so the grid's column count stays even.
+       */
+      isSqlite
+        ? React.createElement(
+            'div',
+            { className: 'dbm-grid-row' },
+            React.createElement('span', { className: 'dbm-grid-label' }, t('createTable.tableTail')),
+            React.createElement(
+              'div',
+              { className: 'dbm-grid-control dbm-check-group' },
+              React.createElement('label', { className: 'dbm-check' },
+                React.createElement('input', {
+                  type: 'checkbox',
+                  checked: withoutRowid,
+                  'data-dbm-newtable-withoutrowid': '',
+                  onChange: (event: { target: { checked: boolean } }) => setWithoutRowid(event.target.checked),
+                }),
+                'WITHOUT ROWID',
+              ),
+              React.createElement('label', { className: 'dbm-check' },
+                React.createElement('input', {
+                  type: 'checkbox',
+                  checked: strict,
+                  'data-dbm-newtable-strict': '',
+                  onChange: (event: { target: { checked: boolean } }) => setStrict(event.target.checked),
+                }),
+                'STRICT',
+              ),
             ),
           )
         : null,
     ),
+    React.createElement('div', { className: 'dbm-hint' }, t('createTable.intoSchema', { schema })),
 
     /* ---- the columns ---- */
     React.createElement(
       'div',
       { className: 'dbm-field' },
       React.createElement('label', { className: 'dbm-field-label' }, t('createTable.columns')),
-      // The datalist suggests types without constraining them: SQLite accepts any type
-      // name and MySQL has more types than a list can hold.
-      React.createElement('datalist', { id: `dbm-types-${kind}` }, ...typeList.map(value => React.createElement('option', { key: value, value }))),
       React.createElement(
         'div',
         { className: 'dbm-scroll' },

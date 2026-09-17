@@ -284,6 +284,8 @@ npm run build       # lib/index.js（host）+ lib/client.js（browser）
 | `scripts/probe-collate-link.mjs` | 排序规则随字符集联动：拿服务端 `information_schema` 真实列表逐项比对，含切换字符集后旧值不残留 |
 | `scripts/probe-create-table.mjs` | 「新建表」端到端：建表后从 `information_schema` 核对列、主键与自增，并实测自增真的生效；同时核对改字符集对话框的预填值 |
 | `scripts/probe-create-table-full.mjs` | 完整建表表单端到端（16 项）：以**几何**断言表单列未被截断（头单元格右边缘须在对话框可视区内、表格宽度须装进正文区），并从服务端核对长度、UNSIGNED、注释、联合索引的列顺序与唯一性、表引擎/整理/注释，以及 UNIQUE 确实被强制 |
+| `scripts/probe-create-table-ui.mjs` | 新建表表单的**布局与控件形态**端到端（16 项）：表名框宽度占比、每个字段「左 label 右控件」且控件左边缘对齐（逐列比对，非全表）、类型下拉的分组、属性是下拉且无残留复选框、自增在不可用时给出可见文字 |
+| `scripts/probe-autoincrement.mjs` | 自增的最小复现：分别记录「初始」「删掉默认字段后」「改为 PRIMARY 后」的 `disabled`、`title` 与**可见提示文字** |
 | `scripts/probe-create-table-capabilities.mjs` / `probe-sqlite-caps.mjs` / `probe-sqlite-traps.mjs` | 建表能力探查：逐条实测两引擎对长度、属性、列排序规则、索引类型、表选项的支持与**静默接受**（SQLite 会接受 `INT UNSIGNED` 并存进类型名而无任何效果） |
 | `scripts/probe-dbop-pane.mjs` | 库操作后右侧面板的状态（重命名/复制后不应停在「正在读取表和统计信息…」） |
 | `scripts/repro-rename.mjs` | 重命名的最小复现：分别验证空库与有表的库，确认原库被删除 |

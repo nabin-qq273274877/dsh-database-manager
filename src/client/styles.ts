@@ -831,6 +831,91 @@ textarea.dbm-cell-input {
 /* A long engine message must wrap rather than widen the dialog. */
 .dbm-maint-entry .dbm-hint { word-break: break-word; }
 
+/*
+ * The table-level fields: label on the LEFT, control on the RIGHT, two per row.
+ *
+ * Reported: 表名's input was too long and the table-level fields were laid out
+ * inconsistently (a full-width input, then labels ABOVE controls in a wrapping flex row).
+ * One grid replaces both, so every control is the same width and every label is in the
+ * same place. Two columns because the dialog is wide: a single column left long empty
+ * stretches beside each control.
+ */
+.dbm-grid2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 20px;
+  align-items: center;
+  /*
+   * Reserve the scrollbar's width on BOTH columns.
+   *
+   * The body scrolls vertically, and without this the scrollbar takes its width from the
+   * right-hand column only — measured as a 6px difference between the two columns'
+   * controls, which reads as misalignment. The stable value keeps the two columns equal
+   * whether or not a scrollbar is present.
+   */
+  scrollbar-gutter: stable;
+}
+/*
+ * Each field is its own two-part row inside the grid cell.
+ *
+ * The label track is a FIXED width, not max-content: max-content is resolved per row, so
+ * a short label ("存储引擎") and a long one ("整理（排序规则）") put their controls at
+ * different x positions — measured 884 vs 890, a visible misalignment of the very thing
+ * that was supposed to line up. One width for every row is what makes the controls
+ * align, and it is why the value is a length rather than a fit.
+ */
+.dbm-grid-row {
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+.dbm-grid-label {
+  font-weight: 500;
+  font-size: 12px;
+  /* Right-aligned so the labels form a column and the controls' left edges line up. */
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The control fills its cell, so widths are uniform rather than content-driven. */
+.dbm-grid-control { width: 100%; min-width: 0; box-sizing: border-box; }
+.dbm-check-group { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+/* A narrow window stacks the pairs: two columns of controls become unusable below this. */
+@media (max-width: 900px) {
+  .dbm-grid2 { grid-template-columns: minmax(0, 1fr); }
+}
+
+/*
+ * The type cell swaps between a dropdown and a text field in place.
+ *
+ * A separate "custom type" column would have widened a form whose width was the
+ * complaint, so the custom field replaces the dropdown in the same cell, with a small
+ * button back to the list (otherwise choosing 自定义 is one-way).
+ */
+.dbm-type-cell { display: flex; gap: 4px; align-items: center; min-width: 0; }
+.dbm-type-cell .dbm-input { flex: 1 1 auto; min-width: 0; }
+.dbm-type-cell .dbm-btn { flex: none; padding: 2px 6px; }
+
+/*
+ * The 自增 cell: the checkbox plus, when the combination is impossible, the reason.
+ *
+ * The reason used to be a title attribute only, which a user does not see without
+ * a DISABLED input does not reliably show one at all, so the control appeared inert with
+ * no explanation. It is now text, wrapped under the checkbox.
+ */
+.dbm-auto-cell { min-width: 0; }
+.dbm-auto-hint {
+  margin-top: 2px;
+  font-size: 10px;
+  line-height: 1.3;
+  /* The column is narrow; let a long reason wrap instead of forcing the table wider. */
+  white-space: normal;
+  word-break: break-word;
+}
+
 /* A column that is part of the primary key, called out in the structure table. */
 .dbm-key-note { color: var(--dsw-alias-label-secondary); font-size: 11px; }
 
@@ -907,17 +992,19 @@ textarea.dbm-cell-input {
   min-width: 0;
   box-sizing: border-box;
 }
-/* 字段名 类型 长度 排序规则 属性 索引 索引名 允许空 默认值 自增 注释 删除 */
+/* 字段名 类型 长度 排序规则 属性 索引 索引名 允许空 默认值 自增 注释 删除.
+ * 类型 is a select now (wider text), 属性 is ONE dropdown instead of four checkboxes
+ * (much narrower), and 自增 holds its reason as well as the box. */
 .dbm-newtable-cols th:nth-child(1) { width: 10%; }
-.dbm-newtable-cols th:nth-child(2) { width: 10%; }
+.dbm-newtable-cols th:nth-child(2) { width: 13%; }
 .dbm-newtable-cols th:nth-child(3) { width: 7%; }
-.dbm-newtable-cols th:nth-child(4) { width: 12%; }
-.dbm-newtable-cols th:nth-child(5) { width: 13%; }
-.dbm-newtable-cols th:nth-child(6) { width: 9%; }
-.dbm-newtable-cols th:nth-child(7) { width: 12%; }
+.dbm-newtable-cols th:nth-child(4) { width: 11%; }
+.dbm-newtable-cols th:nth-child(5) { width: 11%; }
+.dbm-newtable-cols th:nth-child(6) { width: 8%; }
+.dbm-newtable-cols th:nth-child(7) { width: 10%; }
 .dbm-newtable-cols th:nth-child(8) { width: 5%; }
-.dbm-newtable-cols th:nth-child(9) { width: 8%; }
-.dbm-newtable-cols th:nth-child(10) { width: 4%; }
+.dbm-newtable-cols th:nth-child(9) { width: 7%; }
+.dbm-newtable-cols th:nth-child(10) { width: 8%; }
 .dbm-newtable-cols th:nth-child(11) { width: 8%; }
 .dbm-newtable-cols th:nth-child(12) { width: 2%; }
 .dbm-newtable-cols th, .dbm-newtable-cols td { padding: 4px 4px; vertical-align: middle; overflow: hidden; }

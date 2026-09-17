@@ -198,30 +198,21 @@ try {
     set('colcomment', 0, '主键');
     await sleep(200);
     /*
-     * Tick UNSIGNED by the row's own attribute selector.
+     * Tick UNSIGNED through the attribute DROPDOWN.
      *
-     * The previous version built the selector by string-splicing the row id out of a
-     * neighbouring control, which produced a selector that matched nothing — so the box
-     * was never ticked and the server reported a plain int. Selecting directly by the
-     * attribute's own data attribute removes that indirection.
+     * The attribute control changed from a group of checkboxes to a select whose options
+     * are toggles, so the old '[data-dbm-newtable-attr]' checkbox lookup finds nothing and
+     * the attribute is never chosen — which is what this probe reported while the panel
+     * was actually fine. Selecting the option and firing 'change' is what the control now
+     * listens for.
      */
-    const unsignedBox = Array.from(dlg.querySelectorAll('[data-dbm-newtable-attr]'))
-      .find((el) => el.getAttribute('data-dbm-newtable-attr').endsWith(':unsigned'));
-    out.unsignedEnabled = unsignedBox === undefined ? null : unsignedBox.disabled === false;
-    if (unsignedBox !== undefined && !unsignedBox.disabled) {
-      /*
-       * A REAL click, through the input's own activation.
-       *
-       * Setting the DOM checked flag and dispatching a bare click event leaves React's
-       * controlled checkbox out of step: React re-renders from state, sees the DOM value
-       * it expected, and the attribute never reaches the payload — while the DOM reads
-       * checked true, so the probe looked correct. Calling click() runs the browser's own
-       * activation behaviour, which is what a user does and what React listens for.
-       */
-      unsignedBox.click();
+    const attrSelect = dlg.querySelector('[data-dbm-newtable-attr-select="0"]');
+    out.attributeOptions = attrSelect === null ? null : Array.from(attrSelect.options).map((o) => o.value);
+    if (attrSelect !== null) {
+      setSelect(attrSelect, 'unsigned');
     }
     await sleep(300);
-    out.unsignedTicked = unsignedBox === undefined ? null : unsignedBox.checked;
+    out.unsignedTicked = attrSelect === null ? null : (dlg.querySelector('[data-dbm-newtable-attr-select="0"]').value === '');
 
     // Add rows 2 and 3.
     click(dlg.querySelector('[data-dbm-newtable-add]'));
