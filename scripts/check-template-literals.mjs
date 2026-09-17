@@ -51,6 +51,7 @@ const files = [
   'scripts/shot-tree-loading.mjs',
   'scripts/e2e-sql-editing.mjs',
   'scripts/e2e-sql-search.mjs',
+  'scripts/e2e-table-actions.mjs',
 ]
 
 let failed = false

@@ -198,16 +198,31 @@ export class MysqlDriver implements SqlDriver {
     for (const table of tables) {
       const qualified = qualifyMysql(target, table)
       const result = await this.exec(`${statement} TABLE ${qualified}`, [], target)
-      // mysql2 hands back the rows of the statement's own result set; for these
-      // statements each row is one `Msg_type` / `Msg_text` pair.
+      /*
+       * The columns these statements return, in order:
+       *
+       *   Table | Op | Msg_type | Msg_text
+       *
+       * FOUR columns, not three — and the order matters here. An earlier version read
+       * three (Table, Msg_type, Msg_text), so it took `Op` for the message type and
+       * `Msg_type` for the message text: the engine's actual explanation was dropped
+       * and every entry came out as "... repair: note" with no reason. That is exactly
+       * the information this method exists to carry.
+       *
+       * The header row is present in mysql2's result, so it is skipped by name rather
+       * than by position: a future server that reorders the columns would otherwise
+       * silently mislead again.
+       */
       const messages: string[] = []
       let ok = true
       for (const row of result.rows) {
-        const type = row[1] === undefined ? '' : String(row[1])
-        const text = row[2] === undefined ? '' : String(row[2])
-        const label = row[0] === undefined ? '' : String(row[0])
-        messages.push(`${label} ${type}: ${text}`.trim())
-        if (type === 'error') ok = false
+        const first = row[0] === undefined ? '' : String(row[0])
+        // The header row is not a result.
+        if (first.toLowerCase() === 'table') continue
+        const type = row[2] === undefined ? '' : String(row[2])
+        const text = row[3] === undefined ? '' : String(row[3])
+        messages.push(`${first} ${type}: ${text}`.trim())
+        if (type.toLowerCase() === 'error') ok = false
       }
       results.push({ op, ok, messages })
     }

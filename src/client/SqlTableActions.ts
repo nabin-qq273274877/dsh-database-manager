@@ -76,9 +76,14 @@ export function TableBatchBar(props: TableBatchBarProps): React.ReactElement | n
         key: op,
         type: 'button',
         className: 'dbm-btn dbm-btn-sm',
+        // Rendered even when unsupported, but disabled and carrying the reason. All
+        // four were asked for in the batch bar, so REMOVING one would leave a user
+        // looking for a control that is not there; a disabled button whose tooltip
+        // names the engine's limit answers the question instead.
         disabled: busy || !supported,
         title: supported ? t(`db.maint.${op}.hint` as never) : t('db.maint.unsupported'),
         'data-dbm-maint': op,
+        'data-dbm-maint-supported': supported ? 'true' : 'false',
         onClick: () => onMaintain(op),
       },
       t(`db.maint.${op}` as never),
