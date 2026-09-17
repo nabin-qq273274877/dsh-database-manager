@@ -87,6 +87,17 @@ export interface ModalProps {
   /** Footer buttons, rendered right-aligned. */
   footer?: unknown
   children?: unknown
+  /**
+   * A wider dialog, for a form that genuinely has more columns than fit.
+   *
+   * The default 560px suits a dialog with a few stacked fields. The 新建表 form has
+   * one control per COLUMN of the table being defined, so at the default width it
+   * needed an inner horizontal scrollbar — "显示不全" in the report. Widening the
+   * dialog is the fix that keeps every column of the form visible at once; the
+   * alternative (an inline form on the page) would push the table list away and lose
+   * the context the form is filled in against.
+   */
+  wide?: boolean
 }
 
 /**
@@ -95,7 +106,6 @@ export interface ModalProps {
  */
 export function Modal(props: ModalProps): React.ReactElement {
   const { title, onClose, footer, children } = props
-
   // Esc closes; the listener is scoped to this modal's lifetime.
   React.useEffect(() => {
     const onKey = (event: KeyboardEvent): void => {
@@ -117,7 +127,7 @@ export function Modal(props: ModalProps): React.ReactElement {
     },
     React.createElement(
       'div',
-      { className: 'dbm-modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': title },
+      { className: `dbm-modal${props.wide === true ? ' dbm-modal-wide' : ''}`, role: 'dialog', 'aria-modal': 'true', 'aria-label': title },
       React.createElement('div', { className: 'dbm-modal-head' }, title),
       React.createElement('div', { className: 'dbm-modal-body' }, children as never),
       // The footer wrapper owns the top border and nothing else: button layout

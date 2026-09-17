@@ -50,6 +50,15 @@ export interface ColumnDefinition {
   primaryKeyPosition?: number
   /** True when a UNIQUE constraint is attached directly to the column. */
   unique?: boolean
+  /**
+   * A per-column collation, as a bare name.
+   *
+   * `COLLATE NOCASE` (SQLite) or `COLLATE utf8mb4_bin` (MySQL). Held apart from `extras`
+   * because it is a single known keyword rather than an opaque remainder, and because a
+   * collation name cannot be parameter-bound — it goes into the statement as an
+   * identifier-like token, so it is validated where it is rendered.
+   */
+  collate?: string
   /** A `CHECK (…)` clause attached to the column, verbatim. */
   check?: string
   /** Everything else in the column's clause, preserved verbatim and in order. */
@@ -737,6 +746,20 @@ export function renderColumn(column: ColumnDefinition, dialect: SqlDialect): str
   const type = column.type.trim() === '' ? '' : normalizeType(column.type, dialect)
   if (type !== '') parts.push(type)
   parts.push(...column.extras)
+  /*
+   * A per-column collation, validated as a bare name.
+   *
+   * `COLLATE` takes an identifier-like token that cannot be parameter-bound, so the name
+   * is checked against a conservative grammar here rather than pasted. SQLite's built-in
+   * names are `BINARY` / `NOCASE` / `RTRIM`; MySQL's are `utf8mb4_bin` and friends, and
+   * `binary` is also legal there — all of which the grammar admits.
+   */
+  if (column.collate !== undefined && column.collate !== '') {
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(column.collate)) {
+      throw new Error(`invalid collation for column ${column.name}: ${JSON.stringify(column.collate)}`)
+    }
+    parts.push(`COLLATE ${column.collate}`)
+  }
   // A generated column's `AS (…)` clause lives in `extras`, so nothing is added
   // for it here; the flags below would be illegal on one.
   if (column.generated !== true) {

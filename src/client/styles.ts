@@ -878,6 +878,53 @@ textarea.dbm-cell-input {
   overflow: hidden;
   box-shadow: 0 12px 40px rgba(0, 0, 0, .3);
 }
+
+/*
+ * A wide dialog, for a form with genuinely many columns.
+ *
+ * MUST come after the .dbm-modal rule above, not before: both selectors have the same
+ * specificity (one class), so the later one wins. Placed earlier it was silently ignored
+ * and the dialog stayed 560px wide — measured at 562px, which is how the bug was found.
+ */
+.dbm-modal-wide { width: min(1180px, 96vw); }
+/* The form's own column grid may still exceed the dialog on a small window; let it
+ * scroll as a last resort rather than widening the dialog past the viewport. */
+.dbm-modal-wide .dbm-modal-body { overflow: auto; }
+/*
+ * The column grid is SIZED TO FIT, not left to its content.
+ *
+ * With one control per field and twelve fields, every input's min-width summed past the
+ * dialog and the last five columns were cut off (measured: a 1684px table inside a
+ * 1182px dialog). table-layout: fixed plus per-column widths makes the table honour the
+ * available width instead of growing to its content, and the inputs then shrink with
+ * their cells. The per-column widths below are in the header's own field order.
+ */
+.dbm-newtable-cols { table-layout: fixed; width: 100%; }
+.dbm-newtable-cols .dbm-input, .dbm-newtable-cols .dbm-select {
+  /* Fill the cell rather than setting a floor: a floor is what pushed the table wider
+     than its container. */
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+/* 字段名 类型 长度 排序规则 属性 索引 索引名 允许空 默认值 自增 注释 删除 */
+.dbm-newtable-cols th:nth-child(1) { width: 10%; }
+.dbm-newtable-cols th:nth-child(2) { width: 10%; }
+.dbm-newtable-cols th:nth-child(3) { width: 7%; }
+.dbm-newtable-cols th:nth-child(4) { width: 12%; }
+.dbm-newtable-cols th:nth-child(5) { width: 13%; }
+.dbm-newtable-cols th:nth-child(6) { width: 9%; }
+.dbm-newtable-cols th:nth-child(7) { width: 12%; }
+.dbm-newtable-cols th:nth-child(8) { width: 5%; }
+.dbm-newtable-cols th:nth-child(9) { width: 8%; }
+.dbm-newtable-cols th:nth-child(10) { width: 4%; }
+.dbm-newtable-cols th:nth-child(11) { width: 8%; }
+.dbm-newtable-cols th:nth-child(12) { width: 2%; }
+.dbm-newtable-cols th, .dbm-newtable-cols td { padding: 4px 4px; vertical-align: middle; overflow: hidden; }
+/* The attribute cell holds four checkboxes stacked, so it does not set a wide floor. */
+.dbm-attrs { display: flex; flex-direction: column; gap: 2px; }
+.dbm-attrs .dbm-check { white-space: nowrap; font-size: 11px; }
+
 .dbm-modal-head {
   padding: 12px 16px;
   border-bottom: 1px solid var(--dsw-alias-border-l3);

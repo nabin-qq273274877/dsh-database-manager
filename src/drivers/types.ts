@@ -119,6 +119,79 @@ export interface ColumnSpec {
   comment?: string
   /** True when this column starts a new one rather than replacing an existing one. */
   added?: boolean
+  /**
+   * The character set / collation to declare for this column.
+   *
+   * MySQL accepts a per-column charset and collation; SQLite accepts a per-column
+   * COLLATE (measured to take effect: `COLLATE NOCASE` really does match
+   * case-insensitively). Only the collation is offered for SQLite — it has no
+   * per-column character set to set.
+   */
+  collate?: string
+  charset?: string
+  /**
+   * Extra attributes spliced after the type.
+   *
+   * `UNSIGNED`, `ZEROFILL`, `BINARY`, `ON UPDATE CURRENT_TIMESTAMP` and friends. Kept
+   * as discrete flags rather than one free-text field so the panel can offer it only
+   * where the engine honours it — SQLite ACCEPTS the words but stores them as part of
+   * the type name with no effect (measured), which is worse than refusing them.
+   */
+  attributes?: ColumnAttribute[]
+  /**
+   * The declared length / values, as written inside the parentheses.
+   *
+   * A string, not a number: `VARCHAR(255)`, `DECIMAL(10,2)` and
+   * `ENUM('a','b')` all use the same slot and only the first is an integer.
+   */
+  length?: string
+}
+
+/** A column attribute the engines treat as a keyword. */
+export type ColumnAttribute =
+  | 'unsigned'
+  | 'zerofill'
+  | 'binary'
+  | 'onUpdateCurrentTimestamp'
+
+/** Every column attribute, for validation and the UI's list. */
+export const COLUMN_ATTRIBUTES: readonly ColumnAttribute[] = ['unsigned', 'zerofill', 'binary', 'onUpdateCurrentTimestamp']
+
+/** The kind of index a table-level index is. */
+export type IndexKind = 'primary' | 'unique' | 'index' | 'fulltext' | 'spatial'
+
+/** Every index kind, in phpMyAdmin's order. */
+export const INDEX_KINDS: readonly IndexKind[] = ['primary', 'unique', 'index', 'fulltext', 'spatial']
+
+/** One index to create alongside a new table. */
+export interface TableIndexSpec {
+  kind: IndexKind
+  /** A name; ignored for `primary`, whose name is always PRIMARY. */
+  name?: string
+  /** The columns, in index order — the order is what a prefix scan depends on. */
+  columns: string[]
+  /** `fulltext`/`spatial` accept a parser / prefix length in MySQL; passed through. */
+  options?: string
+}
+
+/**
+ * Table-level options for a new table.
+ *
+ * Each is optional because the engines differ: SQLite has no storage engine, no table
+ * comment and no table-level collation (all three are refused by the server — measured),
+ * and a panel that offered them there would be offering a field whose value is
+ * discarded.
+ */
+export interface TableOptions {
+  /** MySQL only. */
+  engine?: string
+  /** MySQL: the table's default collation. SQLite has none (it is per column). */
+  collate?: string
+  charset?: string
+  /** MySQL only. */
+  comment?: string
+  /** SQLite's own trailing keywords: `WITHOUT ROWID`, `STRICT`. */
+  tail?: string
 }
 
 /**
@@ -273,12 +346,16 @@ export interface SqlDriver {
    * the user writing DDL, and building the statement in the driver means the
    * identifier quoting and the type/default validation are exactly the ones the column
    * editor already goes through.
+   *
+   * `indexes` is separate from the columns' own key/unique flags because a COMPOSITE
+   * index spans several columns — its column ORDER is what a prefix scan depends on,
+   * so it cannot be expressed as a flag on any one of them.
    */
   createTable(
     schema: string | undefined,
     table: string,
     columns: ColumnSpec[],
-    options?: { primaryKey?: string[] },
+    options?: { primaryKey?: string[]; indexes?: TableIndexSpec[]; table?: TableOptions },
   ): Promise<QueryResult>
   /** Add a column. */
   addColumn(schema: string | undefined, table: string, spec: ColumnSpec): Promise<QueryResult>

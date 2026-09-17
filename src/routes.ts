@@ -33,9 +33,9 @@ import type {
   SchemaChangeResult,
 } from './protocol.ts'
 import { REDIS_CREATABLE_TYPES } from './protocol.ts'
-import type { ColumnSpec, RowFilter, RowFilterOperator } from './drivers/types.ts'
-import { MAINTENANCE_OPS, ROW_FILTER_OPERATORS } from './drivers/types.ts'
-import type { DatabaseOperationOptions, MaintenanceOp } from './drivers/types.ts'
+import type { ColumnSpec, ColumnAttribute, RowFilter, RowFilterOperator } from './drivers/types.ts'
+import { COLUMN_ATTRIBUTES, INDEX_KINDS, MAINTENANCE_OPS, ROW_FILTER_OPERATORS } from './drivers/types.ts'
+import type { DatabaseOperationOptions, MaintenanceOp, TableIndexSpec, TableOptions } from './drivers/types.ts'
 import { isRedisDriver, isSqlDriver, type Driver, type SqlDriver } from './drivers/types.ts'
 import { isRedisReadCommand } from './drivers/redis.ts'
 import type { IndexRegistry } from './index-registry.ts'
@@ -161,6 +161,32 @@ function readColumnSpec(value: unknown, what: string): ColumnSpec {
   const nullable = record['nullable'] === true
   const defaultValue = typeof record['defaultValue'] === 'string' ? record['defaultValue'] : undefined
   const comment = typeof record['comment'] === 'string' ? record['comment'] : undefined
+  /*
+   * The fields that carry the column's actual definition.
+   *
+   * This validator is an allow-list: an unlisted field is silently dropped. `length`,
+   * `attributes` and `collate` were missing, so a create request specifying them produced
+   * `VARCHAR NULL` — a statement that is not merely lossy but ILLEGAL in MySQL — with no
+   * error pointing at the omission. Caught by an end-to-end create, not by the types.
+   */
+  const length = typeof record['length'] === 'string' && record['length'].trim() !== '' ? record['length'].trim() : undefined
+  const collate = typeof record['collate'] === 'string' && record['collate'].trim() !== '' ? record['collate'].trim() : undefined
+  const charset = typeof record['charset'] === 'string' && record['charset'].trim() !== '' ? record['charset'].trim() : undefined
+  let attributes: ColumnAttribute[] | undefined
+  if (record['attributes'] !== undefined) {
+    const raw = record['attributes']
+    if (!Array.isArray(raw)) throw new Error(`${what}.attributes must be an array when present`)
+    const collected: ColumnAttribute[] = []
+    for (const entry of raw) {
+      // An unknown attribute is refused rather than dropped: dropping it would build a
+      // column without the property the caller asked for, silently.
+      if (typeof entry !== 'string' || !(COLUMN_ATTRIBUTES as readonly string[]).includes(entry)) {
+        throw new Error(`${what}.attributes entries must be one of ${COLUMN_ATTRIBUTES.join(', ')}`)
+      }
+      collected.push(entry as ColumnAttribute)
+    }
+    if (collected.length > 0) attributes = collected
+  }
   let primaryKeyPosition: number | undefined
   if (record['primaryKeyPosition'] !== undefined && record['primaryKeyPosition'] !== null) {
     if (typeof record['primaryKeyPosition'] !== 'number' || !Number.isInteger(record['primaryKeyPosition']) || record['primaryKeyPosition'] < 1) {
@@ -177,6 +203,10 @@ function readColumnSpec(value: unknown, what: string): ColumnSpec {
     ...(primaryKeyPosition === undefined ? {} : { primaryKeyPosition }),
     ...(record['autoIncrement'] === true ? { autoIncrement: true } : {}),
     ...(record['unique'] === true ? { unique: true } : {}),
+    ...(length === undefined ? {} : { length }),
+    ...(collate === undefined ? {} : { collate }),
+    ...(charset === undefined ? {} : { charset }),
+    ...(attributes === undefined ? {} : { attributes }),
   }
 }
 
@@ -194,6 +224,10 @@ interface SchemaChange {
   specs?: ColumnSpec[]
   /** `createTable`: a table-level primary key over these columns. */
   primaryKey?: string[]
+  /** `createTable`: the indexes to create, including composite ones. */
+  indexes?: TableIndexSpec[]
+  /** `createTable`: table-level options (engine, collation, comment, tail). */
+  tableOptions?: TableOptions
 }
 
 /**
@@ -238,7 +272,83 @@ function parseSchemaChange(body: Record<string, unknown>): { change: SchemaChang
         if (primaryKey !== undefined && (!Array.isArray(primaryKey) || primaryKey.some(entry => typeof entry !== 'string' || entry === ''))) {
           return { error: 'primaryKey must be an array of column names when present' }
         }
-        return { change: { ...base, specs, ...(primaryKey === undefined ? {} : { primaryKey: primaryKey as string[] }) } }
+        /*
+         * The table-level indexes, validated here rather than trusted.
+         *
+         * Each needs a known kind and at least one column NAME; the driver resolves
+         * those names against the columns being created, which is the check that
+         * actually matters (a name that does not exist is a mistake in the form).
+         */
+        const indexesBody = body['indexes']
+        const indexes: TableIndexSpec[] = []
+        if (indexesBody !== undefined) {
+          if (!Array.isArray(indexesBody)) return { error: 'indexes must be an array when present' }
+          for (const [index, entry] of indexesBody.entries()) {
+            const item = asJsonObject(entry)
+            if (item === undefined) return { error: `indexes[${index}] must be an object` }
+            const kind = item['kind']
+            if (typeof kind !== 'string' || !(INDEX_KINDS as readonly string[]).includes(kind)) {
+              return { error: `indexes[${index}].kind must be one of ${INDEX_KINDS.join(', ')}` }
+            }
+            const columns = item['columns']
+            if (!Array.isArray(columns) || columns.length === 0 || columns.some(value => typeof value !== 'string' || value === '')) {
+              return { error: `indexes[${index}].columns must be a non-empty array of column names` }
+            }
+            const indexName = item['name']
+            if (indexName !== undefined && (typeof indexName !== 'string' || indexName === '')) {
+              return { error: `indexes[${index}].name must be a non-empty string when present` }
+            }
+            indexes.push({
+              kind: kind as TableIndexSpec['kind'],
+              columns: columns as string[],
+              ...(indexName === undefined ? {} : { name: indexName as string }),
+            })
+          }
+        }
+        /*
+         * Table options: passed through as strings, because every one of them is a
+         * keyword or a literal the driver validates before it reaches a statement.
+         *
+         * Read from `tableOptions`, not `table`: `table` on this payload is the table's
+         * NAME, and one key cannot carry a string and an object at once.
+         */
+        const tableBody = body['tableOptions']
+        let tableOptions: TableOptions | undefined
+        if (tableBody !== undefined) {
+          const item = asJsonObject(tableBody)
+          if (item === undefined) return { error: 'tableOptions must be an object when present' }
+          const readString = (key: string): string | undefined => {
+            const value = item[key]
+            if (value === undefined) return undefined
+            if (typeof value !== 'string') throw new Error(`tableOptions.${key} must be a string`)
+            return value === '' ? undefined : value
+          }
+          try {
+            const engine = readString('engine')
+            const collate = readString('collate')
+            const charset = readString('charset')
+            const comment = readString('comment')
+            const tail = readString('tail')
+            tableOptions = {
+              ...(engine === undefined ? {} : { engine }),
+              ...(collate === undefined ? {} : { collate }),
+              ...(charset === undefined ? {} : { charset }),
+              ...(comment === undefined ? {} : { comment }),
+              ...(tail === undefined ? {} : { tail }),
+            }
+          } catch (error) {
+            return { error: error instanceof Error ? error.message : String(error) }
+          }
+        }
+        return {
+          change: {
+            ...base,
+            specs,
+            ...(primaryKey === undefined ? {} : { primaryKey: primaryKey as string[] }),
+            ...(indexes.length === 0 ? {} : { indexes }),
+            ...(tableOptions === undefined ? {} : { tableOptions }),
+          },
+        }
       }
       case 'addColumn':
         return { change: { ...base, spec: readColumnSpec(body['column'], 'column') } }
@@ -299,6 +409,8 @@ async function applySchemaChange(driver: SqlDriver, change: SchemaChange): Promi
     case 'createTable': {
       const result = await driver.createTable(change.schema, change.table, change.specs ?? [], {
         ...(change.primaryKey === undefined ? {} : { primaryKey: change.primaryKey }),
+        ...(change.indexes === undefined ? {} : { indexes: change.indexes }),
+        ...(change.tableOptions === undefined ? {} : { table: change.tableOptions }),
       })
       // A brand-new table: its columns, indexes and rows are all being seen for the
       // first time, and the database's table list has one more entry.

@@ -391,7 +391,7 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
       setConfirming(undefined)
       setError(failures.length === 0 ? undefined : failures.join('\n'))
       setNotice(failures.length === 0
-        ? t('db.batch.done', { n: ok, op: t(op === 'truncate' ? 'db.batch.truncate' : 'db.batch.drop') })
+        ? t(`db.batch.done.${op}` as never, { n: ok })
         : t('db.batch.partial', { ok, failed: failures.length }))
       await loadTables(schema, true)
       await loadStats(schema, true)

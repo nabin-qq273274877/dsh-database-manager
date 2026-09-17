@@ -21,7 +21,9 @@ import type {
   RowQuery,
   RowValue,
   SqlDriver,
+  TableIndexSpec,
   TableListOptions,
+  TableOptions,
 } from './types.ts'
 
 /** Structural view of the mysql2/promise surface this driver uses. */
@@ -356,7 +358,17 @@ export class MysqlDriver implements SqlDriver {
         ? 'SELECT TABLE_NAME AS name, TABLE_TYPE AS type, TABLE_ROWS AS rows_count, TABLE_COMMENT AS comment, ' +
           'ENGINE AS engine, TABLE_COLLATION AS collation, DATA_LENGTH AS data_bytes, INDEX_LENGTH AS index_bytes ' +
           'FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_TYPE, TABLE_NAME'
-        : 'SELECT TABLE_NAME AS name, TABLE_TYPE AS type, TABLE_COMMENT AS comment ' +
+        /*
+         * Without `stats`, the engine / collation / comment are STILL read.
+         *
+         * They used to be omitted, which meant the overview's 类型 and 排序规则 columns
+         * showed nothing for any caller that skipped statistics — and the database
+         * overview does exactly that when it only needs names. Those three columns are
+         * already in `information_schema.TABLES`, so reading them costs nothing; only
+         * the row counts and sizes are worth deferring.
+         */
+        : 'SELECT TABLE_NAME AS name, TABLE_TYPE AS type, TABLE_COMMENT AS comment, ' +
+          'ENGINE AS engine, TABLE_COLLATION AS collation ' +
           'FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_TYPE, TABLE_NAME',
       values: [target],
     })
@@ -396,7 +408,7 @@ export class MysqlDriver implements SqlDriver {
     const [rows] = await (await this.open()).query({
       sql:
         'SELECT COLUMN_NAME AS name, COLUMN_TYPE AS type, IS_NULLABLE AS nullable, COLUMN_DEFAULT AS dflt, ' +
-        'COLUMN_KEY AS col_key, COLUMN_COMMENT AS comment, EXTRA AS extra ' +
+        'COLUMN_KEY AS col_key, COLUMN_COMMENT AS comment, EXTRA AS extra, COLLATION_NAME AS collation ' +
         'FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION',
       values: [target, table],
     })
@@ -459,6 +471,8 @@ export class MysqlDriver implements SqlDriver {
       const dflt = toWireValue(record['dflt'])
       const comment = toWireValue(record['comment'])
       const extra = toWireValue(record['extra'])
+      // The declared collation, so the 结构 tab can show it and a rebuild can carry it.
+      const columnCollation = toWireValue(record['collation'])
       const options = readEnumOptions(String(record['type'] ?? ''))
       const inKey = primaryColumns.has(name)
       const position = inKey ? (orderedFromStatistics.get(name) ?? declarationOrder.get(name)) : undefined
@@ -469,6 +483,7 @@ export class MysqlDriver implements SqlDriver {
         ...(dflt === null ? {} : { defaultValue: String(dflt) }),
         key: inKey ? 'PRI' : String(record['col_key'] ?? ''),
         ...(typeof comment === 'string' && comment !== '' ? { comment } : {}),
+        ...(typeof columnCollation === 'string' && columnCollation !== '' ? { collation: columnCollation } : {}),
         ...(typeof extra === 'string' && extra !== '' ? { extra } : {}),
         ...(position === undefined ? {} : { primaryKeyPosition: position }),
         ...(options === undefined ? {} : { options }),
@@ -840,34 +855,127 @@ export class MysqlDriver implements SqlDriver {
    *
    * No `IF NOT EXISTS`: creating a table whose name is taken should say so. Silently
    * succeeding would leave the user believing they created something.
+   *
+   * Indexes beyond the primary key are emitted as table-level clauses, because a
+   * composite index spans columns and has no single-column form. FULLTEXT and SPATIAL
+   * are only legal on suitable column types, so each is checked against the columns it
+   * covers before the statement is built — the server's own message ("Column 'a' cannot
+   * be part of FULLTEXT index") does not say which of the form's fields to change.
    */
   async createTable(
     schema: string | undefined,
     table: string,
     columns: ColumnSpec[],
-    options: { primaryKey?: string[] } = {},
+    options: { primaryKey?: string[]; indexes?: TableIndexSpec[]; table?: TableOptions } = {},
   ): Promise<QueryResult> {
     const target = this.requireSchema(schema)
     const qualified = qualifyMysql(target, table)
     if (columns.length === 0) throw new Error('a new table needs at least one column')
 
+    // Attribute/type combinations MySQL refuses, caught here so the message can name
+    // the column rather than arriving as "Invalid ON UPDATE clause for 'a' column".
+    for (const spec of columns) validateMysqlAttributes(spec)
+
     const items = columns.map(spec =>
       `${requireIdentifier(spec.name, 'column name', quoteMysql)} ${renderMysqlDefinition(spec)}`,
     )
 
+    const names = new Set(columns.map(spec => spec.name))
+    const requireKnown = (list: string[], what: string): void => {
+      if (list.length === 0) throw new Error(`${what} needs at least one column`)
+      for (const name of list) {
+        // MySQL would reject an unknown name, but "Key column 'x' doesn't exist in
+        // table" does not say which of the two lists is wrong.
+        if (!names.has(name)) throw new Error(`${what} names a column that is not being created: ${name}`)
+      }
+    }
+
     const key = options.primaryKey ?? []
     if (key.length > 0) {
-      // Every key column must be one of the declared columns: MySQL would reject an
-      // unknown name, but the message ("Key column 'x' doesn't exist in table") does
-      // not say which of the two lists is wrong.
-      const names = new Set(columns.map(spec => spec.name))
-      for (const name of key) {
-        if (!names.has(name)) throw new Error(`the primary key names a column that is not being created: ${name}`)
-      }
+      requireKnown(key, 'the primary key')
       items.push(`PRIMARY KEY (${key.map(name => requireIdentifier(name, 'column name', quoteMysql)).join(', ')})`)
     }
 
-    return this.exec(`CREATE TABLE ${qualified} (\n  ${items.join(',\n  ')}\n)`, [], target)
+    // The index names MySQL will already be using, so a clash is caught before the
+    // server answers with a duplicate-key-name error that names neither of the two.
+    const usedNames = new Set(['PRIMARY'])
+    for (const index of options.indexes ?? []) {
+      requireKnown(index.columns, `the ${index.kind} index`)
+      const kind = index.kind.toUpperCase()
+      if (index.kind === 'spatial') {
+        /*
+         * Every SPATIAL column must be NOT NULL.
+         *
+         * Measured: MySQL refuses a nullable one with "All parts of a SPATIAL index
+         * must be NOT NULL", so the requirement is stated here as what to fix.
+         */
+        for (const name of index.columns) {
+          const spec = columns.find(column => column.name === name)
+          if (spec !== undefined && spec.nullable) {
+            throw new Error(`the SPATIAL index covers "${name}", which must be NOT NULL (MySQL requires it)`)
+          }
+        }
+      }
+      if (index.kind === 'fulltext') {
+        /*
+         * FULLTEXT needs a text column. Measured: MySQL refuses `FULLTEXT(a)` where `a`
+         * is INT with "Column 'a' cannot be part of FULLTEXT index".
+         */
+        for (const name of index.columns) {
+          const spec = columns.find(column => column.name === name)
+          if (spec !== undefined && !/\b(CHAR|VARCHAR|TEXT)\b/i.test(spec.type)) {
+            throw new Error(`the FULLTEXT index covers "${name}" (${spec.type}), which is not a text column`)
+          }
+        }
+      }
+      const columnsSql = index.columns.map(name => requireIdentifier(name, 'column name', quoteMysql)).join(', ')
+      const optionsSql = index.options === undefined || index.options.trim() === '' ? '' : ` ${index.options.trim()}`
+      if (index.kind === 'primary') {
+        if (key.length > 0) throw new Error('the primary key was given twice')
+        items.push(`PRIMARY KEY (${columnsSql})${optionsSql}`)
+        continue
+      }
+      /*
+       * An index needs a name; `PRIMARY` is the only exception and is handled above.
+       * Generated from the columns when the user left it blank, because MySQL requires
+       * one — but a generated name that clashes is reported rather than silently
+       * suffixed, so the name in the resulting schema is the one that was asked for.
+       */
+      const indexName = index.name === undefined || index.name.trim() === ''
+        ? `${index.kind === 'unique' ? 'uq' : 'ix'}_${table}_${index.columns.join('_')}`
+        : index.name.trim()
+      if (usedNames.has(indexName.toUpperCase())) throw new Error(`two indexes would be named ${indexName}`)
+      usedNames.add(indexName.toUpperCase())
+      const keyword = index.kind === 'unique' ? 'UNIQUE KEY' : index.kind === 'fulltext' ? 'FULLTEXT KEY' : index.kind === 'spatial' ? 'SPATIAL KEY' : 'KEY'
+      void kind
+      items.push(`${keyword} ${requireIdentifier(indexName, 'index name', quoteMysql)} (${columnsSql})${optionsSql}`)
+    }
+
+    const tableOptions = options.table ?? {}
+    const tail: string[] = []
+    if (tableOptions.engine !== undefined && tableOptions.engine.trim() !== '') {
+      // An engine name is a bare keyword in the statement, so it is checked against
+      // the grammar rather than pasted.
+      if (!/^[A-Za-z0-9_]{1,32}$/.test(tableOptions.engine.trim())) {
+        throw new Error(`invalid storage engine: ${JSON.stringify(tableOptions.engine)}`)
+      }
+      tail.push(`ENGINE=${tableOptions.engine.trim()}`)
+    }
+    if (tableOptions.charset !== undefined && tableOptions.charset.trim() !== '') {
+      tail.push(`DEFAULT CHARSET=${requireCharset(tableOptions.charset)}`)
+    }
+    if (tableOptions.collate !== undefined && tableOptions.collate.trim() !== '') {
+      tail.push(`COLLATE=${requireCollate(tableOptions.collate)}`)
+    }
+    if (tableOptions.comment !== undefined && tableOptions.comment !== '') {
+      // Same rule as a column comment: the escaping relies on doubling the quote, and
+      // a backslash would change what the literal means.
+      if (tableOptions.comment.includes('\\')) throw new Error('a table comment cannot contain a backslash')
+      tail.push(`COMMENT='${tableOptions.comment.replace(/'/g, "''")}'`)
+    }
+
+    const suffix = tail.length === 0 ? '' : ` ${tail.join(' ')}`
+    return this.exec(`CREATE TABLE ${qualified} (\n  ${items.join(',\n  ')}\n)${suffix}`, [], target)
   }
 
   async addColumn(schema: string | undefined, table: string, spec: ColumnSpec): Promise<QueryResult> {
@@ -1373,9 +1481,28 @@ function readEnumOptions(type: string): string[] | undefined {
  */
 function renderMysqlDefinition(spec: ColumnSpec, carry: { generated?: boolean; extra?: string } = {}): string {
   const parts: string[] = []
-  const declared = spec.type.trim() === '' ? '' : normalizeType(spec.type, 'mysql')
-  if (declared === '') throw new Error('a MySQL column needs a type')
-  parts.push(declared)
+  const base = spec.type.trim() === '' ? '' : normalizeType(spec.type, 'mysql')
+  if (base === '') throw new Error('a MySQL column needs a type')
+  /*
+   * The length / values suffix.
+   *
+   * `normalizeMysqlType` already carries whatever parentheses came WITH the type, so a
+   * separate `length` must not double them up: `VARCHAR(255)` plus `length: '255'`
+   * would render `VARCHAR(255)(255)`. When the type already carries parentheses they
+   * win, and the explicit length is used only when it does not.
+   */
+  const hasParens = /\(/.test(base)
+  const length = spec.length === undefined ? '' : spec.length.trim()
+  if (length !== '' && !hasParens) {
+    // A length is not free text: it goes inside parentheses in the statement. Checked
+    // for the shapes that are genuinely lengths/values and not an injection route.
+    if (!/^[0-9]{1,10}(\s*,\s*[0-9]{1,10})?$/.test(length) && !/^'([^'\\]|'')*'(\s*,\s*'([^'\\]|'')*')*$/.test(length)) {
+      throw new Error(`invalid length/values for column ${spec.name}: ${JSON.stringify(spec.length)}`)
+    }
+    parts.push(`${base}(${length})`)
+  } else {
+    parts.push(base)
+  }
 
   // A generated column's expression lives in EXTRA, and MySQL rejects a
   // definition that carries `DEFAULT` or `AUTO_INCREMENT` alongside it, so the
@@ -1390,16 +1517,70 @@ function renderMysqlDefinition(spec: ColumnSpec, carry: { generated?: boolean; e
     return parts.join(' ')
   }
 
+  /*
+   * The column attributes, in MySQL's own order.
+   *
+   * `ZEROFILL` implies `UNSIGNED` in MySQL, so emitting both is what the server
+   * itself does and what `SHOW CREATE TABLE` reports back — emitting only ZEROFILL
+   * would round-trip to a different string.
+   *
+   * The character set has to come BEFORE the collation: MySQL rejects
+   * `COLLATE x CHARACTER SET y` with "COLLATION 'x' is not valid for CHARACTER SET 'y'"
+   * because the collation is checked against the character set in force when it
+   * appears.
+   */
+  const attributes = new Set(spec.attributes ?? [])
+  if (attributes.has('unsigned') || attributes.has('zerofill')) parts.push('UNSIGNED')
+  if (attributes.has('zerofill')) parts.push('ZEROFILL')
+  if (attributes.has('binary')) parts.push('BINARY')
+  if (spec.charset !== undefined && spec.charset !== '') parts.push(`CHARACTER SET ${requireCharset(spec.charset)}`)
+  if (spec.collate !== undefined && spec.collate !== '') parts.push(`COLLATE ${requireCollate(spec.collate)}`)
+
   // A primary-key column must be NOT NULL, and MySQL refuses the key otherwise.
   parts.push(spec.primaryKeyPosition === undefined && spec.nullable ? 'NULL' : 'NOT NULL')
   if (spec.defaultValue !== undefined) {
     const value = normalizeDefault(spec.defaultValue, 'mysql')
     if (value !== undefined) parts.push(`DEFAULT ${value}`)
   }
+  if (attributes.has('onUpdateCurrentTimestamp')) parts.push('ON UPDATE CURRENT_TIMESTAMP')
   if (spec.autoIncrement === true) parts.push('AUTO_INCREMENT')
   if (spec.unique === true) parts.push('UNIQUE')
   if (spec.comment !== undefined && spec.comment !== '') parts.push(renderComment(spec.comment))
   return parts.join(' ')
+}
+
+/**
+ * Validate a column attribute against the type it is being attached to.
+ *
+ * Both engines reject some combinations, and the server's messages do not always say
+ * which field to change ("Invalid ON UPDATE clause for 'a' column"). Catching them here
+ * lets the message name the column and the reason.
+ *
+ * Measured against MySQL: `BINARY` is a syntax error on INT, and `ON UPDATE
+ * CURRENT_TIMESTAMP` is refused on anything that is not a temporal type.
+ */
+export function validateMysqlAttributes(spec: ColumnSpec): void {
+  const attributes = spec.attributes ?? []
+  if (attributes.length === 0) return
+  const type = spec.type.toUpperCase()
+  const isTemporal = /\b(TIMESTAMP|DATETIME)\b/.test(type)
+  const isString = /\b(CHAR|VARCHAR|TEXT|BLOB|ENUM|SET|BINARY|VARBINARY)\b/.test(type)
+  const isNumeric = /\b(INT|INTEGER|TINYINT|SMALLINT|MEDIUMINT|BIGINT|DECIMAL|NUMERIC|FLOAT|DOUBLE|REAL|BIT)\b/.test(type)
+
+  for (const attribute of attributes) {
+    if (attribute === 'binary' && !isString) {
+      throw new Error(`column ${spec.name}: BINARY only applies to CHAR / VARCHAR / TEXT / BLOB types`)
+    }
+    if (attribute === 'unsigned' && !isNumeric) {
+      throw new Error(`column ${spec.name}: UNSIGNED only applies to numeric types`)
+    }
+    if (attribute === 'zerofill' && !isNumeric) {
+      throw new Error(`column ${spec.name}: ZEROFILL only applies to numeric types`)
+    }
+    if (attribute === 'onUpdateCurrentTimestamp' && !isTemporal) {
+      throw new Error(`column ${spec.name}: ON UPDATE CURRENT_TIMESTAMP only applies to TIMESTAMP or DATETIME`)
+    }
+  }
 }
 
 /** Render a column comment as a MySQL string literal. */

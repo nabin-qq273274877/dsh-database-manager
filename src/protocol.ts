@@ -212,6 +212,14 @@ export interface ColumnInfo {
    * in the table's `CREATE` text.
    */
   generated?: boolean
+  /**
+   * The collation this column was declared with.
+   *
+   * MySQL: `information_schema.COLUMNS.COLLATION_NAME`. SQLite has no such catalog
+   * column — a per-column `COLLATE` lives in the table's `CREATE` text — so it is
+   * absent there rather than reported as empty, which would read as "no collation".
+   */
+  collation?: string
 }
 
 /** One index description (the 结构 tab). */
@@ -345,6 +353,17 @@ export interface MaintenanceOutcome {
 export type DatabaseOpView = 'create' | 'drop' | 'rename' | 'copy' | 'charset'
 
 /**
+ * Re-exported from the driver contract.
+ *
+ * These cross the wire — the browser sends column attributes, index kinds and table
+ * options — so they belong to the shared protocol. Re-exporting rather than
+ * redefining keeps ONE definition: two copies of `IndexKind` would be two lists to keep
+ * in step, and the browser half would happily send a kind the host does not know.
+ */
+export type { ColumnAttribute, IndexKind, TableIndexSpec, TableOptions } from './drivers/types.ts'
+export { COLUMN_ATTRIBUTES, INDEX_KINDS } from './drivers/types.ts'
+
+/**
  * One column-spec edit, as the host expects it.
  *
  * Lives here rather than in a client module because it crosses the wire: the 结构
@@ -359,6 +378,12 @@ export interface ColumnSpecPayload {
   comment?: string
   autoIncrement?: boolean
   unique?: boolean
+  /** The declared length / values, as written inside the parentheses. */
+  length?: string
+  /** A per-column collation. */
+  collate?: string
+  /** MySQL column attributes (UNSIGNED, BINARY, …). */
+  attributes?: import('./drivers/types.ts').ColumnAttribute[]
 }
 
 /** A table-level schema-change request. */
@@ -387,6 +412,22 @@ export interface SchemaChangePayload {
   specs?: ColumnSpecPayload[]
   /** `createTable`: a table-level PRIMARY KEY over these columns. */
   primaryKey?: string[]
+  /**
+   * `createTable`: the indexes to create, including composite ones.
+   *
+   * Named separately from the columns' own key/unique flags because a composite index
+   * spans columns: its ORDER is what a prefix scan depends on, so it cannot be a flag
+   * on any single column.
+   */
+  indexes?: import('./drivers/types.ts').TableIndexSpec[]
+  /**
+   * `createTable`: table-level options.
+   *
+   * `tableOptions`, not `table`: `table` on this payload is already the table's NAME,
+   * and one key cannot carry both a string and an object — TypeScript reported them as
+   * duplicate identifiers, which is the check that caught it.
+   */
+  tableOptions?: import('./drivers/types.ts').TableOptions
 }
 
 /** Connection test outcome. */

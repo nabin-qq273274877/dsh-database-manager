@@ -39,7 +39,9 @@ import type {
   RowQuery,
   RowValue,
   SqlDriver,
+  TableIndexSpec,
   TableListOptions,
+  TableOptions,
 } from './types.ts'
 
 /** Suffix of the temporary table a rebuild builds alongside the original. */
@@ -771,10 +773,61 @@ export class SqliteDriver implements SqlDriver {
     schema: string | undefined,
     table: string,
     columns: ColumnSpec[],
-    options: { primaryKey?: string[] } = {},
+    options: { primaryKey?: string[]; indexes?: TableIndexSpec[]; table?: TableOptions } = {},
   ): Promise<QueryResult> {
     const qualified = qualifySqlite(schema, table)
     if (columns.length === 0) throw new Error('a new table needs at least one column')
+
+    /*
+     * Refuse what SQLite would SILENTLY IGNORE.
+     *
+     * Measured: `CREATE TABLE t(x INT UNSIGNED)` succeeds, and `pragma_table_info`
+     * then reports the type as the literal string `INT UNSIGNED` — no unsigned
+     * behaviour, just a type name that reads as if there were. The same is true of
+     * `ZEROFILL` and of `INT(11)`/`VARCHAR(20)` lengths, which are stored and never
+     * enforced. Accepting those would produce a table the user believes has
+     * constraints it does not have, which is worse than refusing the field.
+     *
+     * `BINARY` and `COMMENT` are outright syntax errors on some types and silently
+     * absorbed into the type name on others (`INT COMMENT 'x'` parses, `VARCHAR(20)
+     * COMMENT 'x'` does not) — so they are refused uniformly rather than depending on
+     * which type they happen to be attached to.
+     *
+     * NOT refused here: `collate`, which SQLite genuinely honours (measured:
+     * `COLLATE NOCASE` really does match case-insensitively).
+     */
+    for (const spec of columns) {
+      const attributes = spec.attributes ?? []
+      if (attributes.length > 0) {
+        throw new Error(`SQLite 不支持列属性 ${attributes.join(', ')}：它会把这些词并入类型名而不产生任何效果`)
+      }
+      if (spec.charset !== undefined && spec.charset !== '') {
+        throw new Error('SQLite 没有列级字符集，只有列级排序规则（COLLATE）')
+      }
+      if (spec.length !== undefined && spec.length.trim() !== '') {
+        throw new Error(`SQLite 不支持长度/值（列 ${spec.name}）：它会保留在类型名里但没有任何约束力。请把长度直接写进类型，如 VARCHAR(20)`)
+      }
+      if (spec.comment !== undefined && spec.comment !== '') {
+        throw new Error('SQLite 不支持列注释：它没有存储注释的地方')
+      }
+    }
+
+    const tableOptions = options.table ?? {}
+    if (tableOptions.engine !== undefined && tableOptions.engine.trim() !== '') {
+      throw new Error('SQLite 没有存储引擎可选')
+    }
+    if (tableOptions.comment !== undefined && tableOptions.comment !== '') {
+      throw new Error('SQLite 没有表注释：它没有存储表注释的地方')
+    }
+    if (tableOptions.collate !== undefined && tableOptions.collate.trim() !== '') {
+      throw new Error('SQLite 没有表级排序规则，排序规则只能逐列指定')
+    }
+    const tail = tableOptions.tail === undefined ? '' : tableOptions.tail.trim()
+    if (tail !== '' && !/^(WITHOUT ROWID|STRICT|,\s*)+$/i.test(tail) && !/^(WITHOUT ROWID|STRICT)(\s*,\s*(WITHOUT ROWID|STRICT))*$/i.test(tail)) {
+      // Only SQLite's own trailing keywords: anything else in this slot would be raw
+      // SQL spliced onto the statement.
+      throw new Error(`invalid table keyword: ${JSON.stringify(tableOptions.tail)}`)
+    }
 
     const key = options.primaryKey ?? []
     const names = new Set(columns.map(spec => spec.name))
@@ -785,11 +838,44 @@ export class SqliteDriver implements SqlDriver {
     // duplicate column, without saying which list is wrong. Cheap to check here.
     if (names.size !== columns.length) throw new Error('two of the new columns have the same name')
 
-    const definitions = columns.map((spec, position) => {
+    /*
+     * Indexes beyond the primary key become separate `CREATE INDEX` statements.
+     *
+     * SQLite has no inline index clause, so they cannot be part of the CREATE TABLE.
+     * That makes the create multi-statement, and the two engines differ here for a real
+     * reason: MySQL emits them in the same statement (one DDL), SQLite has to emit
+     * several. If a later index fails, the table is already created — so the failure
+     * names the index and says the table exists, rather than pretending the whole thing
+     * rolled back.
+     */
+    for (const index of options.indexes ?? []) {
+      if (index.kind === 'primary') {
+        if (key.length > 0) throw new Error('the primary key was given twice')
+        continue
+      }
+      if (index.columns.length === 0) throw new Error(`the ${index.kind} index needs at least one column`)
+      for (const name of index.columns) {
+        if (!names.has(name)) throw new Error(`the ${index.kind} index names a column that is not being created: ${name}`)
+      }
+      // Measured: SQLite has neither index type without an extension.
+      if (index.kind === 'fulltext') throw new Error('SQLite 没有 FULLTEXT 索引（需 FTS5 虚拟表，那是另一种对象，不是普通表上的索引）')
+      if (index.kind === 'spatial') throw new Error('SQLite 没有 SPATIAL 索引（需 R*Tree 扩展模块）')
+    }
+
+    const definitions = columns.map(spec => {
       const definition = toDefinition(spec)
       const keyPosition = key.indexOf(spec.name)
-      return keyPosition === -1 ? definition : { ...definition, primaryKeyPosition: keyPosition + 1 }
+      if (keyPosition === -1) return definition
+      return { ...definition, primaryKeyPosition: keyPosition + 1 }
     })
+
+    const constraints: TableShape['constraints'] = []
+    if (key.length > 1) {
+      constraints.push({
+        sql: `PRIMARY KEY (${key.map(name => requireIdentifier(name, 'column name', quoteSqlite)).join(', ')})`,
+        kind: 'primary' as const,
+      })
+    }
 
     const shape: TableShape = {
       name: table,
@@ -798,16 +884,43 @@ export class SqliteDriver implements SqlDriver {
       // A composite key needs a table-level constraint; the renderer puts a
       // single-column key inline and ignores this one, so it is only added when it is
       // the form that will actually be used.
-      constraints: key.length > 1
-        ? [{
-            sql: `PRIMARY KEY (${key.map(name => requireIdentifier(name, 'column name', quoteSqlite)).join(', ')})`,
-            kind: 'primary' as const,
-          }]
-        : [],
-      tail: '',
+      constraints,
+      tail,
     }
 
-    return this.exec(renderCreateTable(shape, 'sqlite'), [], schema)
+    await this.exec(renderCreateTable(shape, 'sqlite'), [], schema)
+
+    /*
+     * Now the secondary indexes.
+     *
+     * `UNIQUE` from a column flag is already inline on the column; the entries here are
+     * the table-level ones, which SQLite expresses only as separate statements.
+     */
+    let created = 0
+    for (const index of options.indexes ?? []) {
+      if (index.kind === 'primary') continue
+      const indexName = index.name === undefined || index.name.trim() === ''
+        ? `${index.kind === 'unique' ? 'uq' : 'ix'}_${table}_${index.columns.join('_')}`
+        : index.name.trim()
+      const columnsSql = index.columns.map(name => requireIdentifier(name, 'column name', quoteSqlite)).join(', ')
+      const unique = index.kind === 'unique' ? 'UNIQUE ' : ''
+      try {
+        await this.exec(
+          `CREATE ${unique}INDEX ${requireIdentifier(indexName, 'index name', quoteSqlite)} ON ${qualifySqlite(schema, table)} (${columnsSql})`,
+          [],
+          schema,
+        )
+        created++
+      } catch (failure) {
+        // The table exists by now, so saying "failed" would leave the user unsure what
+        // state the database is in. State exactly what happened.
+        throw new Error(
+          `表已创建，但创建索引「${indexName}」失败：${failure instanceof Error ? failure.message : String(failure)}`,
+        )
+      }
+    }
+
+    return { columns: [], rows: [], affected: 1 + created, durationMs: 0, write: true, truncated: false }
   }
 
   async addColumn(schema: string | undefined, table: string, spec: ColumnSpec): Promise<QueryResult> {
@@ -1377,6 +1490,10 @@ function toDefinition(spec: ColumnSpec): ColumnDefinition {
     ...(spec.primaryKeyPosition === undefined ? {} : { primaryKeyPosition: spec.primaryKeyPosition }),
     ...(spec.autoIncrement === true ? { autoIncrement: true, sqliteAutoincrement: true } : {}),
     ...(spec.unique === true ? { unique: true } : {}),
+    // A per-column collation. Carried into the definition, because `renderColumn` emits
+    // it from there — without this the clause never reached the statement and the
+    // column silently used the default collation.
+    ...(spec.collate === undefined || spec.collate === '' ? {} : { collate: spec.collate }),
     extras: [],
   }
 }

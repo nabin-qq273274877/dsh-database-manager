@@ -283,6 +283,8 @@ npm run build       # lib/index.js（host）+ lib/client.js（browser）
 | `scripts/verify-db-ops.mjs` | 对真实 MySQL 逐项核对**破坏性操作的效果**（清空是否真的清了、复制是否带数据、改名是否删掉原库、改编码是否落库），19 项 |
 | `scripts/probe-collate-link.mjs` | 排序规则随字符集联动：拿服务端 `information_schema` 真实列表逐项比对，含切换字符集后旧值不残留 |
 | `scripts/probe-create-table.mjs` | 「新建表」端到端：建表后从 `information_schema` 核对列、主键与自增，并实测自增真的生效；同时核对改字符集对话框的预填值 |
+| `scripts/probe-create-table-full.mjs` | 完整建表表单端到端（16 项）：以**几何**断言表单列未被截断（头单元格右边缘须在对话框可视区内、表格宽度须装进正文区），并从服务端核对长度、UNSIGNED、注释、联合索引的列顺序与唯一性、表引擎/整理/注释，以及 UNIQUE 确实被强制 |
+| `scripts/probe-create-table-capabilities.mjs` / `probe-sqlite-caps.mjs` / `probe-sqlite-traps.mjs` | 建表能力探查：逐条实测两引擎对长度、属性、列排序规则、索引类型、表选项的支持与**静默接受**（SQLite 会接受 `INT UNSIGNED` 并存进类型名而无任何效果） |
 | `scripts/probe-dbop-pane.mjs` | 库操作后右侧面板的状态（重命名/复制后不应停在「正在读取表和统计信息…」） |
 | `scripts/repro-rename.mjs` | 重命名的最小复现：分别验证空库与有表的库，确认原库被删除 |
 | `scripts/e2e-redis-tree.mjs` | 真实浏览器里走完 Redis 树的展开 / 新建 / 删除，并核对服务端实际状态 |

@@ -351,9 +351,16 @@ export function DatabaseActionDialog(props: DatabaseActionDialogProps): React.Re
     const trimmed = name.trim()
     if (action !== 'drop' && action !== 'charset') {
       if (trimmed === '') { onError(t('db.op.nameRequired')); return }
-      // The same grammar the driver enforces, checked here so the message names the
-      // field instead of arriving as an engine syntax error.
-      if (!/^[A-Za-z0-9_$][A-Za-z0-9_$ -]*$/.test(trimmed)) { onError(t('db.op.nameInvalid')); return }
+      /*
+       * The same grammar the driver enforces, and the SAME set the message describes.
+       *
+       * The previous regex allowed `$`, spaces, hyphens and a leading digit while the
+       * message claimed only letters, digits and underscores — so a name the user was
+       * told was invalid was accepted. Conservative on purpose: a database name reaches
+       * the filesystem (SQLite) and command lines, where a space or a leading digit
+       * turns into a quoting problem.
+       */
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed)) { onError(t('db.op.nameInvalid')); return }
       if (schemas.some(existing => existing.toLowerCase() === trimmed.toLowerCase())) {
         onError(t('db.op.nameTaken'))
         return
@@ -378,22 +385,16 @@ export function DatabaseActionDialog(props: DatabaseActionDialogProps): React.Re
         ...(collate === '' ? {} : { collate }),
         ...(action === 'copy' ? { includeData } : {}),
       })
-      const label = action === 'create' ? t('db.op.create')
-        : action === 'rename' ? t('db.op.rename')
-          : action === 'copy' ? t('db.op.copy')
-            : action === 'drop' ? t('db.op.drop')
-              : t('db.op.charset')
-      const reportName = action === 'drop' || action === 'charset' ? (schema ?? '') : trimmed
       /*
-       * Report what changed and where to look afterwards, not just a message.
+       * The completion notice takes the operation's own VERB, not its button label.
        *
-       * The caller cannot derive either: `rename` removes the old name and creates a
-       * new one, `create` adds one, `drop` removes the open one. Returning the names
-       * is what lets the panel reload exactly those and land the pane somewhere real —
-       * leaving it pointing at a name that no longer exists showed
-       * 正在读取表和统计信息… forever (measured).
+       * The label for the charset action is the noun 字符集, and interpolating it into a
+       * sentence produced 已字符集「dsh」. Each operation now has its own completion
+       * phrase, keyed by the action, so a label can be reworded for the button without
+       * breaking the notice that reports the outcome.
        */
-      onDone(t('db.op.done', { op: label, name: reportName }), {
+      const reportName = action === 'drop' || action === 'charset' ? (schema ?? '') : trimmed
+      onDone(t(`db.op.done.${action}` as never, { name: reportName }), {
         stale: action === 'create'
           // A create changes only the list; the new database has no statistics yet.
           ? []
@@ -630,7 +631,9 @@ export function MaintenanceReportDialog(props: MaintenanceReportDialogProps): Re
     children: running
       ? React.createElement('div', { className: 'dbm-row' },
           React.createElement('span', { className: 'dbm-spinner' }),
-          React.createElement('span', null, t('db.maint.running', { op: t(`db.maint.${op ?? 'check'}` as never) })),
+          // The operation's own in-progress phrase: interpolating the operation's NAME
+          // produced 正在执行 检查…, which reads as a form being filled in.
+          React.createElement('span', null, t(`db.maint.running.${op ?? 'check'}` as never)),
         )
       : React.createElement(
           'div',
