@@ -30,6 +30,11 @@ import * as React from 'react'
 
 import type { ColumnAttribute, ColumnSpecPayload, DbKind, IndexKind, TableIndexSpec, TableOptions } from '../protocol.ts'
 import type { DbApi } from './api.ts'
+/*
+ * The rules that do not need React live in `column-defaults.ts` so they can be tested directly.
+ * A rule stated twice — once here, once there — is two places to get it wrong.
+ */
+import { autoIncrementBlocker, defaultToWire, supportsCurrentTimestamp, takesLength, type DefaultMode } from './column-defaults.ts'
 import { Modal, t } from './ui.ts'
 
 /** The index kinds a single column can be assigned to. */
@@ -45,7 +50,16 @@ interface DraftColumn {
   collate: string
   attributes: ColumnAttribute[]
   nullable: boolean
-  defaultValue: string
+  /**
+   * Which kind of default this column has.
+   *
+   * `none` emits no DEFAULT clause; `custom` with an empty text emits `DEFAULT ''`; `custom`
+   * with text emits that text; `null` emits `DEFAULT NULL`; `currentTimestamp` emits
+   * `DEFAULT CURRENT_TIMESTAMP`.
+   */
+  defaultMode: DefaultMode
+  /** The literal, for `defaultMode === 'custom'`. Empty means the empty string. */
+  defaultText: string
   autoIncrement: boolean
   comment: string
   indexKind: ColumnIndexKind
@@ -96,12 +110,6 @@ const ATTRIBUTE_ITEMS: Array<{ id: ColumnAttribute; label: string }> = [
   { id: 'onUpdateCurrentTimestamp', label: 'ON UPDATE CURRENT_TIMESTAMP' },
 ]
 
-/** The flat list of every offered type, for suggestions. */
-const TYPES: Record<string, string[]> = {
-  mysql: TYPE_GROUPS.mysql!.flatMap(group => group.types),
-  sqlite: TYPE_GROUPS.sqlite!.flatMap(group => group.types),
-}
-
 /** The collations offered per engine, as a starting point. */
 const COLLATIONS: Record<string, string[]> = {
   mysql: [
@@ -138,7 +146,9 @@ const blank = (kind: string, first: boolean): DraftColumn => ({
   collate: '',
   attributes: [],
   nullable: !first,
-  defaultValue: '',
+  // No default: that is what an empty field produced before, and it is the common case.
+  defaultMode: 'none' as const,
+  defaultText: '',
   // Only the first column starts as an auto-increment key: that is the shape almost
   // every table wants, so starting from it saves two clicks every time.
   autoIncrement: first,
@@ -159,22 +169,18 @@ const blank = (kind: string, first: boolean): DraftColumn => ({
  *   type name but is NOT the rowid alias, so it would silently not auto-increment.
  */
 /**
- * Why an auto-increment column is not possible here, or undefined when it is.
+ * Whether ANOTHER column already claims the table's single auto-increment slot.
  *
- * Returns the REASON rather than a boolean, because the reason has to be SHOWN. The
- * previous shape returned a boolean and the caller used it to disable the checkbox with
- * the reason in a `title` — so the control could not be clicked and nothing on screen
- * said why. Reproduced exactly: after deleting the default column the checkbox was
- * disabled with `title: 自增字段必须是主键` and no visible text anywhere.
+ * The form used to allow ticking a second 自增 and only refused at submit, with
+ * "只能有一个自增字段，当前勾选了：id, seq" — reported by the user as "建表时可以选两个自增",
+ * and reproduced: both boxes ended up ticked and nothing on screen mentioned the limit.
  *
- * The reasons are ordered as a user would fix them, so the message names the first thing
- * to change rather than a requirement that may already hold.
+ * Knowing about the OTHER rows is what this adds; `autoIncrementBlocker` cannot see them.
+ * The UI uses it to disable the other checkboxes and say why, so the rule is enforced where
+ * it is decided instead of after the form is filled in.
  */
-function autoIncrementBlocker(kind: string, column: DraftColumn): 'notKey' | 'notInteger' | 'notNumeric' | undefined {
-  if (column.indexKind !== 'primary') return 'notKey'
-  if (kind === 'sqlite') return column.type.trim().toUpperCase() === 'INTEGER' ? undefined : 'notInteger'
-  if (!NUMERIC_TYPES.test(column.type) && !/\bINTEGER\b/i.test(column.type)) return 'notNumeric'
-  return undefined
+function autoIncrementTakenBy(columns: DraftColumn[], self: DraftColumn): DraftColumn | undefined {
+  return columns.find(column => column.id !== self.id && column.autoIncrement)
 }
 
 /** Whether an auto-increment column is expressible on this engine. */
@@ -197,9 +203,8 @@ export interface CreateTableDialogProps {
 }
 
 export function CreateTableDialog(props: CreateTableDialogProps): React.ReactElement {
-  const { api, sourceId, schema, kind, existingTables, onClose, onCreated, onError } = props
+  const { api, sourceId, schema, kind, existingTables, onClose, onCreated } = props
   const isSqlite = kind === 'sqlite'
-  const typeList = TYPES[kind] ?? TYPES.mysql!
   const collationList = COLLATIONS[kind] ?? COLLATIONS.mysql!
 
   const [name, setName] = React.useState('')
@@ -310,6 +315,25 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
         }
       }
 
+      /*
+       * The default, as the engine should receive it.
+       *
+       * The mode decides the shape, and the three "empty-looking" cases are deliberately
+       * different: `none` emits nothing, `custom` with no text emits `''`, and `null` emits
+       * `NULL`. A single text field could not express that distinction — measured, a blank
+       * field meant no DEFAULT at all, so "the empty string" was unreachable from the form.
+       */
+      /*
+       * The default, as the engine should receive it.
+       *
+       * `defaultToWire` states the mode-to-value mapping once: the three "empty-looking" modes
+       * are deliberately different (`none` emits nothing, `custom` with no text emits `''`, and
+       * `null` emits `NULL`), and re-deriving that here would be a second place to get it wrong.
+       * A single text field could not express the difference at all — measured, a blank field
+       * meant no DEFAULT clause, so "the empty string" was unreachable from the form.
+       */
+      const defaultValue = defaultToWire(column.defaultMode, column.defaultText)
+
       const autoIncrement = column.autoIncrement && autoIncrementAllowed(kind, column)
       if (column.autoIncrement && !autoIncrementAllowed(kind, column)) {
         /*
@@ -320,11 +344,13 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
          */
         if (column.indexKind !== 'primary') return { error: t('createTable.autoNeedsKey') }
         if (isSqlite) return { error: t('createTable.autoNeedsInteger', { name: columnName }) }
-        return { error: t('createTable.autoNeedsNumeric') }
+        // `{name}` is required by this template: a call without it renders the literal
+        // "{name}" on screen. The locale guard now checks that too.
+        return { error: t('createTable.autoNeedsNumeric', { name: columnName }) }
       }
-      // An auto-increment column cannot also carry a literal default: both engines
-      // refuse it, and the refusal does not say which of the two fields to drop.
-      if (autoIncrement && column.defaultValue.trim() !== '') {
+      // An auto-increment column cannot also carry a default: both engines refuse it, and
+      // the refusal does not say which of the two fields to drop.
+      if (autoIncrement && defaultValue !== undefined) {
         return { error: t('createTable.autoIncrementDefault', { name: columnName }) }
       }
       if (column.indexKind === 'primary') key.push(columnName)
@@ -345,7 +371,7 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
         ...(column.length.trim() === '' ? {} : { length: column.length.trim() }),
         ...(column.collate === '' ? {} : { collate: column.collate }),
         ...(attributes.length === 0 ? {} : { attributes }),
-        ...(column.defaultValue.trim() === '' ? {} : { defaultValue: column.defaultValue.trim() }),
+        ...(defaultValue === undefined ? {} : { defaultValue }),
         ...(autoIncrement ? { autoIncrement: true } : {}),
         ...(column.comment.trim() === '' ? {} : { comment: column.comment.trim() }),
       })
@@ -515,7 +541,18 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
             setCustomTypeRows(current => new Set(current).add(column.id))
             return
           }
-          patch(column.id, { type: value })
+          /*
+           * Changing the type CLEARS a length the new type cannot take.
+           *
+           * A length belongs to the type, and carrying one across is how the form produced
+           * `TIMESTAMP(255)` — a statement the server rejects with "Invalid default value for
+           * 'v'", which points at the DEFAULT and says nothing about the length. The row starts
+           * as VARCHAR with 255 pre-filled, so switching it to any non-length type hit this.
+           */
+          patch(column.id, {
+            type: value,
+            ...(takesLength(value) ? {} : { length: '' }),
+          })
         },
       },
       [
@@ -546,6 +583,66 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
    * rather than being hidden: a user who expects ZEROFILL on a text column is told why
    * they cannot have it.
    */
+  /**
+   * The 默认值 cell: a dropdown, plus a text field when 自定义 is chosen.
+   *
+   * Four states, because they are four different things:
+   *   不设置      → no DEFAULT clause at all
+   *   自定义 + 空  → DEFAULT '' (the empty string)
+   *   自定义 + 文本 → DEFAULT 'text'
+   *   NULL        → DEFAULT NULL
+   *   CURRENT_TIMESTAMP → DEFAULT CURRENT_TIMESTAMP
+   *
+   * A plain text field could only express the third and part of the fourth, and left the
+   * first three indistinguishable.
+   */
+  const defaultCell = (column: DraftColumn, index: number): React.ReactElement => {
+    const select = React.createElement(
+      'select',
+      {
+        className: 'dbm-select',
+        value: column.defaultMode,
+        'aria-label': t('createTable.columnDefault'),
+        'data-dbm-newtable-coldefault-mode': String(index),
+        onChange: (event: { target: { value: string } }) => patch(column.id, { defaultMode: event.target.value as DefaultMode }),
+      },
+      [
+        React.createElement('option', { key: 'none', value: 'none' }, t('common.none')),
+        React.createElement('option', { key: 'custom', value: 'custom' }, t('createTable.default.custom')),
+        React.createElement('option', { key: 'null', value: 'null' }, 'NULL'),
+        // Only offered for a type that accepts it. MySQL refuses it elsewhere with
+        // "Invalid default value", measured on VARCHAR and INT. The rule comes from the shared
+        // module so the form and any test read the same one.
+        React.createElement(
+          'option',
+          { key: 'currentTimestamp', value: 'currentTimestamp', disabled: !supportsCurrentTimestamp(column.type) },
+          supportsCurrentTimestamp(column.type)
+            ? 'CURRENT_TIMESTAMP'
+            : `CURRENT_TIMESTAMP（${t('createTable.default.needsTemporal')}）`,
+        ),
+      ],
+    )
+
+    if (column.defaultMode !== 'custom') return select
+
+    return React.createElement(
+      'div',
+      { className: 'dbm-type-cell' },
+      select,
+      React.createElement('input', {
+        className: 'dbm-input dbm-mono',
+        value: column.defaultText,
+        // Empty is a real answer here — it means the empty string — so the placeholder says
+        // so instead of showing a "nothing" hint.
+        placeholder: t('createTable.default.emptyString'),
+        'aria-label': t('createTable.default.text'),
+        'data-dbm-newtable-coldefault-text': String(index),
+        spellcheck: false,
+        onChange: (event: { target: { value: string } }) => patch(column.id, { defaultText: event.target.value }),
+      }),
+    )
+  }
+
   const attributeSelect = (column: DraftColumn, index: number): React.ReactElement => {
     const chosen = column.attributes
     const summary = chosen.length === 0
@@ -624,19 +721,24 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
   /** One row of the column table. */
   const rowFor = (column: DraftColumn, index: number): React.ReactElement => {
     const autoBlocker = autoIncrementBlocker(kind, column)
+    // Another column already has 自增. This row's checkbox is disabled so the second one
+    // cannot be ticked at all, and the reason names the column that has it.
+    const autoHolder = column.autoIncrement ? undefined : autoIncrementTakenBy(columns, column)
     /**
      * The sentence shown when 自增 cannot be used; nothing when it can.
      *
      * ON SCREEN, not in a title: the reported problem was a checkbox that could not be
      * ticked and gave no reason, because the reason lived only in a tooltip.
      */
-    const autoHint = autoBlocker === undefined
-      ? null
-      : autoBlocker === 'notKey'
-        ? t('createTable.autoNeedsKey')
-        : autoBlocker === 'notInteger'
-          ? t('createTable.autoNeedsInteger', { name: column.name.trim() === '' ? t('createTable.thisColumn') : column.name.trim() })
-          : t('createTable.autoNeedsNumeric', { name: column.name.trim() === '' ? t('createTable.thisColumn') : column.name.trim() })
+    const autoHint = autoHolder !== undefined
+      ? t('createTable.autoAlreadyTaken', { name: autoHolder.name.trim() === '' ? t('createTable.thisColumn') : autoHolder.name.trim() })
+      : autoBlocker === undefined
+        ? null
+        : autoBlocker === 'notKey'
+          ? t('createTable.autoNeedsKey')
+          : autoBlocker === 'notInteger'
+            ? t('createTable.autoNeedsInteger', { name: column.name.trim() === '' ? t('createTable.thisColumn') : column.name.trim() })
+            : t('createTable.autoNeedsNumeric', { name: column.name.trim() === '' ? t('createTable.thisColumn') : column.name.trim() })
 
     return React.createElement(
       'tr',
@@ -716,29 +818,36 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
           onChange: (event: { target: { checked: boolean } }) => patch(column.id, { nullable: event.target.checked }),
         }),
       )),
-      /* 默认值 */
-      React.createElement('td', null, React.createElement('input', {
-        className: 'dbm-input dbm-mono',
-        value: column.defaultValue,
-        placeholder: t('common.none'),
-        'aria-label': t('createTable.columnDefault'),
-        'data-dbm-newtable-coldefault': String(index),
-        spellcheck: false,
-        onChange: (event: { target: { value: string } }) => patch(column.id, { defaultValue: event.target.value }),
-      })),
+      /*
+       * 默认值: a dropdown, with a text field shown only for 自定义.
+       *
+       * The four options are the four things a default can be, and they were not all
+       * reachable with one text field: leaving it blank meant NO default clause (an omitted
+       * column then inserts NULL), so "the empty string" could not be asked for at all, and
+       * NULL was only expressible by knowing to type the word.
+       *
+       * The text field appears in the same cell rather than as another column, because the
+       * form is already wide.
+       */
+      React.createElement('td', null, defaultCell(column, index)),
       /*
        * 自增, WITH ITS REASON ON SCREEN.
        *
        * The combination the engine cannot express is still refused, but the user is told
-       * what to change instead of facing a control that silently does nothing.
+       * what to change instead of facing a control that silently does nothing. That covers
+       * the "another column already has it" case too — the rule the form previously left to
+       * a submit-time error.
        */
       React.createElement('td', { className: 'dbm-auto-cell' },
         React.createElement('label', { className: 'dbm-check' },
           React.createElement('input', {
             type: 'checkbox',
             checked: column.autoIncrement,
-            disabled: autoBlocker !== undefined,
+            disabled: autoBlocker !== undefined || autoHolder !== undefined,
             'data-dbm-newtable-auto': String(index),
+            // Only one column may own it, so every other row's checkbox is disabled rather
+            // than left clickable until submit.
+            'data-dbm-newtable-auto-blocked-by': autoHolder === undefined ? undefined : 'other',
             onChange: (event: { target: { checked: boolean } }) => patch(column.id, { autoIncrement: event.target.checked }),
           }),
         ),
@@ -956,6 +1065,13 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
        * not discoverable from the form: a user who wants a two-column index has no way
        * to know they must type the SAME name twice.
        */
+      /*
+       * The default-value explanation, where the control is.
+       *
+       * "No default" and "the empty string" look the same in a form and are not the same in
+       * the database, so the difference is stated rather than left to be discovered.
+       */
+      React.createElement('div', { className: 'dbm-hint' }, t('createTable.default.hint')),
       React.createElement('div', { className: 'dbm-hint' }, t('createTable.compositeHint')),
     ),
 

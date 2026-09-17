@@ -170,6 +170,39 @@ for (const file of sourceFiles(join(root, 'src'))) {
       )
     }
   }
+
+  /*
+   * Calls that pass NO second argument at all.
+   *
+   * The regex above REQUIRES a `{...}` object, so `t('k')` was never examined — and that is
+   * the shape that shipped a literal `{name}` on screen in the create-table dialog:
+   * `t('createTable.autoNeedsNumeric')` against a template of `'{name} 要自增…'`. A guard
+   * whose pattern demands the very argument that is missing cannot see the omission, which
+   * made it blind to the simplest form of the bug it exists to catch.
+   *
+   * Scanned separately rather than by loosening the main regex: that one also extracts the
+   * supplied names, so making the object optional would complicate that extraction for no
+   * gain. Two clear scans beat one clever pattern.
+   */
+  const bare = /\bt\('([a-zA-Z0-9._]*\.[a-zA-Z0-9._]+)'\)/g
+  let bareCall
+  while ((bareCall = bare.exec(source)) !== null) {
+    const line = source.slice(0, bareCall.index).split('\n').length
+    const key = bareCall[1]
+    const template = templates.get(key)
+    if (template === undefined) {
+      console.log(`${file.replace(root, '')}:${line}: t('${key}') has no zh template`)
+      failed = true
+      continue
+    }
+    const needs = [...template.matchAll(/\{(\w+)\}/g)].map(m => m[1])
+    if (needs.length === 0) continue
+    console.log(
+      `${file.replace(root, '')}:${line}: t('${key}') passes no values but the template needs ` +
+      `{${needs.join('} {')}} — it would render the literal placeholder`,
+    )
+    failed = true
+  }
 }
 
 console.log(failed ? 'FAILED' : 'ok')

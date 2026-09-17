@@ -194,7 +194,7 @@ try {
     set('colname', 0, 'id');
     set('coltype', 0, 'INT');
     set('collength', 0, '');
-    set('coldefault', 0, '');
+    set('coldefault-mode', 0, 'none');
     set('colcomment', 0, '主键');
     await sleep(200);
     /*
@@ -227,7 +227,7 @@ try {
     set('collength', 1, '50');
     set('colcollate', 1, '');
     set('colcomment', 1, '姓名');
-    set('coldefault', 1, '');
+    set('coldefault-mode', 1, 'none');
     set('index', 1, 'unique');
     await sleep(200);
     set('indexname', 1, 'uq_name_group');
@@ -243,6 +243,7 @@ try {
 
     out.beforeSubmit = {
       names: Array.from(dlg.querySelectorAll('[data-dbm-newtable-colname]')).map((el) => el.value),
+      defaultModes: Array.from(dlg.querySelectorAll('[data-dbm-newtable-coldefault-mode]')).map((el) => el.value),
       types: Array.from(dlg.querySelectorAll('[data-dbm-newtable-coltype]')).map((el) => el.value),
       lengths: Array.from(dlg.querySelectorAll('[data-dbm-newtable-collength]')).map((el) => el.value),
       indexKinds: Array.from(dlg.querySelectorAll('[data-dbm-newtable-index]')).map((el) => el.value),
