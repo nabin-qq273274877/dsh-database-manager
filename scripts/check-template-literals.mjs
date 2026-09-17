@@ -62,6 +62,8 @@ const files = [
   'scripts/probe-create-table-grid.mjs',
   'scripts/probe-create-table-widths.mjs',
   'scripts/probe-autoincrement.mjs',
+  'scripts/probe-multi-autoincrement.mjs',
+  'scripts/probe-autoincrement-shape.mjs',
   'scripts/probe-create-table-capabilities.mjs',
   'scripts/probe-sqlite-caps.mjs',
   'scripts/probe-sqlite-traps.mjs',

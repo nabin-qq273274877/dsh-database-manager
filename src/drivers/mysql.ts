@@ -896,9 +896,22 @@ export class MysqlDriver implements SqlDriver {
       items.push(`PRIMARY KEY (${key.map(name => requireIdentifier(name, 'column name', quoteMysql)).join(', ')})`)
     }
 
+    /*
+     * At most ONE auto-increment column, checked before anything else.
+     *
+     * Measured: MySQL allows exactly one, and its message ("there can be only one auto
+     * column and it must be defined as a key") does not say which of the columns to change.
+     */
+    const autoColumns = columns.filter(spec => spec.autoIncrement === true)
+    if (autoColumns.length > 1) {
+      throw new Error(`only one column can AUTO_INCREMENT; ${autoColumns.length} were requested (${autoColumns.map(spec => spec.name).join(', ')})`)
+    }
+
     // The index names MySQL will already be using, so a clash is caught before the
     // server answers with a duplicate-key-name error that names neither of the two.
     const usedNames = new Set(['PRIMARY'])
+    // Every key's column list, so the auto-increment rule below can see all of them.
+    const keyLists: string[][] = key.length > 0 ? [key] : []
     for (const index of options.indexes ?? []) {
       requireKnown(index.columns, `the ${index.kind} index`)
       const kind = index.kind.toUpperCase()
@@ -946,6 +959,9 @@ export class MysqlDriver implements SqlDriver {
         : index.name.trim()
       if (usedNames.has(indexName.toUpperCase())) throw new Error(`two indexes would be named ${indexName}`)
       usedNames.add(indexName.toUpperCase())
+      // Recorded so the auto-increment rule can see this key too: a UNIQUE or plain INDEX
+      // over the auto column satisfies MySQL, the primary key is not required.
+      keyLists.push(index.columns)
       const keyword = index.kind === 'unique' ? 'UNIQUE KEY' : index.kind === 'fulltext' ? 'FULLTEXT KEY' : index.kind === 'spatial' ? 'SPATIAL KEY' : 'KEY'
       void kind
       items.push(`${keyword} ${requireIdentifier(indexName, 'index name', quoteMysql)} (${columnsSql})${optionsSql}`)
@@ -972,6 +988,33 @@ export class MysqlDriver implements SqlDriver {
       // a backslash would change what the literal means.
       if (tableOptions.comment.includes('\\')) throw new Error('a table comment cannot contain a backslash')
       tail.push(`COMMENT='${tableOptions.comment.replace(/'/g, "''")}'`)
+    }
+
+    /*
+     * The auto-increment column's key requirement, now that every key is known.
+     *
+     * Measured against MySQL: it must be A key (UNIQUE or a plain INDEX is enough, PRIMARY
+     * is not required), and inside a COMPOSITE key it must be the FIRST member. The
+     * position rule is the one the panel previously missed, so it produced a CREATE the
+     * server rejected with the same blanket message it uses for the other two mistakes.
+     */
+    const autoColumn = autoColumns[0]
+    if (autoColumn !== undefined) {
+      /*
+       * Two distinct failures, reported separately.
+       *
+       * They were one branch at first, which meant a column in NO key at all was told it
+       * "must be the first column of a key" — true-sounding but not the thing to fix, and
+       * a probe that read the actual message showed it. The order is: is it in a key, then
+       * does it lead one.
+       */
+      const inSomeKey = keyLists.some(list => list.includes(autoColumn.name))
+      if (!inSomeKey) {
+        throw new Error(`column ${autoColumn.name} is AUTO_INCREMENT, so it must be a key: add it to the primary key, or give it a UNIQUE or INDEX of its own`)
+      }
+      if (!keyLists.some(list => list[0] === autoColumn.name)) {
+        throw new Error(`column ${autoColumn.name} is AUTO_INCREMENT, so it must be the FIRST column of a key (in a composite key the auto column cannot come second unless it is also indexed on its own)`)
+      }
     }
 
     const suffix = tail.length === 0 ? '' : ` ${tail.join(' ')}`

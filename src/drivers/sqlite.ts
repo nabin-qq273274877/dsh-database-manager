@@ -839,6 +839,34 @@ export class SqliteDriver implements SqlDriver {
     if (names.size !== columns.length) throw new Error('two of the new columns have the same name')
 
     /*
+     * SQLite's AUTOINCREMENT rules, checked here because the renderer cannot express them.
+     *
+     * Measured: SQLite has exactly one rowid, so
+     *   - at most ONE auto-increment column, and
+     *   - it must BE the primary key, not merely a member of it — a composite key has no
+     *     rowid alias, so `PRIMARY KEY(a, b)` with `a` auto is refused.
+     *
+     * Without this check the driver emitted the statement and the server answered with
+     * "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY" or "table has more than one
+     * primary key", neither of which says which of the form's rows to change. The two-auto
+     * case was not caught at all: the request resolved successfully and the table was
+     * created with the flag silently dropped from the second column.
+     */
+    const autoColumns = columns.filter(spec => spec.autoIncrement === true)
+    if (autoColumns.length > 1) {
+      throw new Error(`only one column can AUTOINCREMENT on SQLite (it has a single rowid); ${autoColumns.length} were requested (${autoColumns.map(spec => spec.name).join(', ')})`)
+    }
+    const autoColumn = autoColumns[0]
+    if (autoColumn !== undefined) {
+      if (key.length !== 1 || key[0] !== autoColumn.name) {
+        throw new Error(
+          `SQLite 的自增要求「${autoColumn.name}」就是该表的唯一主键（rowid 别名）：` +
+          '复合主键没有 rowid 别名，因此复合主键下的自增无法实现',
+        )
+      }
+    }
+
+    /*
      * Indexes beyond the primary key become separate `CREATE INDEX` statements.
      *
      * SQLite has no inline index clause, so they cannot be part of the CREATE TABLE.
