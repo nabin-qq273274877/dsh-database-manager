@@ -18,7 +18,8 @@ import * as React from 'react'
  */
 
 import type { ColumnInfo, RowFilter, RowFilterOperator } from '../protocol.ts'
-import { ROW_FILTER_OPERATORS, UNARY_FILTER_OPERATORS } from '../protocol.ts'
+import { ROW_FILTER_OPERATORS } from '../protocol.ts'
+import { inputHints, isUnaryOperator, operatorsFor } from './column-kinds.ts'
 import { Empty, t } from './ui.ts'
 
 /** One editable condition row. */
@@ -42,41 +43,45 @@ export interface SqlSearchTabProps {
   total?: number
   onSearch(filters: RowFilter[], join: 'and' | 'or'): void
   onError(message: string | undefined): void
-}
-
-/** Whether an operator takes no operand. */
-function isUnary(operator: RowFilterOperator): boolean {
-  return UNARY_FILTER_OPERATORS.includes(operator)
-}
-
-/** The operators that make sense for a column's declared type. */
-export function operatorsFor(type: string): RowFilterOperator[] {
-  const text = type.trim().toLowerCase()
-  const orderLike = /^(tiny|small|medium|big)?(int|decimal|numeric|float|double|real|bit|year)|^(date|datetime|timestamp|time)/.test(text)
-  const textual = /char|text|enum|set|json|blob|binary|uuid/.test(text)
-  if (orderLike) {
-    // An ordered type has no meaningful "contains": `LIKE` on an int casts it,
-    // which cannot use an index and reads as a different question.
-    return ['eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'between', 'in', 'isNull', 'isNotNull']
-  }
-  if (textual) {
-    return ['contains', 'notContains', 'startsWith', 'endsWith', 'eq', 'neq', 'in', 'isNull', 'isNotNull']
-  }
-  return [...ROW_FILTER_OPERATORS]
+  /**
+   * The result grid, rendered by the caller.
+   *
+   * Passed in rather than built here because it is the 浏览 tab's grid in
+   * read-only mode — the same paging, sorting and cell copy. A second grid
+   * implementation would be a second place for those to differ.
+   */
+  results?: React.ReactNode
 }
 
 /** The 搜索 tab. */
 export function SqlSearchTab(props: SqlSearchTabProps): React.ReactElement {
-  const { columns, filters, join, loading, total, onSearch, onError } = props
+  const { columns, filters, join, loading, total, onSearch, onError, results } = props
   const nextId = React.useRef(1)
   /** The form's rows. Kept local so a half-typed condition is not a search. */
   const [rows, setRows] = React.useState<ConditionRow[]>([])
   const [localJoin, setLocalJoin] = React.useState<'and' | 'or'>(join)
 
-  // The form follows what the last search ran with — including one issued from
-  // elsewhere (a column's 非重复值 shortcut) — so the grid and the form never
-  // disagree about what is being shown.
+  /**
+   * The form follows what the last search ran with — including one issued from
+   * elsewhere (a column's 非重复值 shortcut) — so the grid and the form never
+   * disagree about what is being shown.
+   *
+   * Keyed on a SERIALIZATION of the filters rather than on the array. `filters`
+   * is a fresh array on every parent render, so depending on it re-seeded the
+   * form constantly and discarded anything the user had typed.
+   *
+   * The re-seed is also skipped while the form has UNSENT input. The prop
+   * describes the last SEARCH, and the user may have typed a new condition since;
+   * overwriting it because the parent re-rendered would erase what they were
+   * about to search for.
+   */
+  const filterKey = JSON.stringify(filters) + '|' + join
+  const lastApplied = React.useRef(filterKey)
   React.useEffect(() => {
+    if (lastApplied.current === filterKey) return
+    // The search itself changed (a condition ran from elsewhere), so the form
+    // adopts it.
+    lastApplied.current = filterKey
     setRows(filters.map(filter => ({
       id: nextId.current++,
       column: filter.column,
@@ -85,7 +90,42 @@ export function SqlSearchTab(props: SqlSearchTabProps): React.ReactElement {
       value2: filter.value2 ?? '',
     })))
     setLocalJoin(join)
-  }, [filters, join])
+    // Only a CHANGE to the search itself may replace the form.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filterKey])
+
+  /**
+   * A first condition row once the columns are known.
+   *
+   * Without it the tab opens as an empty panel with nothing to fill in: the
+   * columns arrive with the table's structure, so a form that only ever grows
+   * from a click leaves the user reading an instruction where a control should
+   * be.
+   *
+   * Guarded on "are there any columns at all" rather than on the array's
+   * identity. `columns` is a fresh array on every parent render, so a dependency
+   * on it re-ran this effect constantly — and its `setRows` then REPLACED
+   * whatever the user had typed, so a filled-in condition silently became "no
+   * conditions" and the search button did nothing.
+   */
+  const hasColumns = columns.length > 0
+  React.useEffect(() => {
+    if (!hasColumns) return
+    setRows(current => {
+      if (current.length > 0) return current
+      const first = columns[0]!
+      return [{
+        id: nextId.current++,
+        column: first.name,
+        operator: operatorsFor(first.type)[0] ?? 'eq',
+        value: '',
+        value2: '',
+      }]
+    })
+    // `columns` is deliberately absent: only the transition from "no columns" to
+    // "some columns" may seed the form.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasColumns])
 
   const addRow = (): void => {
     const first = columns[0]
@@ -103,7 +143,7 @@ export function SqlSearchTab(props: SqlSearchTabProps): React.ReactElement {
     const out: RowFilter[] = []
     for (const [index, row] of rows.entries()) {
       if (row.column === '') return { error: t('search.needCondition') }
-      if (isUnary(row.operator)) { out.push({ column: row.column, operator: row.operator }); continue }
+      if (isUnaryOperator(row.operator)) { out.push({ column: row.column, operator: row.operator }); continue }
       if (row.operator === 'between') {
         if (row.value.trim() === '' || row.value2.trim() === '') {
           return { error: t('search.needCondition') }
@@ -198,7 +238,7 @@ export function SqlSearchTab(props: SqlSearchTabProps): React.ReactElement {
                   },
                   operators.map(operator => React.createElement('option', { key: operator, value: operator }, t(`search.op.${operator}` as never))),
                 ),
-                isUnary(row.operator)
+                isUnaryOperator(row.operator)
                   ? null
                   : React.createElement('input', {
                       className: 'dbm-input',
@@ -268,18 +308,10 @@ export function SqlSearchTab(props: SqlSearchTabProps): React.ReactElement {
       { className: 'dbm-pad' },
       React.createElement('div', { className: 'dbm-hint' }, t('search.hint')),
     ),
+    // The result grid, in its own scroll area so the form above keeps its height
+    // and the rows get the rest of the tab.
+    results === undefined ? null : React.createElement('div', { className: 'dbm-tab-body', style: { minHeight: 0 } }, results),
   )
-}
-
-/** The `inputMode` / `type` a browser needs for a column's declared type. */
-function inputHints(column: ColumnInfo): Record<string, string> {
-  const type = column.type.trim().toLowerCase()
-  if (/^(tiny|small|medium|big)?(int|bit|year)/.test(type)) return { inputMode: 'numeric' }
-  if (/^(decimal|numeric|float|double|real)/.test(type)) return { inputMode: 'decimal' }
-  if (/^date$/.test(type)) return { type: 'date' }
-  if (/^datetime|^timestamp/.test(type)) return { type: 'datetime-local' }
-  if (/^time$/.test(type)) return { type: 'time' }
-  return {}
 }
 
 /** The 搜索 tab's empty-result placeholder, re-exported for the view's use. */

@@ -18,6 +18,7 @@ import * as React from 'react'
 
 import type { ColumnInfo, DataSourceSummary } from '../protocol.ts'
 import type { DbApi } from './api.ts'
+import { autoAssigns, fieldKind } from './column-kinds.ts'
 import { t } from './ui.ts'
 
 /** One column's form value, as the user set it. */
@@ -39,50 +40,6 @@ export interface SqlInsertTabProps {
   /** Refresh counts and the grid after an insert. */
   onDone(message: string): void
   onError(message: string | undefined): void
-}
-
-/** A rough type classification, for choosing a control. */
-export type FieldKind =
-  | { kind: 'enum'; options: string[] }
-  | { kind: 'boolean' }
-  | { kind: 'number'; integer: boolean; maxLength?: number }
-  | { kind: 'date' }
-  | { kind: 'datetime' }
-  | { kind: 'time' }
-  | { kind: 'text'; maxLength?: number; multiline: boolean }
-  | { kind: 'binary' }
-
-/** Decide which control a column's declared type gets. */
-export function fieldKind(column: ColumnInfo): FieldKind {
-  if (column.options !== undefined && column.options.length > 0) return { kind: 'enum', options: column.options }
-  const type = column.type.trim().toLowerCase()
-  if (/^(bool|boolean)$/.test(type)) return { kind: 'boolean' }
-  if (/^tinyint\(1\)/.test(type)) return { kind: 'boolean' }
-  if (/^(tiny|small|medium|big)?(int|year)/.test(type)) return { kind: 'number', integer: true }
-  if (/^(decimal|numeric|float|double|real|bit)/.test(type)) return { kind: 'number', integer: false }
-  if (/^date$/.test(type)) return { kind: 'date' }
-  if (/^datetime|^timestamp/.test(type)) return { kind: 'datetime' }
-  if (/^time$/.test(type)) return { kind: 'time' }
-  if (/blob|binary/.test(type)) return { kind: 'binary' }
-  const maxLength = /\((?:char|varchar|character|nvarchar|native)?\s*(\d{1,6})\)/.exec(type)?.[1]
-  return {
-    kind: 'text',
-    ...(maxLength === undefined ? {} : { maxLength: Number(maxLength) }),
-    multiline: /(text|json|clob)/.test(type),
-  }
-}
-
-/** Whether a column is SQLite's `INTEGER PRIMARY KEY` rowid alias. */
-function isRowidAlias(kind: string, column: ColumnInfo): boolean {
-  if (kind !== 'sqlite') return false
-  if (column.key !== 'PRI' || column.primaryKeyPosition !== 1) return false
-  return column.type.trim().toLowerCase().replace(/\s+/g, ' ') === 'integer'
-}
-
-/** Whether the engine will assign a value when the column is omitted. */
-function autoAssigns(kind: string, column: ColumnInfo): boolean {
-  if (isRowidAlias(kind, column)) return true
-  return column.extra !== undefined && /auto_increment/i.test(column.extra)
 }
 
 /** The 插入 tab. */

@@ -372,7 +372,7 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     setBrowse(current => ({ ...current, page: 1, orderBy: undefined, orderByColumns: undefined, filters: undefined }))
     setError(undefined)
     setNotice(undefined)
-    if (nextTab === 'structure' || nextTab === 'insert') void loadStructure(schema, table)
+    if (nextTab === 'structure' || nextTab === 'insert' || nextTab === 'search') void loadStructure(schema, table)
     if (nextTab === 'browse') void loadRows({ schema, table, page: 1, pageSize: browse.pageSize, mode: 'browse', withIndexes: true })
   }
 
@@ -382,7 +382,12 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     setError(undefined)
     setNotice(undefined)
     if (activeTable === undefined || activeSchema === undefined) return
-    if (next === 'structure' || next === 'insert') void loadStructure(activeSchema, activeTable)
+    // The 搜索 tab needs the column list too, not only 结构 and 插入: its form is a
+    // list of columns with per-type operators, so without them it renders an empty
+    // condition row and offers nothing to search by.
+    if (next === 'structure' || next === 'insert' || next === 'search') {
+      void loadStructure(activeSchema, activeTable)
+    }
     if (next === 'browse') void loadRows({
       schema: activeSchema,
       table: activeTable,
@@ -716,6 +721,52 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
             })
           },
           onError: message => { setError(message); if (message !== undefined) setNotice(undefined) },
+          /*
+           * The RESULTS, rendered by the browse grid in read-only mode.
+           *
+           * Without this the tab was a form with nothing under it: a search ran,
+           * the rows came back, and the user saw no result at all. Reusing the
+           * grid keeps the paging, the sort and the cell copy identical to 浏览 —
+           * and the rows are shown WITHOUT editing, because a result set is a
+           * view onto a query rather than a table with stable keys.
+           */
+          results: React.createElement(SqlBrowseTab, {
+            key: 'search-results',
+            api,
+            sourceId: source.id,
+            schema: selection.schema,
+            table: selection.table,
+            rows,
+            query: { ...browse, mode: 'search' } as never,
+            knownColumns: columns,
+            readOnly: true,
+            onQuery: next => {
+              const merged: BrowseQuery = { ...browse, ...next }
+              setBrowse(merged)
+              void loadRows({
+                schema: selection.schema,
+                table: selection.table,
+                page: merged.page,
+                pageSize: merged.pageSize,
+                mode: 'search',
+                ...(merged.filters === undefined ? {} : { filters: merged.filters }),
+                ...(merged.filterJoin === undefined ? {} : { filterJoin: merged.filterJoin }),
+                ...(merged.orderBy === undefined ? {} : { orderBy: merged.orderBy }),
+                ...(merged.orderByColumns === undefined ? {} : { orderByColumns: merged.orderByColumns }),
+                orderDir: merged.orderDir,
+                withIndexes: true,
+              })
+            },
+            onReload: reloadCurrent,
+            onExport: options => setTransfer({
+              kind: 'export',
+              ...(options?.rowsOnly === true ? { rowsOnly: true } : {}),
+              ...(options?.selectedKeys === undefined ? {} : { selectedKeys: options.selectedKeys }),
+            }),
+            onImport: () => { void openImport(selection.schema) },
+            onNotice: message => { setNotice(message); if (message !== undefined) setError(undefined) },
+            onError: message => { setError(message); if (message !== undefined) setNotice(undefined) },
+          }),
         }),
       )
     }

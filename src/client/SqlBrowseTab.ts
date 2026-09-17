@@ -68,6 +68,15 @@ export interface SqlBrowseTabProps {
   onExport(options?: { rowsOnly?: boolean; selectedKeys?: RowKey[] }): void
   /** Open the import dialog. */
   onImport(): void
+  /**
+   * Show the rows without offering to change them.
+   *
+   * Set by the 搜索 tab: a result set is a view onto a query, not a table with
+   * stable keys, so the in-cell editor and the row actions would act on a row
+   * whose identity came from a join or an expression. The paging, the sorting and
+   * the cell copy stay available — those only read.
+   */
+  readOnly?: boolean
   /** Structure changes elsewhere may have changed the table; reported upward. */
   onNotice(message: string | undefined): void
   onError(message: string | undefined): void
@@ -95,24 +104,18 @@ function cellText(value: KeyValue): string {
   return value === null ? '' : String(value)
 }
 
-/** Whether a column's declared type is numeric (drives the insert control). */
-export function isNumericType(type: string): boolean {
-  return /^(tiny|small|medium|big)?(int|decimal|numeric|float|double|real|bit|year)\b/i.test(type.trim())
-}
-
-/** Whether a column's declared type is a date/time (drives the insert control). */
-export function isDateType(type: string): boolean {
-  return /^(date|datetime|timestamp|time)\b/i.test(type.trim())
-}
-
-/** Whether a column's declared type is boolean-ish. */
-export function isBooleanType(type: string): boolean {
-  return /^(bool|boolean)\b/i.test(type.trim())
-}
+/**
+ * The type classifiers, re-exported so call sites keep one import.
+ *
+ * They live in `column-kinds.ts` (no React, no i18n) because the RULES are what
+ * is worth testing, and a component cannot be reached by a unit test without a
+ * DOM.
+ */
+export { isNumericType, isDateType, isBooleanType, fieldKind, operatorsFor } from './column-kinds.ts'
 
 /** The 浏览 tab. */
 export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
-  const { api, sourceId, schema, table, rows, query, onQuery, onReload, onExport, onImport, onNotice, onError } = props
+  const { api, sourceId, schema, table, rows, query, onQuery, onReload, onExport, onImport, readOnly, onNotice, onError } = props
   /** The cell being edited, by row index and column name. */
   const [editing, setEditing] = React.useState<{ row: number; column: string; value: string } | undefined>(undefined)
   /** Keys of the rows selected for a batch action, serialized for set membership. */
@@ -240,7 +243,11 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
   if (rows.error !== undefined && page === undefined) return React.createElement(ErrorBanner, { message: rows.error })
 
   const pages = page === undefined ? 1 : Math.max(1, Math.ceil(page.total / page.pageSize))
-  const canActOnRows = primaryKey.length > 0
+  // A read-only grid still needs a row key to offer a selection for, but not one
+  // to edit with: every action that would WRITE is dropped below.
+  const canSelectRows = primaryKey.length > 0 && readOnly !== true
+  const canEditCells = primaryKey.length > 0 && readOnly !== true
+  const canActOnRows = canSelectRows
 
   /** One action button in the 操作 cell. */
   const rowAction = (key: string, label: string, onClick: () => void, danger = false, title?: string): React.ReactElement =>
@@ -305,6 +312,7 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
     )
   }
   header.push(React.createElement('th', { key: '__actions', className: 'dbm-row-actions' }, t('browse.actions')))
+  if (readOnly === true) header.pop()
 
   const body: unknown[] = []
   for (const [index, row] of (page?.rows ?? []).entries()) {
@@ -349,13 +357,27 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
               value: editing.value,
               'aria-label': column.name,
               onChange: (event: { target: { value: string } }) => setEditing({ row: index, column: column.name, value: event.target.value }),
-              onKeyDown: (event: { key: string; preventDefault(): void }) => {
+              onKeyDown: (event: { key: string; preventDefault(): void; currentTarget: { value: string } }) => {
                 if (event.key === 'Escape') { event.preventDefault(); setEditing(undefined); return }
-                if (event.key === 'Enter') { event.preventDefault(); void saveCell(index, column.name, editing.value) }
+                if (event.key === 'Enter') {
+                  event.preventDefault()
+                  void saveCell(index, column.name, event.currentTarget.value)
+                }
               },
-              // Losing focus saves, which is what makes the gesture a single
-              // action rather than one that needs a confirmation click.
-              onBlur: () => { void saveCell(index, column.name, editing.value) },
+              /*
+               * Losing focus saves, which is what makes the gesture a single
+               * action rather than one that needs a confirmation click.
+               *
+               * The value is read from the ELEMENT, not from `editing.value`.
+               * The handler closes over the state of the render that created it,
+               * so a blur arriving before React has committed a keystroke would
+               * save the PREVIOUS value — and the unchanged-value guard in
+               * `saveCell` would then skip the write entirely, silently
+               * discarding the edit. Reading the element is immune to that
+               * ordering, which also covers a paste or an IME composition that
+               * ends in the same tick.
+               */
+              onBlur: (event: { target: { value: string } }) => { void saveCell(index, column.name, event.target.value) },
             }),
           ),
         )
@@ -366,10 +388,10 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
           'td',
           {
             key: column.name,
-            className: `${isNull(value) ? 'dbm-null' : ''}${canActOnRows ? ' dbm-cell-editable' : ''}`.trim() || undefined,
-            title: canActOnRows ? t('browse.cellHint') : renderCell(value),
-            ...(canActOnRows ? { 'data-dbm-cell': `${index}:${column.name}` } : {}),
-            ...(canActOnRows
+            className: `${isNull(value) ? 'dbm-null' : ''}${canEditCells ? ' dbm-cell-editable' : ''}`.trim() || undefined,
+            title: canEditCells ? t('browse.cellHint') : renderCell(value),
+            ...(canEditCells ? { 'data-dbm-cell': `${index}:${column.name}` } : {}),
+            ...(canEditCells
               ? {
                   onDoubleClick: () => {
                     setEditing({ row: index, column: column.name, value: value === null ? '' : String(value) })
@@ -381,6 +403,10 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
         ),
       )
     }
+    // The action cell is omitted entirely in read-only mode rather than rendered
+    // empty: a column of buttons that do nothing is worse than no column, and the
+    // header would otherwise promise actions the grid does not have.
+    if (readOnly === true) { body.push(React.createElement('tr', { key: index, 'data-selected': String(isSelected) }, ...cells as never[])); continue }
     cells.push(
       React.createElement(
         'td',

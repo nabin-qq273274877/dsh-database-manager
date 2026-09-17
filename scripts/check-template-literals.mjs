@@ -49,6 +49,8 @@ const files = [
   'scripts/e2e-index-used.mjs',
   'scripts/e2e-search-tree.mjs',
   'scripts/shot-tree-loading.mjs',
+  'scripts/e2e-sql-editing.mjs',
+  'scripts/e2e-sql-search.mjs',
 ]
 
 let failed = false
