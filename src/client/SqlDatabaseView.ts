@@ -496,9 +496,19 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
           isOpen ? '▾' : '▸',
         ),
         React.createElement('span', { className: 'dbm-node-name' }, schema),
+        /*
+         * The count is the database's TOTAL, not the filtered subset.
+         *
+         * This number sits on the database's own row, so it answers "how many
+         * tables does this database hold". Showing the filtered count made the
+         * row claim `dbm_tree 0` while the database held five tables and the
+         * filter was simply excluding all of them — a number that contradicted
+         * what the API returns for the same database. The filter's effect is
+         * already visible in the list below the row.
+         */
         tables === undefined
           ? null
-          : React.createElement('span', { className: 'dbm-tree-meta' }, String(tables.filter(table => matchesFilter(table.name)).length)),
+          : React.createElement('span', { className: 'dbm-tree-meta' }, String(tables.length)),
       ),
     )
     if (!isOpen) continue
@@ -513,7 +523,15 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
         React.createElement(
           'div',
           { key: `empty-${schema}`, className: 'dbm-tree-item dbm-tree-indent-1 dbm-hint' },
-          t('db.noTables'),
+          /*
+           * "No tables" and "your filter excluded them all" are different facts,
+           * and conflating them misleads in exactly the case a filter is used: a
+           * database with tables reported as having none. The filter's own text is
+           * quoted in the message so the reason is not left to be inferred.
+           */
+          (tables !== undefined && tables.length > 0 && tableFilter !== '')
+            ? t('db.noTablesFiltered', { filter: tableFilter })
+            : t('db.noTables'),
         ),
       )
       continue

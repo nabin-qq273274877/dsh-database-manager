@@ -217,7 +217,23 @@ export const PANEL_CSS = `
 .dbm-main { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
 
 /* ---- tree rows --------------------------------------------------------- */
+/*
+ * box-sizing: border-box is load-bearing here, not stylistic.
+ *
+ * The row is width:100% with 10px of horizontal padding, and the sidebar's body
+ * is overflow:auto. Under the default content-box the padding was ADDED to the
+ * 100%, so each row measured 20px wider than its container: measured, the body's
+ * clientWidth was 280 while its scrollWidth was 300. The right-hand number — which
+ * sits at the row's trailing edge — was therefore pushed into the 20px-wide strip
+ * that overflow:auto clips, so its last characters were cut off. Every row was
+ * affected; the number was simply the only thing whose value sat flush against
+ * that edge.
+ *
+ * The Redis tree's rows already set this (dbm-tree-node), which is why only this
+ * tree showed the clipping.
+ */
 .dbm-tree-item {
+  box-sizing: border-box;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -244,7 +260,32 @@ export const PANEL_CSS = `
   color: var(--dsw-alias-label-secondary);
   flex: none;
 }
-.dbm-tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/*
+ * The name takes the space left over and gives it back when the row is narrow.
+ *
+ * flex:1 with min-width:0 is what makes the ellipsis actually happen: a flex
+ * item's default min-width:auto refuses to shrink below its content, so a long
+ * table name pushed the trailing count out of the row instead of being truncated.
+ */
+.dbm-tree-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+/*
+ * The trailing number never shrinks and never wraps.
+ *
+ * flex:none because it is the one thing in the row whose full value is always
+ * needed — a truncated count is worse than a truncated name. Tabular figures keep
+ * it a fixed width, so a row does not shift as the number changes.
+ */
+.dbm-tree-item .dbm-tree-meta {
+  flex: none;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
 
 /*
  * The caret and the label on a database row.
