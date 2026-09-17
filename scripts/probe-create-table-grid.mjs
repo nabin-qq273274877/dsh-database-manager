@@ -216,7 +216,14 @@ try {
   const rightSpreads = [...byColumn.values()].map(rights => Math.max(...rights) - Math.min(...rights))
   check('the controls align on their RIGHT edge within each column', rightSpreads.length > 0 && rightSpreads.every(spread => spread <= 8), { rightSpreads, edges: edges.map(entry => [entry.label, entry.controlLeft, entry.controlRight]) })
   check('the outermost control reaches the dialog edge', edges.length > 0 && Math.max(...edges.map(entry => entry.controlRight)) >= (out.wide?.dialogRight ?? 0) - 40, { maxRight: Math.max(...edges.map(entry => entry.controlRight)), dialogRight: out.wide?.dialogRight })
-  check('the grid really has two columns at this width', (out.wide?.gridColumns ?? '').split(' ').length >= 2, out.wide?.gridColumns)
+  /*
+   * The grid lays the four table-level fields out in FOUR columns at this width.
+   *
+   * Asserted as "at least two" while the grid was fixed at two; the requested layout puts all four
+   * on one row, so an exact count is what pins it. A narrower window degrades to three or two,
+   * which the widths probe covers — this probe runs at the dialog's own 1600px window.
+   */
+  check('the grid lays the four fields out in four columns', (out.wide?.gridColumns ?? '').split(' ').length === 4, out.wide?.gridColumns)
 
   // ---- gap 2: the custom type round trip -------------------------------
   check('choosing 自定义 swaps in a text field', out.afterCustom?.hasText === true && out.afterCustom?.textVisible === true && out.afterCustom?.selectGone === true, out.afterCustom)

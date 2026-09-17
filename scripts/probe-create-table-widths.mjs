@@ -137,6 +137,23 @@ try {
       const columnTable = dialog.querySelector('.dbm-newtable-cols');
       const headers = Array.from(dialog.querySelectorAll('.dbm-newtable-cols thead th'));
 
+      /*
+       * How the four table-level fields are arranged at THIS width.
+       *
+       * The requested four-across must not degrade into an ORPHAN row: auto-fit alone gave 3+1 at a
+       * 1000px viewport (measured), which reads as a layout mistake rather than a grid, so the
+       * shape is reported per width and asserted below. Grouped by a 5px tolerance because the rows'
+       * tops differ by a sub-pixel amount when a field's control uses the code font.
+       */
+      const fieldRows = Array.from(grid.querySelectorAll('.dbm-grid-row'));
+      const fieldTops = fieldRows.map((row) => Math.round(row.getBoundingClientRect().top));
+      const shape = [];
+      for (const top of fieldTops) {
+        if (shape.length === 0 || top - shape[shape.length - 1][0] > 5) shape.push([top]);
+        else shape[shape.length - 1].push(top);
+      }
+      const perRow = shape.map((group) => group.length);
+
       const controls = Array.from(dialog.querySelectorAll('.dbm-grid-control')).map((control) => ({
         width: Math.round(control.getBoundingClientRect().width),
         past: Math.round(control.getBoundingClientRect().right - dialogRect.right),
@@ -177,7 +194,16 @@ try {
         dialogPastViewport: Math.round(dialogRect.right - window.innerWidth),
         gridColumns: getComputedStyle(grid).gridTemplateColumns,
         gridRowCount: grid.querySelectorAll('.dbm-grid-row').length,
-        distinctGridTops: new Set(Array.from(grid.querySelectorAll('.dbm-grid-row')).map((r) => Math.round(r.getBoundingClientRect().top))).size,
+        /*
+         * The number of VISUAL rows, grouped with a tolerance.
+         *
+         * The old count was of distinct ROUNDED tops, which reported 3 "rows" for the four fields
+         * that all sit on one line — 表名's monospaced control shifts its line box by a fraction of
+         * a pixel, so rounding produced 320, 321 and 322. Grouping is what makes the number mean
+         * what its name says.
+         */
+        distinctGridTops: shape.length,
+        fieldsPerRow: perRow,
         narrowestControl: controls.length === 0 ? null : Math.min(...controls.map((c) => c.width)),
         controlsPastDialog: controls.filter((c) => c.past > 1).length,
         worstControlPast: controls.length === 0 ? 0 : Math.max(...controls.map((c) => c.past)),
@@ -203,7 +229,7 @@ try {
         measured.columnTableOverflows ? `column table scrolls (${measured.columnTableScrollWidth}>${measured.columnTableClientWidth})` : 'column table fits',
         measured.clippedCount > 0 ? `${measured.clippedCount} control(s) with clipped content` : 'no clipped content',
         `narrowest col ${measured.narrowestColumn}px`,
-        `${measured.distinctGridTops}/${measured.gridRowCount} grid rows`,
+        `fields/row ${JSON.stringify(measured.fieldsPerRow)}`,
       ].join(' | ')
     console.log(`${String(width).padStart(5)}px  ${status}`)
   }
@@ -214,13 +240,21 @@ try {
     (row.columnsPastDialog ?? []).length > 0 ||
     row.controlsPastDialog > 0 ||
     row.columnTableOverflows === true ||
-    row.bodyOverflows === true
+    row.bodyOverflows === true ||
+    // A wider row than the one above it is an orphan: 3+1 for four fields reads as a fault.
+    (row.fieldsPerRow ?? []).some(count => count < Math.max(...(row.fieldsPerRow ?? [1])))
   ))
   if (broken.length === 0) {
-    console.log('no overflow at any measured width')
+    console.log('no overflow at any measured width, and no width leaves an ORPHAN row of fields')
   } else {
-    console.log(`OVERFLOW at ${broken.length} width(s):`)
-    console.log(JSON.stringify(broken, null, 2))
+    console.log(`OVERFLOW or ORPHAN at ${broken.length} width(s):`)
+    console.log(JSON.stringify(broken.map(row => ({
+      width: row.width,
+      fieldsPerRow: row.fieldsPerRow,
+      dialogPastViewport: row.dialogPastViewport,
+      controlsPastDialog: row.controlsPastDialog,
+      clippedCount: row.clippedCount,
+    })), null, 2))
   }
 } finally {
   try {

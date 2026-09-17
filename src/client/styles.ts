@@ -832,17 +832,27 @@ textarea.dbm-cell-input {
 .dbm-maint-entry .dbm-hint { word-break: break-word; }
 
 /*
- * The table-level fields: label on the LEFT, control on the RIGHT, two per row.
+ * The table-level fields: label on the LEFT, control on the RIGHT, ALL FOUR on one row.
  *
- * Reported: 表名's input was too long and the table-level fields were laid out
- * inconsistently (a full-width input, then labels ABOVE controls in a wrapping flex row).
- * One grid replaces both, so every control is the same width and every label is in the
- * same place. Two columns because the dialog is wide: a single column left long empty
- * stretches beside each control.
+ * Reported before: 表名's input was too long and the fields were laid out inconsistently (a
+ * full-width input, then labels ABOVE controls in a wrapping flex row). One grid replaced both.
+ *
+ * The column count is adaptive rather than fixed at two: asked for as "上面表名等4个放一行",
+ * because a two-column grid left the four fields as two short rows with an empty stretch beside
+ * each control. auto-fit gives four columns at this dialog's own width; the two media queries
+ * below take it down to a balanced 2x2 and then to one column as the window narrows, instead of
+ * letting auto-fit produce an orphan row.
+ *
+ * Each field is still label-left/control-right with a FIXED label track, so the controls inside a
+ * column are the same width and every label starts at the same x.
  */
 .dbm-grid2 {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  /*
+   * 240px is the floor a field may shrink to: the 104px label track, the 8px gap, and ~128px of
+   * control. Below that the collation dropdown cannot show a name like utf8mb4_unicode_ci.
+   */
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
   gap: 8px 20px;
   align-items: center;
   /*
@@ -863,6 +873,11 @@ textarea.dbm-cell-input {
  * different x positions — measured 884 vs 890, a visible misalignment of the very thing
  * that was supposed to line up. One width for every row is what makes the controls
  * align, and it is why the value is a length rather than a fit.
+ *
+ * 104px is set by the LONGEST label in this grid, "整理（排序规则）" — eight characters at
+ * 12px is ~96px, so anything narrower ellipsises the very label the track exists to align.
+ * Nothing narrower is available without shrinking the controls the four-across row already
+ * made tight, which is the trade this width is chosen against.
  */
 .dbm-grid-row {
   display: grid;
@@ -891,9 +906,40 @@ textarea.dbm-cell-input {
 /* The control fills its cell, so widths are uniform rather than content-driven. */
 .dbm-grid-control { width: 100%; min-width: 0; box-sizing: border-box; }
 .dbm-check-group { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-/* A narrow window stacks the pairs: two columns of controls become unusable below this. */
-@media (max-width: 900px) {
+/*
+ * Below the width where four tracks still fit, go straight to TWO columns.
+ *
+ * auto-fit alone produced an ORPHAN row here — measured at a 1000px and 900px viewport, three
+ * fields on one row and the fourth alone below — because 928px of content holds three 240px
+ * tracks but not four. A balanced 2x2 reads as a deliberate grid; 3+1 reads as a mistake.
+ *
+ * The breakpoint is where four tracks stop fitting: the dialog is min(1180px, 96vw), so its content
+ * box reaches 4 x 240 = 960px only from roughly 1040px of viewport. Verified per width afterwards:
+ * 1600px and 1200px give 4 across, 1000px and 900px give 2x2, 800px and 600px stay 2x2.
+ */
+@media (max-width: 1040px) {
+  .dbm-grid2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+/*
+ * One column once two get too narrow to hold a 104px label AND a readable control.
+ *
+ * At a 560px viewport two columns leave each control ~110px, which is the point where the
+ * collation dropdown can no longer show a value — the same floor the 240px track encodes.
+ */
+@media (max-width: 620px) {
   .dbm-grid2 { grid-template-columns: minmax(0, 1fr); }
+}
+/*
+ * The rule between the table-level fields and the column list.
+ *
+ * Asked for as "下面加一条线和下面的字段表格隔开": the four fields and the 字段 grid are two
+ * different subjects — the table's own options, then its columns — and without a rule the
+ * 字段 header read as a fifth label of the same block. A plain border-top on an empty div rather
+ * than an hr element, so it uses the theme's border token and takes no default browser styling.
+ */
+.dbm-newtable-sep {
+  border-top: 1px solid var(--dsw-alias-border-l3);
+  margin: 2px 0;
 }
 
 /*

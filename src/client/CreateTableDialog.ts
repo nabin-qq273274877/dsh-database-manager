@@ -1008,9 +1008,10 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
     null,
     /* ---- the table itself ------------------------------------------------ *
      *
-     * One grid: label on the left, control on the right, two fields per row. The dialog
-     * is wide enough for two, and a single column of fields at this width left long empty
-     * stretches beside every control.
+     * One grid: label on the left, control on the right, all four fields on one row at this
+     * dialog's width. The column count is adaptive (see `.dbm-grid2`) rather than fixed, so the
+     * fields reflow to three, two then one as the window narrows instead of sitting in two
+     * short rows with empty stretches beside them.
      */
     React.createElement(
       'div',
@@ -1132,6 +1133,15 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
           )
         : null,
     ),
+
+    /*
+     * The rule that separates the table's own options from its column list.
+     *
+     * The two are different subjects — "which table is this" then "what is in it" — and without
+     * the rule the 字段 header read as a fifth field label of the block above. Asked for as
+     * "下面加一条线和下面的字段表格隔开".
+     */
+    React.createElement('div', { className: 'dbm-newtable-sep' }),
 
     /* ---- the columns ---- */
     React.createElement(

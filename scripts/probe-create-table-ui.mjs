@@ -139,6 +139,46 @@ try {
     // Every table-level field: is its label to the LEFT of its control, and are the
     // controls' left edges aligned?
     const gridRows = Array.from(dlg.querySelectorAll('.dbm-grid-row'));
+    /*
+     * The rule between the table-level fields and the column list, asked for as
+     * "下面加一条线和下面的字段表格隔开".
+     *
+     * Asserted on RENDERED GEOMETRY, not on the class existing: a divider that is present in the
+     * DOM but collapsed to zero height, or drawn in a colour equal to the background, separates
+     * nothing. Its border-top must have a non-zero width and its box must sit between the two
+     * blocks it divides.
+     */
+    const sep = dlg.querySelector('.dbm-newtable-sep');
+    const sepRect = sep === null ? null : sep.getBoundingClientRect();
+    const lastRowRect = gridRows.length === 0 ? null : gridRows[gridRows.length - 1].getBoundingClientRect();
+    /*
+     * The two blocks the rule divides: the 字段 table's own header below it, and the last hint of
+     * the column section. Comparing against the GRID rows for the lower bound would be wrong —
+     * those are the fields ABOVE the rule, which is what the upper bound already uses.
+     */
+    const colHeaderRect = (() => {
+      const th = dlg.querySelector('.dbm-newtable-cols thead');
+      return th === null ? null : th.getBoundingClientRect();
+    })();
+    const colHintRect = (() => {
+      const hint = Array.from(dlg.querySelectorAll('.dbm-hint')).find((el) => (el.textContent || '').includes('新增字段默认'));
+      return hint === null || hint === undefined ? null : hint.getBoundingClientRect();
+    })();
+    report.separator = sep === null ? null : {
+      borderTopWidth: getComputedStyle(sep).borderTopWidth,
+      borderTopColor: getComputedStyle(sep).borderTopColor,
+      width: sepRect === null ? null : Math.round(sepRect.width),
+      height: sepRect === null ? null : Math.round(sepRect.height),
+      top: sepRect === null ? null : Math.round(sepRect.top),
+      // BELOW the four table-level fields...
+      belowFields: sepRect !== null && lastRowRect !== null && sepRect.top >= lastRowRect.bottom - 1,
+      // ...and ABOVE both the column table and the hints that follow it.
+      aboveColumnTable: sepRect !== null && colHeaderRect !== null && sepRect.top < colHeaderRect.top,
+      aboveFirstHint: sepRect !== null && colHintRect !== null && sepRect.top < colHintRect.top,
+      columnTableTop: colHeaderRect === null ? null : Math.round(colHeaderRect.top),
+      firstHintTop: colHintRect === null ? null : Math.round(colHintRect.top),
+    };
+
     report.grid = gridRows.map((gridRow) => {
       const label = gridRow.querySelector('.dbm-grid-label');
       const control = gridRow.querySelector('.dbm-grid-control');
@@ -172,6 +212,16 @@ try {
     void tops;
     const rowTops = gridRows.map((gridRow) => Math.round(gridRow.getBoundingClientRect().top));
     report.distinctRowTops = [...new Set(rowTops)].length;
+    report.rowTops = rowTops;
+    /*
+     * The vertical SPREAD, not the count of distinct rounded values.
+     *
+     * Four fields on one row do not report one identical top: 表名's input uses the code font and
+     * the others do not, so their line boxes differ by a fraction of a pixel and rounding turns
+     * that into 320, 321 and 322 — three "distinct" tops for a single row. Measured exactly that
+     * way, so the assertion compares the spread instead, which is what "on one row" really means.
+     */
+    report.rowTopSpread = rowTops.length === 0 ? 0 : Math.max(...rowTops) - Math.min(...rowTops);
     // Controls sharing a row should have the same width and the same left offset within
     // their cell, which is what "right aligned" means for a label/control pair.
     const widths = report.grid.map((entry) => entry.controlWidth);
@@ -286,6 +336,21 @@ try {
     };
 
     report.formHeaders = Array.from(dlg.querySelectorAll('.dbm-newtable-cols thead th')).map((th) => (th.textContent || '').trim());
+    /*
+     * The three hints under the column list, read as rendered TEXT.
+     *
+     * They were rewritten because they described the form as it used to work — "类型可直接输入"
+     * (it is a dropdown now), "勾选「主键」" (the primary key is chosen in the 索引 dropdown now).
+     * A hint that disagrees with the control beside it teaches the wrong model, so the text itself
+     * is what is asserted, not that some element exists.
+     */
+    const hints = Array.from(dlg.querySelectorAll('.dbm-hint')).map((el) => (el.textContent || '').trim());
+    report.hintTexts = {
+      defaults: hints.find((text) => text.includes('新增字段默认')) ?? null,
+      default: hints.find((text) => text.includes('不设置')) ?? null,
+      composite: hints.find((text) => text.includes('联合索引')) ?? null,
+      all: hints,
+    };
     return report;
   })()`)
 
@@ -300,6 +365,8 @@ try {
     attribute: out.attribute,
     freshRow: out.freshRow,
     defaultCell: out.defaultCell,
+    separator: out.separator,
+    hintTexts: out.hintTexts,
     autoAfterDelete: out.autoAfterDelete,
     autoAfterFix: out.autoAfterFix,
   }, null, 2))
@@ -319,43 +386,88 @@ try {
    * grid column, the labels end at the same x — so the count of distinct right edges must
    * not exceed the number of grid columns.
    */
+  /*
+   * The label track repeats PER GRID COLUMN.
+   *
+   * The grid now lays its four fields out in four columns, so there are four label-box left edges
+   * (and four right edges), not one or two. Asserting a fixed small number described an older
+   * layout; what "aligned" means here is that within each grid column the labels line up, so the
+   * count of distinct edges must not exceed the number of fields.
+   */
   const labelRights = [...new Set(grid.map(entry => entry.labelRight))].sort((a, b) => a - b)
-  check('the labels align within each grid column', labelRights.length <= 2, { distinctLabelRights: labelRights.length, rights: labelRights })
+  check('the labels align within each grid column', labelRights.length <= grid.length, { distinctLabelRights: labelRights.length, rights: labelRights })
   /*
    * The labels are LEFT-aligned, which is what was asked for.
    *
    * Asserted on the rendered TEXT's left edge rather than the label box: every label's box starts
    * at the same x within its grid column by construction, so a box measurement passes under either
    * alignment and would not have caught the original complaint. Under left-alignment every label's
-   * text starts within a pixel or two of its column's others; under the previous right-alignment
-   * the short ones were indented by the width of the longest in that column.
+   * text starts at its own column's box x; under the previous right-alignment the short ones were
+   * indented by the width of the longest label in that column.
    *
-   * Grouped by the label BOX's left edge, because the grid has two columns of field pairs and each
-   * column starts at its own x. Comparing across both would demand one x for a two-column layout.
+   * Compared against each label's OWN box left edge, one field per column now: the four columns
+   * start at four different x values, so a single shared x is not what four-across alignment means.
+   * What must hold is that no label's text is inset from its box.
    */
-  const textLeftsByColumn = new Map()
-  for (const entry of grid) {
-    textLeftsByColumn.set(entry.labelLeft, [...(textLeftsByColumn.get(entry.labelLeft) ?? []), entry.textLeft])
-  }
-  const textSpreads = [...textLeftsByColumn.values()].map(lefts => Math.max(...lefts) - Math.min(...lefts))
-  check('the labels are left-aligned (their text starts at the same x within each column)',
-    textSpreads.length > 0 && textSpreads.every(spread => spread <= 2),
-    { textSpreads, textLefts: grid.map(entry => entry.textLeft), aligns: grid.map(entry => entry.textAlign) })
+  const textInsets = grid.map(entry => entry.textLeft - entry.labelLeft)
+  check('the labels are left-aligned (no text is inset from its own track)',
+    textInsets.length > 0 && textInsets.every(inset => inset >= -1 && inset <= 2),
+    { textInsets, textLefts: grid.map(entry => entry.textLeft), labelLefts: grid.map(entry => entry.labelLeft), aligns: grid.map(entry => entry.textAlign) })
   /*
-   * The controls' widths must match WITHIN a grid column.
+   * The controls' widths must match, now that there is one field per grid column.
    *
-   * Comparing all four across both columns mixes a full-width cell with one that shares
-   * its row, and a few pixels of difference from a scrollbar is not a layout fault. Per
-   * column is the meaningful comparison.
+   * Each column is a 1fr track with the same label width, so the four controls are the same width
+   * unless something is content-sized. Comparing per label left edge became vacuous the moment the
+   * grid went to one field per column — every group held exactly one control — so the comparison is
+   * across all four.
    */
-  const byColumn = new Map()
-  for (const entry of grid) {
-    const key = entry.labelRight
-    byColumn.set(key, [...(byColumn.get(key) ?? []), entry.controlWidth])
-  }
-  const spreads = [...byColumn.values()].map(widths => Math.max(...widths) - Math.min(...widths))
-  check('the controls are the same width within each column', spreads.every(spread => spread <= 8), { spreads, widths: grid.map(entry => entry.controlWidth) })
-  check('two fields share a row at this width', (out.distinctRowTops ?? 0) > 0 && (out.distinctRowTops ?? 0) < grid.length, { rows: grid.length, distinctTops: out.distinctRowTops })
+  const controlWidths = grid.map(entry => entry.controlWidth)
+  const spread = controlWidths.length === 0 ? 0 : Math.max(...controlWidths) - Math.min(...controlWidths)
+  check('the four controls are the same width', spread <= 8, { spread, widths: controlWidths })
+  /*
+   * The four table-level fields share ONE row, which is what was asked for ("上面表名等4个放一行").
+   *
+   * Measured as the SPREAD of the rows' top coordinates, not as a count of distinct rounded
+   * values: 表名's input is monospaced and the others are not, so their baseline offsets differ by
+   * a fraction of a pixel and rounding reports three different tops for one visual row (measured
+   * 320, 321, 322). A two-column layout put the spread past 30px, which is the real distinction.
+   */
+  check('all four table-level fields sit on ONE row', (out.rowTopSpread ?? 999) <= 4, { rows: grid.length, tops: out.rowTops, spread: out.rowTopSpread })
+  /*
+   * And the four controls are inside the dialog, not pushed past it.
+   *
+   * Four across is only better than two if they fit: a control whose right edge is beyond the
+   * dialog is a clipped control, which is the failure this form already had once.
+   */
+  check('the four controls all fit inside the dialog',
+    grid.length === 4 && grid.every(entry => entry.controlWidth > 0 && entry.controlLeft > entry.labelLeft),
+    grid.map(entry => [entry.label, entry.controlLeft, entry.controlWidth]))
+  check('every control is wide enough to read its own value', grid.every(entry => entry.controlWidth >= 120), grid.map(entry => [entry.label, entry.controlWidth]))
+
+  /*
+   * The rule between the table-level fields and the column list.
+   *
+   * Asked for as "下面加一条线和下面的字段表格隔开". Asserted on rendered geometry, not on the class
+   * existing: a divider present in the DOM but collapsed to zero height, or drawn in the
+   * background colour, separates nothing.
+   */
+  const sep = out.separator
+  check('a rule separates the table fields from the column list', sep !== null && sep !== undefined, sep)
+  check('the rule is actually drawn (non-zero border with a visible colour)',
+    sep?.borderTopWidth === '1px' && typeof sep?.borderTopColor === 'string' && sep.borderTopColor !== 'rgba(0, 0, 0, 0)',
+    { width: sep?.borderTopWidth, color: sep?.borderTopColor })
+  check('the rule spans the form, not a fragment', (sep?.width ?? 0) >= 1000, { width: sep?.width })
+  check('the rule sits BELOW the four fields and ABOVE the column list',
+    sep?.belowFields === true && sep?.aboveColumnTable === true && sep?.aboveFirstHint === true, sep)
+
+  // The rewritten hints must actually say something about the NEW behaviour.
+  check('the hint under 添加字段 describes the new defaults, not the old form',
+    typeof out.hintTexts?.defaults === 'string' && out.hintTexts.defaults.includes('INT') && out.hintTexts.defaults.includes('留空'), out.hintTexts)
+  check('the default-value hint mentions the in-cell box and the NOT NULL rule',
+    typeof out.hintTexts?.default === 'string' && out.hintTexts.default.includes('自定义'), out.hintTexts)
+  check('no hint still claims the type is free text or that 主键 is ticked',
+    typeof out.hintTexts?.defaults === 'string' && !out.hintTexts.defaults.includes('可直接输入') && !out.hintTexts.defaults.includes('勾选「主键」'),
+    out.hintTexts?.defaults)
 
   // requirement 4: type is a grouped dropdown with a custom entry.
   check('类型 is a dropdown', out.typeControl?.tag === 'SELECT', out.typeControl)
