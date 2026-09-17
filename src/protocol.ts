@@ -320,6 +320,30 @@ export interface ImportResponse {
   skipped: Array<{ line: number; fields: number }>
 }
 
+/**
+ * A table-maintenance operation.
+ *
+ * Mirrors the driver's list; kept here too because the browser names it and the
+ * labels live in the locale files.
+ */
+export type MaintenanceOpView = 'check' | 'optimize' | 'repair' | 'analyze'
+
+/** Every maintenance operation, in the order phpMyAdmin lists them. */
+export const MAINTENANCE_OPS_VIEW: readonly MaintenanceOpView[] = ['check', 'optimize', 'repair', 'analyze']
+
+/** One table's maintenance outcome. */
+export interface MaintenanceOutcome {
+  op: MaintenanceOpView
+  ok: boolean
+  /** The engine's own message lines, verbatim. */
+  messages: string[]
+  /** Which table this outcome belongs to, so many can be shown in one report. */
+  table: string
+}
+
+/** One database-level operation. */
+export type DatabaseOpView = 'create' | 'drop' | 'rename' | 'copy' | 'charset'
+
 /** A table-level schema-change request. */
 export interface SchemaChangePayload {
   schema?: string
@@ -675,8 +699,7 @@ export const DB_API_BASE = '/api/dsh-database' as const
 
 /** Route paths the browser half calls (shared literals). */
 export const DB_API = {
-  sources: DB_API_BASE + '/sources',
-  test: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/test`,
+  sources: DB_API_BASE + '/sources',  test: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/test`,
   /**
    * Test an UNSAVED payload. Distinct from `test(id)`: nothing is written to the
    * store, so the dialog can verify a connection before the user commits.
@@ -701,6 +724,12 @@ export const DB_API = {
   exportData: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/export`,
   /** Import a SQL dump or a CSV file. */
   importData: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/import`,
+  /** Table maintenance: check / optimize / repair / analyze, on one or many tables. */
+  maintain: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/maintain`,
+  /** What maintenance this engine can actually do (the UI disables the rest). */
+  maintenanceSupport: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/maintenance-support`,
+  /** Database-level operations: create / drop / rename / copy / charset. */
+  databaseOp: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/database`,
   query: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/query`,
   redisInfo: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/info`,
   redisKeys: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/keys?${params}`,

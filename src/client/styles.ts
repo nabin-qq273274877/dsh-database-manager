@@ -589,9 +589,35 @@ export const PANEL_CSS = `
 .dbm-data td.dbm-select-col { z-index: 0; }
 .dbm-data th.dbm-select-col { z-index: 2; }
 /* The row controls: edit / copy / delete, revealed on hover like the tree's. */
-.dbm-data td.dbm-row-actions {
+/*
+ * The actions column is pinned to the RIGHT edge of the viewport.
+ *
+ * The grid scrolls horizontally on a wide table, and the actions sat at the end
+ * of the row — so reaching them meant scrolling all the way right, then losing the
+ * row's identity off the left edge. Pinning the column keeps "which row" and "what
+ * can I do to it" on screen together, which is the same reason the select column
+ * is pinned left.
+ *
+ * 'right: 0' plus a background is what makes a sticky cell work: without an opaque
+ * background the scrolled columns show through it.
+ */
+.dbm-data th.dbm-row-actions, .dbm-data td.dbm-row-actions {
   white-space: nowrap;
   width: 1%;
+  position: sticky;
+  right: 0;
+  background: var(--dsw-alias-bg-base);
+}
+/* The header row's own sticky cells need to sit above the body's. */
+.dbm-data th.dbm-row-actions { z-index: 2; }
+.dbm-data td.dbm-row-actions { z-index: 1; }
+/* A selected row's tint must show through its pinned cells, so they inherit it. */
+.dbm-data tr[data-selected="true"] > td.dbm-row-actions {
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4c8bf5) 14%, var(--dsw-alias-bg-base));
+}
+/* A divider, because the pinned column floats over the columns it covers. */
+.dbm-data td.dbm-row-actions, .dbm-data th.dbm-row-actions {
+  border-left: 1px solid var(--dsw-alias-border-l3);
 }
 .dbm-row-action {
   font: inherit;
@@ -650,6 +676,33 @@ export const PANEL_CSS = `
 /* The cell is a double-click target, which has to be discoverable. */
 .dbm-cell-editable { cursor: text; }
 .dbm-cell-editable:hover { outline: 1px dashed var(--dsw-alias-border-l3); outline-offset: -2px; }
+/*
+ * The in-cell editor is a one-row TEXTAREA (see SqlBrowseTab for why), so its own
+ * chrome has to be taken off for it to sit in a cell like an input did.
+ *
+ * 'resize: vertical' only: the point is a taller view of a long value, and
+ * horizontal resizing inside a table cell would fight the column widths. No
+ * wrapping, so a long value stays one line until the user grows the box.
+ */
+textarea.dbm-cell-input {
+  resize: vertical;
+  white-space: pre;
+  line-height: 1.4;
+  overflow-x: auto;
+  overflow-y: hidden;
+  min-height: 22px;
+  /* The default textarea font is monospace-ish and small; keep the grid's. */
+  font-family: var(--ds-font-family-code);
+  font-size: 12px;
+}
+/*
+ * A grown editor must be able to show its resize handle.
+ *
+ * The cells set 'overflow: hidden' for the ellipsis, which would clip the handle
+ * at the box's bottom-right corner. Scoped with ':has()' so only the cell
+ * actually holding an editor loses its clipping.
+ */
+.dbm-data td:has(> textarea.dbm-cell-input) { overflow: visible; }
 .dbm-cell-saving { opacity: .6; }
 .dbm-cell-failed { color: var(--dsw-alias-label-danger, #d33); font-style: normal; }
 .dbm-null { color: var(--dsw-alias-label-secondary); font-style: italic; }
@@ -690,16 +743,94 @@ export const PANEL_CSS = `
  * a narrow panel, and a horizontal scrollbar inside a table row is worse than a
  * second line.
  */
-.dbm-struct-editor {
+/*
+ * A stacked form field: label above its control, hint below.
+ *
+ * Replaces the one-line arrangement the column and index forms used, which wrapped
+ * at the panel's real width and left the reader unable to pair a label with its box.
+ */
+.dbm-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.dbm-field-label { font-weight: 500; font-size: 12px; }
+.dbm-field > .dbm-input, .dbm-field > .dbm-select { width: 100%; box-sizing: border-box; }
+
+/*
+ * The column picker in the index dialog.
+ *
+ * A bordered, scrollable list in the table's own column order. A checked row shows
+ * its position, because the TICK order is the index's column order — a prefix of
+ * that order is what the index can serve, so the sequence must be visible rather
+ * than implied by which boxes happen to be ticked.
+ */
+.dbm-column-picker {
+  border: 1px solid var(--dsw-alias-border-l3);
+  border-radius: 8px;
+  max-height: 260px;
+  overflow: auto;
+  padding: 6px 8px;
+}
+.dbm-column-picker-row {
   display: flex;
   align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  padding: 6px 8px;
-  background: var(--dsw-alias-interactive-bg-hover);
-  border-radius: 6px;
+  gap: 8px;
+  width: 100%;
+  padding: 3px 2px;
 }
-.dbm-struct-editor .dbm-input, .dbm-struct-editor .dbm-select { min-width: 90px; }
+.dbm-column-order {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  border-radius: 50%;
+  font-size: 11px;
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-secondary);
+}
+/* A checked row marks its position, so the tick order is legible. */
+.dbm-column-picker-row input[type="checkbox"]:checked ~ .dbm-column-order {
+  background: var(--dsw-alias-label-primary);
+  color: var(--dsw-alias-label-primary-inverted);
+}
+
+/*
+ * A separator between groups of batch actions, so "export/empty" and the four
+ * maintenance statements do not read as one undifferentiated run of buttons.
+ */
+.dbm-batch-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--dsw-alias-border-l3);
+  flex: none;
+}
+
+/* The select checkbox column of the table list: narrow and centred. */
+.dbm-table-select-col { width: 30px; text-align: center; }
+/* The table list needs the batch bar's wrap behaviour, since it carries more. */
+.dbm-batch-bar { row-gap: 6px; }
+
+/*
+ * The maintenance report: one block per table, each with its own verdict and the
+ * engine's message lines underneath. Scrollable, because a run can cover many
+ * tables and the dialog must stay usable.
+ */
+.dbm-maint-report {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 45vh;
+  overflow: auto;
+  margin-top: 8px;
+}
+.dbm-maint-entry {
+  border: 1px solid var(--dsw-alias-border-l3);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+.dbm-maint-entry > .dbm-row { gap: 8px; }
+/* A long engine message must wrap rather than widen the dialog. */
+.dbm-maint-entry .dbm-hint { word-break: break-word; }
+
 /* A column that is part of the primary key, called out in the structure table. */
 .dbm-key-note { color: var(--dsw-alias-label-secondary); font-size: 11px; }
 

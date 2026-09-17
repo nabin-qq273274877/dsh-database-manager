@@ -373,8 +373,24 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
               }, t('common.cancel')),
             ],
         React.createElement('span', { className: 'dbm-spacer' }),
-        loading ? React.createElement('span', { className: 'dbm-hint' }, t('common.loading')) : null,
-        React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-sm', disabled: busy, onClick: () => { onReload(); onReloadRows() } }, t('common.refresh')),
+        React.createElement(
+          'button',
+          {
+            type: 'button',
+            className: `dbm-btn dbm-btn-sm${loading ? ' dbm-btn-busy' : ''}`,
+            // Disabled while a READ is running, so a second click cannot stack the
+            // same request. `busy` is a write and is tracked separately: a write
+            // must not disable the refresh control, and a refresh must not look
+            // like a write.
+            disabled: loading,
+            'aria-busy': loading ? 'true' : undefined,
+            'data-dbm-structure-refresh': '',
+            onClick: () => { onReload(); onReloadRows() },
+          },
+          loading
+            ? [React.createElement('span', { key: 'spin', className: 'dbm-spinner' }), t('common.loading')]
+            : t('common.refresh'),
+        ),
       ),
       error === undefined ? null : React.createElement(ErrorBanner, { message: error }),
       editor === undefined
@@ -551,7 +567,17 @@ function ConfirmChange(props: {
   })
 }
 
-/** The inline add / change form for one column. */
+/**
+ * The add / change form for one column.
+ *
+ * A normal vertical form — one labelled field per row — rather than a line of
+ * controls. Laid out inline it wrapped at the panel's real width, at which point
+ * "which label goes with which box" stopped being readable.
+ *
+ * It is a dialog because it has several fields and a commit step: an inline panel
+ * pushes the column table down, and that table is the context you compare the new
+ * column against.
+ */
 function ColumnEditor(props: {
   editor: { mode: 'add' | 'edit'; spec: ColumnSpecPayload; original: string }
   kind: string
@@ -565,88 +591,127 @@ function ColumnEditor(props: {
   const { editor, kind, columns, busy, onChange, onSubmit, onCancel } = props
   const spec = editor.spec
   const options = typeOptions(kind)
-  // `enum()`/`set()` cannot be offered as a fixed list: their members are what the
-  // user has to supply, so the type field is free text and the list is a set of
-  // starting points.
+  // An enum's members are what the user has to supply, so the type list is a set of
+  // starting points and the text field is the authority.
   const inList = options.includes(spec.type)
   const existing = editor.mode === 'edit' ? columns.find(column => column.name === editor.original) : undefined
 
-  return React.createElement(
-    'div',
-    { className: 'dbm-struct-editor' },
-    React.createElement('strong', null, editor.mode === 'add' ? t('structure.newColumn') : t('structure.editColumn', { column: editor.original })),
-    React.createElement('label', { className: 'dbm-hint' }, t('structure.colName')),
-    React.createElement('input', {
-      className: 'dbm-input',
-      value: spec.name,
-      style: { width: 120 },
-      'aria-label': t('structure.colName'),
-      onChange: (event: { target: { value: string } }) => onChange({ ...spec, name: event.target.value }),
-    }),
-    React.createElement('label', { className: 'dbm-hint' }, t('structure.col.type')),
+  /** One labelled field, stacked, with an optional hint under its control. */
+  const field = (key: string, label: string, control: unknown, hint?: string): React.ReactElement =>
     React.createElement(
-      'select',
-      {
-        className: 'dbm-select',
-        value: inList ? spec.type : '__other__',
-        onChange: (event: { target: { value: string } }) => {
-          const value = event.target.value
-          onChange({ ...spec, type: value === '__other__' ? spec.type : value })
+      'div',
+      { className: 'dbm-field', key },
+      React.createElement('label', { className: 'dbm-field-label' }, label),
+      control as never,
+      hint === undefined ? null : React.createElement('div', { className: 'dbm-hint' }, hint),
+    )
+
+  return React.createElement(Modal, {
+    title: editor.mode === 'add' ? t('structure.newColumn') : t('structure.editColumn', { column: editor.original }),
+    onClose: onCancel,
+    footer: [
+      React.createElement('button', { key: 'cancel', type: 'button', className: 'dbm-btn', disabled: busy, onClick: onCancel }, t('common.cancel')),
+      React.createElement(
+        'button',
+        {
+          key: 'ok',
+          type: 'button',
+          className: 'dbm-btn dbm-btn-primary',
+          disabled: busy,
+          'data-dbm-column-submit': '',
+          onClick: onSubmit,
         },
-      },
-      [
-        ...options.map(type => React.createElement('option', { key: type === '' ? '__none__' : type, value: type }, type === '' ? t('common.none') : type)),
-        React.createElement('option', { key: '__other__', value: '__other__' }, t('structure.typeOther')),
-      ],
+        busy ? t('common.loading') : (editor.mode === 'add' ? t('structure.addSubmit') : t('structure.saveSubmit')),
+      ),
+    ],
+    children: React.createElement(
+      'div',
+      null,
+      field('name', t('structure.colName'), React.createElement('input', {
+        className: 'dbm-input',
+        value: spec.name,
+        'aria-label': t('structure.colName'),
+        'data-dbm-column-name': '',
+        onChange: (event: { target: { value: string } }) => onChange({ ...spec, name: event.target.value }),
+      })),
+      /*
+       * The type is a LIST plus a text field, not one or the other.
+       *
+       * The list is a convenience: SQLite accepts any type name, and MySQL has more
+       * than a fixed list can hold (decimal(10,2) unsigned, enum('a','b')). So the
+       * text field is always editable and the list fills it in.
+       */
+      field('type', t('structure.col.type'),
+        React.createElement('select', {
+          className: 'dbm-select',
+          value: inList ? spec.type : '__other__',
+          'aria-label': t('structure.col.type'),
+          onChange: (event: { target: { value: string } }) => {
+            const value = event.target.value
+            onChange({ ...spec, type: value === '__other__' ? spec.type : value })
+          },
+        },
+        [
+          ...options.map(type => React.createElement('option', { key: type === '' ? '__none__' : type, value: type }, type === '' ? t('common.none') : type)),
+          React.createElement('option', { key: '__other__', value: '__other__' }, t('structure.typeOther')),
+        ]),
+      ),
+      field('typeText', t('structure.typeText'), React.createElement('input', {
+        className: 'dbm-input dbm-mono',
+        value: spec.type,
+        placeholder: t('structure.typeOtherPlaceholder'),
+        'aria-label': t('structure.typeText'),
+        spellcheck: false,
+        'data-dbm-column-type': '',
+        onChange: (event: { target: { value: string } }) => onChange({ ...spec, type: event.target.value }),
+      })),
+      field('nullable', t('structure.col.nullable'),
+        React.createElement('label', { className: 'dbm-check' },
+          React.createElement('input', {
+            type: 'checkbox',
+            checked: spec.nullable,
+            // A primary-key column cannot be nullable in either engine, so the
+            // checkbox is disabled where it would mean nothing.
+            disabled: existing?.primaryKeyPosition !== undefined,
+            onChange: (event: { target: { checked: boolean } }) => onChange({ ...spec, nullable: event.target.checked }),
+          }),
+          t('structure.col.nullable')),
+        existing?.primaryKeyPosition === undefined ? undefined : t('structure.nullableKeyHint'),
+      ),
+      field('default', t('structure.col.default'), React.createElement('input', {
+        className: 'dbm-input dbm-mono',
+        value: spec.defaultValue ?? '',
+        placeholder: t('structure.defaultPlaceholder'),
+        'aria-label': t('structure.col.default'),
+        spellcheck: false,
+        onChange: (event: { target: { value: string } }) => onChange({ ...spec, defaultValue: event.target.value }),
+      })),
+      field('comment', t('structure.col.comment'), React.createElement('input', {
+        className: 'dbm-input',
+        value: spec.comment ?? '',
+        placeholder: t('structure.commentPlaceholder'),
+        'aria-label': t('structure.col.comment'),
+        onChange: (event: { target: { value: string } }) => onChange({ ...spec, comment: event.target.value }),
+      })),
+      editor.mode === 'edit' && existing?.generated === true
+        ? React.createElement('div', { className: 'dbm-hint' }, t('structure.generatedHint'))
+        : null,
     ),
-    React.createElement('input', {
-      className: 'dbm-input dbm-mono',
-      value: spec.type,
-      style: { width: 150 },
-      placeholder: t('structure.typeOtherPlaceholder'),
-      'aria-label': t('structure.col.type'),
-      spellcheck: false,
-      onChange: (event: { target: { value: string } }) => onChange({ ...spec, type: event.target.value }),
-    }),
-    React.createElement('label', { className: 'dbm-check' },
-      React.createElement('input', {
-        type: 'checkbox',
-        checked: spec.nullable,
-        // A primary-key column cannot be nullable in either engine, so the
-        // checkbox is offered only where it means something.
-        disabled: existing?.primaryKeyPosition !== undefined,
-        onChange: (event: { target: { checked: boolean } }) => onChange({ ...spec, nullable: event.target.checked }),
-      }),
-      t('structure.col.nullable')),
-    React.createElement('label', { className: 'dbm-hint' }, t('structure.col.default')),
-    React.createElement('input', {
-      className: 'dbm-input dbm-mono',
-      value: spec.defaultValue ?? '',
-      style: { width: 130 },
-      placeholder: t('common.none'),
-      'aria-label': t('structure.col.default'),
-      spellcheck: false,
-      onChange: (event: { target: { value: string } }) => onChange({ ...spec, defaultValue: event.target.value }),
-    }),
-    React.createElement('input', {
-      className: 'dbm-input',
-      value: spec.comment ?? '',
-      style: { width: 130 },
-      placeholder: t('structure.col.comment'),
-      'aria-label': t('structure.col.comment'),
-      onChange: (event: { target: { value: string } }) => onChange({ ...spec, comment: event.target.value }),
-    }),
-    editor.mode === 'edit' && existing?.generated === true
-      ? React.createElement('span', { className: 'dbm-hint' }, t('structure.generatedHint'))
-      : null,
-    React.createElement('span', { className: 'dbm-spacer' }),
-    React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-sm dbm-btn-primary', disabled: busy, onClick: onSubmit },
-      editor.mode === 'add' ? t('structure.addSubmit') : t('structure.saveSubmit')),
-    React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-sm', disabled: busy, onClick: onCancel }, t('common.cancel')),
-  )
+  })
 }
 
-/** The index creator's form. */
+/**
+ * The index creator, as a dialog with the table's columns to pick from.
+ *
+ * It was an inline strip BELOW the column table, which put the form and the thing
+ * it describes on opposite sides of the table it was about — and a strip has no
+ * room for the field list, so the columns appeared as one long wrapped line.
+ *
+ * The columns are checkboxes in table order, and the order they are TICKED is the
+ * index's column order: a prefix of that order is what the index can serve, so the
+ * sequence is not something the dialog may normalise away. The tick order is shown
+ * as a leading number so it is visible rather than implied.
+ */
 function IndexCreator(props: {
   form: { name: string; columns: string[]; unique: boolean }
   columns: ColumnInfo[]
@@ -658,47 +723,80 @@ function IndexCreator(props: {
   onError(message: string | undefined): void
 }): React.ReactElement {
   const { form, columns, busy, onChange, onSubmit, onCancel } = props
-  return React.createElement(
-    'div',
-    { className: 'dbm-struct-editor' },
-    React.createElement('strong', null, t('structure.addIndex')),
-    React.createElement('label', { className: 'dbm-hint' }, t('structure.indexName')),
-    React.createElement('input', {
-      className: 'dbm-input',
-      value: form.name,
-      style: { width: 150 },
-      'aria-label': t('structure.indexName'),
-      onChange: (event: { target: { value: string } }) => onChange({ ...form, name: event.target.value }),
-    }),
-    React.createElement('label', { className: 'dbm-check' },
-      React.createElement('input', {
-        type: 'checkbox',
-        checked: form.unique,
-        onChange: (event: { target: { checked: boolean } }) => onChange({ ...form, unique: event.target.checked }),
-      }),
-      t('structure.indexUnique')),
-    React.createElement('span', { className: 'dbm-hint' }, t('structure.indexColumnsHint')),
-    // The columns are ticked IN ORDER, and the tick order is the index's column
-    // order: a prefix of that order is what the index can serve, so the sequence
-    // is not a detail the UI may normalise away.
-    ...columns.map(column => {
-      const at = form.columns.indexOf(column.name)
-      return React.createElement('label', { key: column.name, className: 'dbm-check' },
+  return React.createElement(Modal, {
+    title: t('structure.addIndex'),
+    onClose: onCancel,
+    footer: [
+      React.createElement('button', { key: 'cancel', type: 'button', className: 'dbm-btn', disabled: busy, onClick: onCancel }, t('common.cancel')),
+      React.createElement(
+        'button',
+        { key: 'ok', type: 'button', className: 'dbm-btn dbm-btn-primary', disabled: busy, 'data-dbm-index-submit': '', onClick: onSubmit },
+        busy ? t('common.loading') : t('structure.createIndex'),
+      ),
+    ],
+    children: React.createElement(
+      'div',
+      null,
+      React.createElement(
+        'div',
+        { className: 'dbm-field' },
+        React.createElement('label', { className: 'dbm-field-label' }, t('structure.indexName')),
         React.createElement('input', {
-          type: 'checkbox',
-          checked: at !== -1,
-          onChange: (event: { target: { checked: boolean } }) => {
-            const next = form.columns.filter(name => name !== column.name)
-            if (event.target.checked) next.push(column.name)
-            onChange({ ...form, columns: next })
-          },
+          className: 'dbm-input',
+          value: form.name,
+          'aria-label': t('structure.indexName'),
+          'data-dbm-index-name': '',
+          onChange: (event: { target: { value: string } }) => onChange({ ...form, name: event.target.value }),
         }),
-        at === -1 ? column.name : `${at + 1}. ${column.name}`)
-    }),
-    React.createElement('span', { className: 'dbm-spacer' }),
-    React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-sm dbm-btn-primary', disabled: busy, onClick: onSubmit }, t('structure.createIndex')),
-    React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-sm', disabled: busy, onClick: onCancel }, t('common.cancel')),
-  )
+      ),
+      React.createElement(
+        'div',
+        { className: 'dbm-field' },
+        React.createElement('label', { className: 'dbm-field-label' }, t('structure.indexColumns')),
+        React.createElement(
+          'div',
+          { className: 'dbm-column-picker' },
+          ...columns.map((column, position) => {
+            const at = form.columns.indexOf(column.name)
+            return React.createElement(
+              'label',
+              { key: column.name, className: 'dbm-check dbm-column-picker-row' },
+              React.createElement('input', {
+                type: 'checkbox',
+                checked: at !== -1,
+                'data-dbm-index-column': column.name,
+                onChange: (event: { target: { checked: boolean } }) => {
+                  const next = form.columns.filter(name => name !== column.name)
+                  if (event.target.checked) next.push(column.name)
+                  onChange({ ...form, columns: next })
+                },
+              }),
+              React.createElement('span', { className: 'dbm-column-order' }, at === -1 ? '' : String(at + 1)),
+              React.createElement('span', { className: 'dbm-mono' }, column.name),
+              React.createElement('span', { className: 'dbm-hint' }, column.type === '' ? '' : column.type),
+              void position,
+            )
+          }),
+        ),
+        React.createElement('div', { className: 'dbm-hint' }, t('structure.indexColumnsHint')),
+      ),
+      React.createElement(
+        'div',
+        { className: 'dbm-field' },
+        React.createElement('label', { className: 'dbm-check' },
+          React.createElement('input', {
+            type: 'checkbox',
+            checked: form.unique,
+            onChange: (event: { target: { checked: boolean } }) => onChange({ ...form, unique: event.target.checked }),
+          }),
+          t('structure.indexUnique'),
+        ),
+      ),
+      form.columns.length === 0
+        ? null
+        : React.createElement('div', { className: 'dbm-hint' }, `${t('structure.indexOrderPreview')}: ${form.columns.join(', ')}`),
+    ),
+  })
 }
 
 /** The primary-key editor: tick the columns, in the order they should key. */

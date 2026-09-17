@@ -121,6 +121,16 @@ export interface ColumnSpec {
   added?: boolean
 }
 
+/**
+ * Whether a table-maintenance operation actually does anything on InnoDB.
+ *
+ * `repair` is a MyISAM-era statement: on InnoDB the server answers with a NOTE
+ * ("The storage engine for the table doesn't support repair") and reports the table
+ * as OK, so a panel that showed "repaired" would be claiming work that did not
+ * happen. This is why the raw messages travel to the UI.
+ */
+export type MaintenanceNoteKind = 'note' | 'status' | 'error' | 'warning'
+
 /** Options for a table listing. */
 export interface TableListOptions {
   /**
@@ -136,6 +146,62 @@ export interface TableListOptions {
   stats?: boolean
 }
 
+/**
+ * A table-maintenance operation, as phpMyAdmin's 操作 tab offers them.
+ *
+ * The two engines support different subsets, and the panel reports which — see
+ * {@link SqlDriver.maintenanceSupport}. Nothing here is pretended to work: a
+ * `repair` on SQLite is refused with the reason, and MySQL's InnoDB answers
+ * `repair` with a note rather than an error, which is passed through.
+ */
+export type MaintenanceOp = 'check' | 'optimize' | 'repair' | 'analyze'
+
+/** Every maintenance operation, for validation and the UI's list. */
+export const MAINTENANCE_OPS: readonly MaintenanceOp[] = ['check', 'optimize', 'repair', 'analyze']
+
+/** What one maintenance run reported. */
+export interface MaintenanceResult {
+  op: MaintenanceOp
+  /** Whether the engine reported the table as healthy / the operation as a success. */
+  ok: boolean
+  /**
+   * The engine's own message lines.
+   *
+   * Kept verbatim because they carry the information a user acts on: MySQL's
+   * `optimize` says "Table does not support optimize, doing recreate + analyze
+   * instead", and its `repair` on InnoDB says the engine does not support it —
+   * neither is an error, and both explain what actually happened.
+   */
+  messages: string[]
+}
+
+/** One database-level operation. */
+export type DatabaseOp =
+  | 'create'
+  | 'drop'
+  | 'rename'
+  /** Copy the structure and the data into a new database. */
+  | 'copy'
+  /** Change the database's default character set / collation. */
+  | 'charset'
+
+/** Options for {@link SqlDriver.databaseOperation}. */
+export interface DatabaseOperationOptions {
+  /**
+   * The database being operated ON, for the ops that need one.
+   *
+   * `rename` and `copy` have both a source and a target, and `charset` and `drop`
+   * act on an existing database. `create` is the only op with no source.
+   */
+  from?: string
+  /** `charset`: the character set to set as the database default. */
+  charset?: string
+  /** `charset`: the collation, which must belong to the character set. */
+  collate?: string
+  /** `copy`: whether to copy the rows as well as the structure. */
+  includeData?: boolean
+}
+
 /** SQL engine driver. */
 export interface SqlDriver {
   readonly kind: 'sqlite' | 'mysql'
@@ -145,6 +211,23 @@ export interface SqlDriver {
   close(): Promise<void>
   /** Databases/schemas visible to this connection. */
   schemas(): Promise<SchemaInfo[]>
+  /**
+   * Which maintenance operations this engine can actually perform.
+   *
+   * Explicit rather than inferred from a failed statement: the panel disables what
+   * is unsupported and says why, instead of offering a button whose only outcome is
+   * an engine error message.
+   */
+  maintenanceSupport(): MaintenanceOp[]
+  /** Run maintenance on one or more tables. */
+  maintain(schema: string | undefined, tables: string[], op: MaintenanceOp): Promise<MaintenanceResult[]>
+  /**
+   * Run one database-level operation.
+   *
+   * `name` is the target (the new database, or the new name for a rename); `options`
+   * carries the arguments a specific op needs (`charset`, `collate`, `includeData`).
+   */
+  databaseOperation(op: DatabaseOp, name: string, options?: DatabaseOperationOptions): Promise<QueryResult>
   /** Tables and views in one schema. */
   tables(schema?: string, options?: TableListOptions): Promise<TableInfo[]>
   /** Column metadata for one table. */

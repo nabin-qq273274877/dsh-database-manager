@@ -383,15 +383,32 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
           React.createElement(
             'td',
             { key: column.name },
-            React.createElement('input', {
+            /*
+             * A one-line TEXTAREA, not an input.
+             *
+             * A text column can hold far more than a 380px cell shows, and an
+             * `<input>` cannot grow: editing a long value meant seeing a few
+             * characters at a time with no way to widen the view. A textarea
+             * starts at one row and is `resize: vertical`, so the user drags it
+             * taller when the value needs it — which is the only way to give "let
+             * the user size it" without guessing a height in advance.
+             *
+             * Enter still saves (see onKeyDown) rather than inserting a newline:
+             * inside a grid, Enter has always meant "commit this cell", and a
+             * newline in the middle of a value is rare enough that Shift+Enter is
+             * the better trade.
+             */
+            React.createElement('textarea', {
               className: 'dbm-cell-input',
+              rows: 1,
               autoFocus: true,
               value: editing.value,
               'aria-label': column.name,
+              spellcheck: false,
               onChange: (event: { target: { value: string } }) => setEditing({ row: index, column: column.name, value: event.target.value }),
-              onKeyDown: (event: { key: string; preventDefault(): void; currentTarget: { value: string } }) => {
+              onKeyDown: (event: { key: string; preventDefault(): void; currentTarget: { value: string }; shiftKey: boolean }) => {
                 if (event.key === 'Escape') { event.preventDefault(); setEditing(undefined); return }
-                if (event.key === 'Enter') {
+                if (event.key === 'Enter' && !event.shiftKey) {
                   event.preventDefault()
                   void saveCell(index, column.name, event.currentTarget.value)
                 }
@@ -404,10 +421,8 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
                * The handler closes over the state of the render that created it,
                * so a blur arriving before React has committed a keystroke would
                * save the PREVIOUS value — and the unchanged-value guard in
-               * `saveCell` would then skip the write entirely, silently
-               * discarding the edit. Reading the element is immune to that
-               * ordering, which also covers a paste or an IME composition that
-               * ends in the same tick.
+               * `saveCell` would then skip the write entirely, silently discarding
+               * the edit.
                */
               onBlur: (event: { target: { value: string } }) => { void saveCell(index, column.name, event.target.value) },
             }),
@@ -453,8 +468,8 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
             if (first === undefined) return
             setEditing({ row: index, column: first.name, value: row[first.name] === null ? '' : String(row[first.name] ?? '') })
           }, false, canActOnRows ? undefined : t('browse.noPk')),
-          rowAction('copy', t('browse.copy'), () => { void copyValue(row[page?.columns[0]?.name ?? ''] ?? null) }),
-          rowAction('copyRow', '⧉', () => {
+          rowAction('copy', t('browse.copyCell'), () => { void copyValue(row[page?.columns[0]?.name ?? ''] ?? null) }),
+          rowAction('copyRow', t('browse.copyRow'), () => {
             // The whole row as one tab-separated line, which is what pastes into
             // a spreadsheet as a row rather than as a single cell.
             const line = (page?.columns ?? []).map(column => cellText(row[column.name] ?? null)).join('\t')
@@ -462,7 +477,7 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
               if (failure === null) { onNotice(t('browse.copied')); onError(undefined) }
               else onError(t('browse.copyFailed', { error: failure }))
             })
-          }, false, t('browse.copy')),
+          }, false, t('browse.copyRow')),
           rowAction('delete', t('browse.deleteRow'), () => {
             if (keys === undefined) { onError(t('browse.noPk')); return }
             setConfirming({ kind: 'row', keys: [keys] })

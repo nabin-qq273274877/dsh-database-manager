@@ -11,7 +11,7 @@
  * loop for its duration is acceptable, and it keeps transactions correct.
  */
 
-import { existsSync, mkdirSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { expandHome } from '../dsh-home.ts'
 import type { ColumnInfo, DataSourceEntry, IndexInfo, QueryResult, SchemaInfo, TableInfo, TablePage, TestResult } from '../protocol.ts'
@@ -29,7 +29,18 @@ import {
   setPrimaryKey,
   splitTopLevel,
 } from '../sql-schema.ts'
-import type { ColumnSpec, RowKey, RowQuery, RowValue, SqlDriver, TableListOptions } from './types.ts'
+import type {
+  ColumnSpec,
+  DatabaseOp,
+  DatabaseOperationOptions,
+  MaintenanceOp,
+  MaintenanceResult,
+  RowKey,
+  RowQuery,
+  RowValue,
+  SqlDriver,
+  TableListOptions,
+} from './types.ts'
 
 /** Suffix of the temporary table a rebuild builds alongside the original. */
 const REBUILD_SUFFIX = '__dbm_rebuild'
@@ -163,6 +174,152 @@ export class SqliteDriver implements SqlDriver {
   }
 
   async close(): Promise<void> {
+    const db = this.db
+    this.db = undefined
+    if (db === undefined) return
+    try {
+      db.close()
+    } catch {
+      /* already closed */
+    }
+  }
+
+  /**
+   * Which maintenance operations SQLite supports.
+   *
+   * Measured:
+   *   - `check`    → `PRAGMA integrity_check` (the whole file, not one table);
+   *   - `optimize` → `VACUUM`, which compacts the file;
+   *   - `analyze`  → `ANALYZE`, which fills `sqlite_stat1` — this is what makes row
+   *                  counts appear in the table list, so it is worth offering;
+   *   - `repair`   → NOTHING. SQLite has no `REPAIR` statement. It is absent from
+   *                  this list rather than offered as a button that can only fail.
+   */
+  maintenanceSupport(): MaintenanceOp[] {
+    return ['check', 'optimize', 'analyze']
+  }
+
+  /**
+   * Run maintenance on the database.
+   *
+   * Two honest limitations, both stated rather than hidden:
+   *
+   * 1. **Some operations are per-DATABASE, not per-table.** `integrity_check` and
+   *    `VACUUM` act on the whole file; only `ANALYZE` takes a table name. So a
+   *    requested set of tables returns one result each but the message says the scope
+   *    was the whole database — claiming a per-table repair would be a fiction.
+   * 2. **`VACUUM` cannot run inside a transaction** (measured: "cannot VACUUM from
+   *    within a transaction"), and the pool hands the same connection back, so it is
+   *    issued on its own rather than through `runScript`.
+   */
+  async maintain(schema: string | undefined, tables: string[], op: MaintenanceOp): Promise<MaintenanceResult[]> {
+    const target = schema === undefined || schema === '' ? 'main' : schema
+    requireIdentifier(target, 'schema name', quoteSqlite)
+    if (tables.length === 0) throw new Error('maintenance needs at least one table')
+    for (const table of tables) requireIdentifier(table, 'table name', quoteSqlite)
+
+    if (op === 'check') {
+      // The thorough form; `quick_check` is faster but skips some checks. This is a
+      // deliberate action on a database the user chose, so thoroughness wins.
+      const rows = await this.run(db => {
+        const raw = db.prepare(`PRAGMA ${quoteSqlite(target)}.integrity_check`).all() as Array<Record<string, unknown>>
+        return raw.map(row => String(Object.values(row)[0] ?? ''))
+      })
+      const ok = rows.length === 1 && rows[0]!.toLowerCase() === 'ok'
+      const messages = ok
+        ? [`${target}: ok（整库检查，非单表）`]
+        : rows.map(line => `${target}: ${line}`)
+      return tables.map(() => ({ op, ok, messages }))
+    }
+
+    if (op === 'optimize') {
+      // Outside a transaction — SQLite refuses `VACUUM` inside one.
+      await this.run(db => { db.exec(`VACUUM ${quoteSqlite(target)}`) })
+      return tables.map(() => ({ op, ok: true, messages: [`${target}: 已重整文件（VACUUM，作用于整库）`] }))
+    }
+
+    if (op === 'analyze') {
+      // Per table IS supported here, so each requested table is analysed on its own.
+      const results: MaintenanceResult[] = []
+      for (const table of tables) {
+        await this.run(db => { db.exec(`ANALYZE ${quoteSqlite(target)}.${quoteSqlite(table)}`) })
+        results.push({ op, ok: true, messages: [`${table}: 已更新统计信息（ANALYZE）`] })
+      }
+      return results
+    }
+
+    throw new Error(
+      `SQLite 不支持 ${op}：它没有 REPAIR 语句。表损坏时的做法是从备份恢复、或把数据导出后重建；可先用「检查」确认损坏范围。`,
+    )
+  }
+
+  /**
+   * Run one database-level operation.
+   *
+   * A SQLite "database" is a FILE, so the MySQL forms (CREATE / ALTER / DROP
+   * DATABASE) have no equivalent and are not pretended:
+   *
+   *   - `create` — creates the file by opening it, which is what `DatabaseSync` does;
+   *     a file with no tables is a valid empty database.
+   *   - `drop`   — deletes the file together with its `-wal` and `-shm` siblings.
+   *     Leaving those behind would make a "deleted" database reappear.
+   *   - `rename` — renames the file, after closing the handle: renaming a file another
+   *     handle has open is not portable, and the pool would hand back a connection to
+   *     the old path.
+   *   - `copy`   — `VACUUM INTO`, which produces a consistent COMPACTED copy rather
+   *     than a byte clone that may have unmerged WAL pages.
+   *   - `charset` — refused with the reason: SQLite is UTF-8 (or UTF-16 if compiled
+   *     that way) for the file's whole lifetime, fixed at creation.
+   */
+  async databaseOperation(op: DatabaseOp, name: string, options: DatabaseOperationOptions = {}): Promise<QueryResult> {
+    const started = Date.now()
+    void options
+    const file = this.entry.file
+    if (file === undefined || file.trim() === '') throw new Error('this SQLite data source has no file configured')
+    if (file === ':memory:') throw new Error('an in-memory SQLite database has no file to operate on')
+
+    if (op === 'charset') {
+      throw new Error(
+        'SQLite 没有可修改的库编码：整个库固定为 UTF-8（或编译期选定的 UTF-16），PRAGMA encoding 在库创建时确定后不可更改。',
+      )
+    }
+
+    if (op === 'create') {
+      // Opening the path creates it. The panel adds a data source pointed at the new
+      // file, so this is the useful form: make the file exist and be a valid database.
+      await this.open()
+      return { columns: [], rows: [], affected: 1, durationMs: Date.now() - started, write: true, truncated: false }
+    }
+
+    const sourcePath = resolveSqliteFile(file)
+
+    if (op === 'copy') {
+      const targetPath = resolveSqliteFile(name)
+      if (existsSync(targetPath)) throw new Error(`目标文件已存在：${targetPath}`)
+      this.closeHandle()
+      await this.run(db => { db.exec(`VACUUM INTO ${sqliteStringLiteral(targetPath)}`) })
+      return { columns: [], rows: [], affected: 1, durationMs: Date.now() - started, write: true, truncated: false }
+    }
+
+    if (op === 'rename') {
+      const targetPath = resolveSqliteFile(name)
+      if (existsSync(targetPath)) throw new Error(`目标文件已存在：${targetPath}`)
+      this.closeHandle()
+      renameWithSiblings(sourcePath, targetPath)
+      return { columns: [], rows: [], affected: 1, durationMs: Date.now() - started, write: true, truncated: false }
+    }
+
+    if (op === 'drop') {
+      this.closeHandle()
+      dropWithSiblings(sourcePath)
+      return { columns: [], rows: [], affected: 1, durationMs: Date.now() - started, write: true, truncated: false }
+    }
+
+    throw new Error(`unsupported database operation: ${op}`)
+  }
+
+  /** Close and forget the open handle, so a file operation can proceed. */
+  private closeHandle(): void {
     const db = this.db
     this.db = undefined
     if (db === undefined) return
@@ -1253,4 +1410,58 @@ export function ensureSqliteParent(file: string): void {
   const path = resolveSqliteFile(file)
   if (path === ':memory:') return
   mkdirSync(dirname(path), { recursive: true })
+}
+
+/**
+ * A SQLite string literal for a path.
+ *
+ * Paths cannot be parameter-bound in a `VACUUM INTO` (it takes a literal), so the
+ * quoting is done here: single quotes doubled, and a backslash is fine as-is because
+ * `VACUUM INTO`'s argument is an SQL string literal with no escape processing beyond
+ * the doubled quote. A path is normalised to forward slashes first — a Windows
+ * backslash inside a SQL literal is not wrong, but it is one escaping rule fewer to
+ * rely on.
+ */
+function sqliteStringLiteral(path: string): string {
+  const normalized = path.replace(/\\/g, '/')
+  if (/[\u0000-\u001f]/.test(normalized)) throw new Error('a database path cannot contain a control character')
+  return `'${normalized.replace(/'/g, "''")}'`
+}
+
+/** The `-wal` and `-shm` files SQLite keeps beside a database in WAL mode. */
+function sqliteSiblings(path: string): string[] {
+  return [`${path}-wal`, `${path}-shm`]
+}
+
+/**
+ * Rename a database file, taking its WAL siblings along.
+ *
+ * Without the siblings the renamed database would lose committed transactions that
+ * are still in the `-wal` file, and the ORIGINAL path would keep a `-wal` that no
+ * database claims.
+ */
+function renameWithSiblings(from: string, to: string): void {
+  renameSync(from, to)
+  for (const [index, sibling] of sqliteSiblings(from).entries()) {
+    if (!existsSync(sibling)) continue
+    try {
+      renameSync(sibling, sqliteSiblings(to)[index]!)
+    } catch {
+      // Best effort: a `-shm` file can be locked, and the database itself is already
+      // moved. Reporting the whole rename as failed would be wrong.
+    }
+  }
+}
+
+/** Delete a database file and its WAL siblings. */
+function dropWithSiblings(path: string): void {
+  for (const target of [path, ...sqliteSiblings(path)]) {
+    try {
+      rmSync(target, { force: true })
+    } catch (error) {
+      // A locked file means the delete did not happen, which the caller must know:
+      // silently reporting success would leave the database in place.
+      throw new Error(`无法删除 ${target}：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
 }

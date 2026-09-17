@@ -39,6 +39,9 @@ import {
   type ExportResponse,
   type ImportPayload,
   type ImportResponse,
+  type MaintenanceOpView,
+  type MaintenanceOutcome,
+  type DatabaseOpView,
 } from '../protocol.ts'
 
 /** Error carrying the route's JSON error message. */
@@ -265,6 +268,30 @@ export class DbApi {
   /** Import a SQL dump or a CSV file. */
   async importData(id: string, body: ImportPayload): Promise<ImportResponse> {
     return (await send<{ result: ImportResponse }>(DB_API.importData(id), 'POST', body)).result
+  }
+
+  /** Which table-maintenance operations this engine can actually perform. */
+  async maintenanceSupport(id: string): Promise<MaintenanceOpView[]> {
+    return (await readJson<{ support: MaintenanceOpView[] }>(await fetch(DB_API.maintenanceSupport(id)))).support
+  }
+
+  /** Run table maintenance on one or many tables. */
+  async maintain(id: string, body: { schema?: string; tables: string[]; op: MaintenanceOpView }): Promise<MaintenanceOutcome[]> {
+    return (await send<{ results: MaintenanceOutcome[] }>(DB_API.maintain(id), 'POST', body)).results
+  }
+
+  /** Run one database-level operation (create / drop / rename / copy / charset). */
+  async databaseOperation(id: string, body: {
+    op: DatabaseOpView
+    /** The new / target database name. */
+    name: string
+    /** The existing database, for rename and copy. */
+    from?: string
+    charset?: string
+    collate?: string
+    includeData?: boolean
+  }): Promise<QueryResult> {
+    return (await send<{ result: QueryResult }>(DB_API.databaseOp(id), 'POST', body)).result
   }
 
   /** Insert one row. */

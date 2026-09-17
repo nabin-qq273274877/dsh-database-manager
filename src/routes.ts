@@ -34,7 +34,8 @@ import type {
 } from './protocol.ts'
 import { REDIS_CREATABLE_TYPES } from './protocol.ts'
 import type { ColumnSpec, RowFilter, RowFilterOperator } from './drivers/types.ts'
-import { ROW_FILTER_OPERATORS } from './drivers/types.ts'
+import { MAINTENANCE_OPS, ROW_FILTER_OPERATORS } from './drivers/types.ts'
+import type { DatabaseOperationOptions, MaintenanceOp } from './drivers/types.ts'
 import { isRedisDriver, isSqlDriver, type Driver, type SqlDriver } from './drivers/types.ts'
 import { isRedisReadCommand } from './drivers/redis.ts'
 import type { IndexRegistry } from './index-registry.ts'
@@ -77,6 +78,14 @@ const DEFAULT_KEY_COUNT = 200
  * at once" and not a limit a normal interaction meets.
  */
 const MAX_BATCH_ROWS = 5000
+/**
+ * Cap on tables one maintenance request may name.
+ *
+ * A select-all over a table list is bounded by how many tables a database has, so
+ * this is a guard against a pathological schema rather than a limit a normal
+ * selection meets.
+ */
+const MAX_BATCH_TABLES = 500
 /**
  * Body cap for an import request.
  *
@@ -847,6 +856,97 @@ export function makeRoutes(deps: RoutesDeps): { routes: WebRoute[]; upgrade: Web
         const change = parsed.change
         const result = await applySchemaChange(driver, change)
         writeJson(res, 200, { result })
+        return
+      }
+
+      // ---- table maintenance (the 表列表 的批量操作) -------------------------
+      // Same user surface as the other write routes: the click is the
+      // authorization. The engine's own message lines are returned verbatim,
+      // because they carry what actually happened (MySQL's `repair` on InnoDB says
+      // the engine does not support it, which is not an error and is worth seeing).
+      if (action === 'maintenance-support' && method === 'GET') {
+        if (!isSqlDriver(driver)) {
+          writeError(res, 400, 'maintenance-support is only available for SQL data sources')
+          return
+        }
+        writeJson(res, 200, { support: driver.maintenanceSupport() })
+        return
+      }
+
+      if (action === 'maintain' && method === 'POST') {
+        if (!isSqlDriver(driver)) {
+          writeError(res, 400, 'maintain is only available for SQL data sources')
+          return
+        }
+        const body = asJsonObject(await readJsonBody(req))
+        if (body === undefined) {
+          writeError(res, 400, 'body must be a JSON object')
+          return
+        }
+        const tables = body['tables']
+        if (!Array.isArray(tables) || tables.length === 0 || tables.some(entry => typeof entry !== 'string' || entry === '')) {
+          writeError(res, 400, 'tables must be a non-empty array of table names')
+          return
+        }
+        if (tables.length > MAX_BATCH_TABLES) {
+          writeError(res, 400, `too many tables in one request (max ${MAX_BATCH_TABLES})`)
+          return
+        }
+        const op = body['op']
+        if (typeof op !== 'string' || !(MAINTENANCE_OPS as readonly string[]).includes(op)) {
+          writeError(res, 400, `op must be one of ${MAINTENANCE_OPS.join(', ')}`)
+          return
+        }
+        const schema = typeof body['schema'] === 'string' && body['schema'] !== '' ? body['schema'] : undefined
+        // Refused up front when the engine cannot do it at all, rather than letting
+        // every table fail with the same engine error.
+        const support = driver.maintenanceSupport()
+        if (!support.includes(op as MaintenanceOp)) {
+          writeError(res, 400, `${driver.kind} 不支持 ${op}（可用：${support.join(', ')}）`)
+          return
+        }
+        const results = await driver.maintain(schema, tables as string[], op as MaintenanceOp)
+        // The table name is attached here: the driver returns one outcome per
+        // requested table in order, and pairing them is this layer's job.
+        writeJson(res, 200, { results: results.map((result, index) => ({ ...result, table: tables[index] })) })
+        return
+      }
+
+      // ---- database-level operations --------------------------------------
+      if (action === 'database' && method === 'POST') {
+        if (!isSqlDriver(driver)) {
+          writeError(res, 400, 'database is only available for SQL data sources')
+          return
+        }
+        const body = asJsonObject(await readJsonBody(req))
+        if (body === undefined) {
+          writeError(res, 400, 'body must be a JSON object')
+          return
+        }
+        const op = body['op']
+        if (op !== 'create' && op !== 'drop' && op !== 'rename' && op !== 'copy' && op !== 'charset') {
+          writeError(res, 400, 'op must be one of create, drop, rename, copy, charset')
+          return
+        }
+        const name = typeof body['name'] === 'string' ? body['name'].trim() : ''
+        // `create` needs the new name; the rest need the database they act on, which
+        // `name` carries except for rename/copy where it is the NEW name and `from`
+        // is the existing one.
+        if (name === '' && op !== 'drop' && op !== 'charset') {
+          writeError(res, 400, 'name is required')
+          return
+        }
+        const from = typeof body['from'] === 'string' && body['from'] !== '' ? body['from'] : undefined
+        const options: DatabaseOperationOptions = {
+          ...(from === undefined ? {} : { from }),
+          ...(typeof body['charset'] === 'string' && body['charset'] !== '' ? { charset: body['charset'] } : {}),
+          ...(typeof body['collate'] === 'string' && body['collate'] !== '' ? { collate: body['collate'] } : {}),
+          ...(body['includeData'] === undefined ? {} : { includeData: body['includeData'] === true }),
+        }
+        // A pool entry for the source is now stale when its schema changed shape.
+        // `invalidateSource` is the driver-agnostic way: the next call re-acquires.
+        if (op === 'drop' || op === 'rename') pool.drop(id)
+        writeJson(res, 200, { result: await driver.databaseOperation(op, name, options) })
         return
       }
 

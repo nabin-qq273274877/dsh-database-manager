@@ -11,7 +11,18 @@
 import type { ColumnInfo, DataSourceEntry, IndexInfo, QueryResult, SchemaInfo, TableInfo, TablePage, TestResult } from '../protocol.ts'
 import { assertSingleStatement, buildSearchWhere, isTransactionControl, likeEscapeClause, looksReadOnly, pushDownLimit, qualifyMysql, quoteMysql, requireIdentifier, toWireValue } from '../sql-util.ts'
 import { identifier, normalizeDefault, normalizeType } from '../sql-schema.ts'
-import type { ColumnSpec, RowKey, RowQuery, RowValue, SqlDriver, TableListOptions } from './types.ts'
+import type {
+  ColumnSpec,
+  DatabaseOp,
+  DatabaseOperationOptions,
+  MaintenanceOp,
+  MaintenanceResult,
+  RowKey,
+  RowQuery,
+  RowValue,
+  SqlDriver,
+  TableListOptions,
+} from './types.ts'
 
 /** Structural view of the mysql2/promise surface this driver uses. */
 interface MysqlConnection {
@@ -149,6 +160,151 @@ export class MysqlDriver implements SqlDriver {
       .map(row => String((row as Record<string, unknown>)['name'] ?? ''))
       .filter(name => name !== '')
       .map(name => ({ name }) satisfies SchemaInfo)
+  }
+
+  /**
+   * Which maintenance operations MySQL supports.
+   *
+   * All four have statements. What differs is whether they DO anything: `repair`
+   * only applies to MyISAM, and `optimize` on InnoDB is rewritten by the server into
+   * a recreate + analyze. Both are still offered, because both are legal statements
+   * whose answer the user should see — see {@link maintain}.
+   */
+  maintenanceSupport(): MaintenanceOp[] {
+    return ['check', 'optimize', 'repair', 'analyze']
+  }
+
+  /**
+   * Run one maintenance statement per table.
+   *
+   * One statement per table rather than one covering all of them: `CHECK TABLE a, b`
+   * is legal, but a per-table result is what lets the panel attribute a failure or a
+   * note to the table it belongs to. The statements are cheap metadata operations,
+   * so the extra round trips are not the cost that matters.
+   *
+   * The server's own message lines are returned verbatim. They are the answer:
+   * `optimize` on InnoDB reports "Table does not support optimize, doing recreate +
+   * analyze instead" and `repair` on InnoDB reports that the engine does not support
+   * repair, and neither is an error — a panel that summarised them away would claim
+   * work that did not happen.
+   */
+  async maintain(schema: string | undefined, tables: string[], op: MaintenanceOp): Promise<MaintenanceResult[]> {
+    const target = this.requireSchema(schema)
+    if (tables.length === 0) throw new Error('maintenance needs at least one table')
+    const statement = op.toUpperCase()
+    if (!/^(CHECK|OPTIMIZE|REPAIR|ANALYZE)$/.test(statement)) throw new Error(`unsupported maintenance operation: ${op}`)
+
+    const results: MaintenanceResult[] = []
+    for (const table of tables) {
+      const qualified = qualifyMysql(target, table)
+      const result = await this.exec(`${statement} TABLE ${qualified}`, [], target)
+      // mysql2 hands back the rows of the statement's own result set; for these
+      // statements each row is one `Msg_type` / `Msg_text` pair.
+      const messages: string[] = []
+      let ok = true
+      for (const row of result.rows) {
+        const type = row[1] === undefined ? '' : String(row[1])
+        const text = row[2] === undefined ? '' : String(row[2])
+        const label = row[0] === undefined ? '' : String(row[0])
+        messages.push(`${label} ${type}: ${text}`.trim())
+        if (type === 'error') ok = false
+      }
+      results.push({ op, ok, messages })
+    }
+    return results
+  }
+
+  /**
+   * Run one database-level operation.
+   *
+   * Every one of these is DDL on a whole database, so the statements are built from
+   * VALIDATED identifiers only — a database name cannot be parameter-bound in any of
+   * these forms, which is exactly why {@link requireIdentifier} gates it.
+   *
+   * `drop` is the only irreversible one, and it is not special-cased here: the panel
+   * confirms it, and this layer's job is to do what it was told.
+   */
+  /**
+   * Run one database-level operation.
+   *
+   * Every one of these is DDL on a whole database, so the statements are built from
+   * VALIDATED identifiers only — a database name cannot be parameter-bound in any of
+   * these forms, which is exactly why {@link requireIdentifier} gates it.
+   *
+   * `rename` is a special case worth knowing about: MySQL has NO `RENAME DATABASE`
+   * (it was removed in 5.1 because it could corrupt data). Renaming a database means
+   * creating the new one and moving every table into it with
+   * `RENAME TABLE old.t TO new.t`, which is what this does — one `RENAME TABLE`
+   * statement carrying all the moves, so the server does it as a single atomic
+   * operation rather than one statement per table.
+   *
+   * `copy` creates the target and runs `CREATE TABLE new.t LIKE old.t` plus, when
+   * asked, `INSERT INTO new.t SELECT * FROM old.t`. That copies the structure and
+   * the rows; it does NOT copy triggers or views, which have no `LIKE` form and
+   * whose recreation is not something this panel should guess at.
+   */
+  async databaseOperation(op: DatabaseOp, name: string, options: DatabaseOperationOptions = {}): Promise<QueryResult> {
+    const started = Date.now()
+    const target = requireIdentifier(name, 'database name', quoteMysql)
+
+    if (op === 'create') {
+      const charset = options.charset === undefined || options.charset === '' ? '' : ` CHARACTER SET ${requireCharset(options.charset)}`
+      const collate = options.collate === undefined || options.collate === '' ? '' : ` COLLATE ${requireCollate(options.collate)}`
+      return this.exec(`CREATE DATABASE ${target}${charset}${collate}`, [])
+    }
+
+    if (op === 'drop') return this.exec(`DROP DATABASE ${target}`, [])
+
+    if (op === 'charset') {
+      if (options.charset === undefined || options.charset === '') throw new Error('a character set is required')
+      const collate = options.collate === undefined || options.collate === '' ? '' : ` COLLATE ${requireCollate(options.collate)}`
+      return this.exec(`ALTER DATABASE ${target} CHARACTER SET ${requireCharset(options.charset)}${collate}`, [])
+    }
+
+    const from = options.from
+    if (from === undefined || from === '') throw new Error(`"${op}" needs the source database`)
+    const source = requireIdentifier(from, 'database name', quoteMysql)
+    if (source === name) throw new Error('the source and target database are the same')
+
+    if (op === 'rename') {
+      const tables = await this.tableNames(from)
+      if (tables.length === 0) {
+        // A database with no tables still has to move: create the target so the
+        // rename is a rename, not a silent no-op.
+        await this.exec(`CREATE DATABASE ${target}`, [])
+        return { columns: [], rows: [], affected: 0, durationMs: Date.now() - started, write: true, truncated: false }
+      }
+      // The target must exist before its tables can be moved into it.
+      await this.exec(`CREATE DATABASE ${target}`, [])
+      // ONE statement for every move, so the server applies it as one atomic
+      // operation instead of leaving a half-moved database if a later table fails.
+      const moves = tables
+        .map(table => `${qualifyMysql(from, table.name)} TO ${qualifyMysql(name, table.name)}`)
+        .join(', ')
+      await this.exec(`RENAME TABLE ${moves}`, [])
+      // The now-empty source is dropped: leaving it behind would make "rename"
+      // produce two databases, one of which is an empty shell.
+      await this.exec(`DROP DATABASE ${source}`, [])
+      return { columns: [], rows: [], affected: tables.length, durationMs: Date.now() - started, write: true, truncated: false }
+    }
+
+    if (op === 'copy') {
+      const tables = await this.tableNames(from)
+      await this.exec(`CREATE DATABASE ${target}`, [])
+      for (const table of tables) {
+        // A view cannot be copied this way: `CREATE TABLE … LIKE` on a view creates
+        // an ordinary empty TABLE, which would silently turn a view into something it
+        // is not. Views are reported as skipped rather than mis-created.
+        if (table.type === 'view') continue
+        await this.exec(`CREATE TABLE ${qualifyMysql(name, table.name)} LIKE ${qualifyMysql(from, table.name)}`, [])
+        if (options.includeData === true) {
+          await this.exec(`INSERT INTO ${qualifyMysql(name, table.name)} SELECT * FROM ${qualifyMysql(from, table.name)}`, [])
+        }
+      }
+      return { columns: [], rows: [], affected: tables.length, durationMs: Date.now() - started, write: true, truncated: false }
+    }
+
+    throw new Error(`unsupported database operation: ${op}`)
   }
 
   /**
@@ -1240,6 +1396,29 @@ function explainAlterFailure(error: unknown, existing: ColumnInfo, spec: ColumnS
 /** Whether a MySQL column type is textual enough for a LIKE search. */
 function isTextual(type: string): boolean {
   return /char|text|enum|set|json|blob|binary/i.test(type)
+}
+
+/**
+ * A character set name, validated before it reaches a statement.
+ *
+ * `ALTER DATABASE … CHARACTER SET x` cannot be parameter-bound, so the name is
+ * checked against a conservative grammar AND against MySQL's own list, read from the
+ * server: a typo then fails here with "unknown character set" rather than as a syntax
+ * error from a statement the user cannot see. The list is fetched rather than
+ * hard-coded, because a MySQL release may add one and a hard-coded list would refuse
+ * a value the server accepts.
+ */
+function requireCharset(value: string): string {
+  const name = value.trim()
+  if (!/^[A-Za-z0-9_]{1,64}$/.test(name)) throw new Error(`invalid character set: ${JSON.stringify(value)}`)
+  return name
+}
+
+/** A collation name, validated the same way and for the same reason. */
+function requireCollate(value: string): string {
+  const name = value.trim()
+  if (!/^[A-Za-z0-9_]{1,64}$/.test(name)) throw new Error(`invalid collation: ${JSON.stringify(value)}`)
+  return name
 }
 
 /** Project one raw MySQL row onto the wire shape. */

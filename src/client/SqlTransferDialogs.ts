@@ -31,6 +31,13 @@ export interface ExportDialogProps {
   tableCount: number
   /** Rows the user selected in the grid, when the scope is a selection. */
   selectedKeys?: Array<Array<{ column: string; value: string | number | boolean | null }>>
+  /**
+   * Tables to export, when the caller already knows the set.
+   *
+   * The batch 导出所选 passes the ticked table names. Absent means "whatever the
+   * scope select says" — the whole schema, or the open table.
+   */
+  tables?: string[]
   /** Whether the dialog opened in the rows-only mode the batch bar uses. */
   rowsOnly?: boolean
   onClose(): void
@@ -40,7 +47,7 @@ export interface ExportDialogProps {
 
 /** The 导出 dialog. */
 export function ExportDialog(props: ExportDialogProps): React.ReactElement {
-  const { api, source, schema, table, tableCount, selectedKeys, rowsOnly, onClose, onDone, onError } = props
+  const { api, source, schema, table, tableCount, selectedKeys, tables: presetTables, rowsOnly, onClose, onDone, onError } = props
   const hasTable = table !== undefined && table !== ''
   const hasSelection = selectedKeys !== undefined && selectedKeys.length > 0
   const [format, setFormat] = React.useState<'sql' | 'csv'>(rowsOnly === true ? 'csv' : 'sql')
@@ -64,6 +71,19 @@ export function ExportDialog(props: ExportDialogProps): React.ReactElement {
     if (format === 'csv' && !hasTable) { onError(t('export.csvOneTable')); return }
     setBusy(true)
     try {
+      /*
+       * Which tables to export.
+       *
+       * `presetTables` (the batch 导出所选) wins: it is the set the user ticked, and
+       * re-deriving it from the scope select would export something else. Otherwise a
+       * CSV is always the one open table — a CSV cannot hold more than one — and a SQL
+       * dump follows the scope select.
+       */
+      const chosen = presetTables !== undefined && presetTables.length > 0
+        ? presetTables
+        : format === 'csv'
+          ? (hasTable ? [table!] : [])
+          : scope === 'table' && hasTable ? [table] : []
       const payload = {
         schema,
         includeStructure: format === 'csv' ? false : includeStructure,
@@ -72,9 +92,7 @@ export function ExportDialog(props: ExportDialogProps): React.ReactElement {
         // end, and re-creating it would collide with it.
         drop: scope === 'selected' ? false : drop,
         format,
-        ...(scope === 'schema' || format === 'csv'
-          ? (hasTable ? { tables: [table!] } : {})
-          : hasTable ? { tables: [table] } : {}),
+        ...(chosen.length === 0 ? {} : { tables: chosen }),
       }
       const response = await api.exportData(source.id, payload as never)
       // The browser saves it. A Blob rather than a data: URL: a dump can be
@@ -143,6 +161,9 @@ export function ExportDialog(props: ExportDialogProps): React.ReactElement {
               className: 'dbm-select',
               value: scope,
               'data-dbm-export-scope': '',
+              // A preset set of tables IS the scope, so the select is disabled rather
+              // than offering choices that would be ignored.
+              disabled: presetTables !== undefined && presetTables.length > 0,
               onChange: (event: { target: { value: string } }) => setScope(event.target.value as 'schema' | 'table' | 'selected'),
             },
             [
@@ -151,6 +172,13 @@ export function ExportDialog(props: ExportDialogProps): React.ReactElement {
               hasSelection ? React.createElement('option', { key: 'selected', value: 'selected' }, t('export.scope.selected')) : null,
             ].filter(entry => entry !== null)),
           ),
+      presetTables !== undefined && presetTables.length > 0
+        ? React.createElement(
+            'div',
+            { className: 'dbm-hint dbm-mono', 'data-dbm-export-tables': '', style: { wordBreak: 'break-all' } },
+            `${t('export.scope.chosen', { n: presetTables.length })}: ${presetTables.join('、')}`,
+          )
+        : null,
       row('', React.createElement('label', { className: 'dbm-check' },
         React.createElement('input', {
           type: 'checkbox',
