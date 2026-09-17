@@ -1137,17 +1137,25 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
     /*
      * The rule that separates the table's own options from its column list.
      *
-     * The two are different subjects — "which table is this" then "what is in it" — and without
-     * the rule the 字段 header read as a fifth field label of the block above. Asked for as
+     * The two are different subjects — "which table is this" then "what is in it" — and the rule is
+     * what divides them now that the 字段 heading above the list is gone. Asked for as
      * "下面加一条线和下面的字段表格隔开".
      */
     React.createElement('div', { className: 'dbm-newtable-sep' }),
 
     /* ---- the columns ---- */
+    /*
+     * No 字段 heading above the list.
+     *
+     * There used to be one (`dbm-field-label`), asked to be removed: the table's own fields above
+     * the rule already carry their own labels, and the column table's header row (字段名 / 类型 /
+     * 长度/值 …) names the block better than a heading could — so the heading was a third level of
+     * labelling for the same thing, and the space it took pushed the list down. The rule stays as
+     * the visual divider in its place.
+     */
     React.createElement(
       'div',
       { className: 'dbm-field' },
-      React.createElement('label', { className: 'dbm-field-label' }, t('createTable.columns')),
       React.createElement(
         'div',
         { className: 'dbm-scroll' },

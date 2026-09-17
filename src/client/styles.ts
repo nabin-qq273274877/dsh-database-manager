@@ -936,10 +936,19 @@ textarea.dbm-cell-input {
  * different subjects — the table's own options, then its columns — and without a rule the
  * 字段 header read as a fifth label of the same block. A plain border-top on an empty div rather
  * than an hr element, so it uses the theme's border token and takes no default browser styling.
+ *
+ * The bottom margin is the larger one because the rule now also does the job the removed 字段
+ * heading did — introducing the block below — so it needs air beneath it rather than sitting flush
+ * on the header row. Measured before this: the header started 2px under the rule, which read as the
+ * rule being underlined by the table.
+ *
+ * These margins are what sets the spacing at all: .dbm-modal-body's gap applies only between
+ * its DIRECT children, and this rule is a sibling of .dbm-field inside an inner div — so the gap
+ * contributes nothing here and the value below is the whole distance.
  */
 .dbm-newtable-sep {
   border-top: 1px solid var(--dsw-alias-border-l3);
-  margin: 2px 0;
+  margin: 2px 0 8px;
 }
 
 /*

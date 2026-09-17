@@ -175,6 +175,14 @@ try {
       // ...and ABOVE both the column table and the hints that follow it.
       aboveColumnTable: sepRect !== null && colHeaderRect !== null && sepRect.top < colHeaderRect.top,
       aboveFirstHint: sepRect !== null && colHintRect !== null && sepRect.top < colHintRect.top,
+      /*
+       * The air under the rule, in px.
+       *
+       * The rule took over the removed 字段 heading's job of introducing the block below, so it must
+       * not sit flush on the header row. Measured 2px before the margin was set, which read as the
+       * rule being underlined by the table; the assertion keeps a real gap there.
+       */
+      gapToColumnTable: sepRect !== null && colHeaderRect !== null ? Math.round(colHeaderRect.top - sepRect.bottom) : null,
       columnTableTop: colHeaderRect === null ? null : Math.round(colHeaderRect.top),
       firstHintTop: colHintRect === null ? null : Math.round(colHintRect.top),
     };
@@ -337,6 +345,26 @@ try {
 
     report.formHeaders = Array.from(dlg.querySelectorAll('.dbm-newtable-cols thead th')).map((th) => (th.textContent || '').trim());
     /*
+     * The 字段 heading between the two blocks must be GONE, and the rule must still be there.
+     *
+     * Asked for as "表名表单和字段列表表单中间的「字段」标题去掉". Removing a heading is easy to do
+     * half-way — leaving an empty flex item that still takes vertical space looks the same in the
+     * source and does nothing useful on screen — so the check is that no rendered element inside the
+     * dialog carries the text 字段 as a heading AND that the block above the list is exactly the rule.
+     */
+    report.blockDivider = {
+      // Any .dbm-field-label left in this dialog would be the removed heading.
+      leftoverFieldLabels: Array.from(dlg.querySelectorAll('.dbm-field-label')).map((el) => (el.textContent || '').trim()),
+      // Nothing inside the dialog should read exactly 字段 as a standalone heading.
+      exactFieldHeadings: Array.from(dlg.querySelectorAll('div, span, label, h1, h2, h3, h4'))
+        .filter((el) => (el.textContent || '').trim() === '字段' && el.children.length === 0)
+        .map((el) => el.tagName + '.' + el.className),
+      // The rule is what divides the blocks now, so it must still be present.
+      hasRule: dlg.querySelector('.dbm-newtable-sep') !== null,
+      // The column table's own header row still names the block.
+      firstHeader: (Array.from(dlg.querySelectorAll('.dbm-newtable-cols thead th'))[0] || {}).textContent || null,
+    };
+    /*
      * The three hints under the column list, read as rendered TEXT.
      *
      * They were rewritten because they described the form as it used to work — "类型可直接输入"
@@ -366,6 +394,7 @@ try {
     freshRow: out.freshRow,
     defaultCell: out.defaultCell,
     separator: out.separator,
+    blockDivider: out.blockDivider,
     hintTexts: out.hintTexts,
     autoAfterDelete: out.autoAfterDelete,
     autoAfterFix: out.autoAfterFix,
@@ -459,6 +488,20 @@ try {
   check('the rule spans the form, not a fragment', (sep?.width ?? 0) >= 1000, { width: sep?.width })
   check('the rule sits BELOW the four fields and ABOVE the column list',
     sep?.belowFields === true && sep?.aboveColumnTable === true && sep?.aboveFirstHint === true, sep)
+  check('the rule has breathing room above the column table, not flush against it',
+    (sep?.gapToColumnTable ?? 0) >= 6, { gap: sep?.gapToColumnTable })
+
+  /*
+   * The 字段 heading between the two blocks is gone, and the rule took its place as the divider.
+   *
+   * Asserted three ways because each covers a different half-measure: the heading element removed
+   * but its text still rendered elsewhere, the element hidden with CSS while still occupying space,
+   * and the heading removed together with the rule (leaving the two blocks with no divider at all).
+   */
+  const divider = out.blockDivider ?? {}
+  check('the 字段 heading is gone', (divider.leftoverFieldLabels ?? ['x']).length === 0 && (divider.exactFieldHeadings ?? ['x']).length === 0, divider)
+  check('the divider rule remains, in the heading\'s place', divider.hasRule === true, divider)
+  check('the column table\'s own header still names the block', divider.firstHeader === '字段名', divider)
 
   // The rewritten hints must actually say something about the NEW behaviour.
   check('the hint under 添加字段 describes the new defaults, not the old form',

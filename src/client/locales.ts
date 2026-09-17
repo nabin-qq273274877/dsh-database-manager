@@ -222,7 +222,6 @@ export const zh = {
 
   'createTable.title': '新建表',
   'createTable.tableName': '表名',
-  'createTable.columns': '字段',
   'createTable.columnName': '字段名',
   'createTable.columnNamePlaceholder': '例如 id',
   'createTable.columnType': '类型',
@@ -918,7 +917,6 @@ export const en: Record<DbKey, string> = {
 
   'createTable.title': 'New table',
   'createTable.tableName': 'Table name',
-  'createTable.columns': 'Columns',
   'createTable.columnName': 'Column',
   'createTable.columnNamePlaceholder': 'e.g. id',
   'createTable.columnType': 'Type',
