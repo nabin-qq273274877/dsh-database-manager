@@ -874,8 +874,16 @@ textarea.dbm-cell-input {
 .dbm-grid-label {
   font-weight: 500;
   font-size: 12px;
-  /* Right-aligned so the labels form a column and the controls' left edges line up. */
-  text-align: right;
+  /*
+   * LEFT-aligned, so the labels read as a column of their own and each one starts at the same
+   * x as the 字段 table's header above it. Right-alignment put every label's START at a
+   * different x, which looked ragged next to the left-aligned header and the left-aligned
+   * 字段名 below — reported as "上面的表名、存储引擎等 label 左对齐".
+   *
+   * The track width above stays FIXED, so the controls' left edges still line up: alignment of
+   * the labels was the complaint, not the alignment of the controls.
+   */
+  text-align: left;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -994,16 +1002,23 @@ textarea.dbm-cell-input {
 }
 /* 字段名 类型 长度 排序规则 属性 索引 索引名 允许空 默认值 自增 注释 删除.
  * 类型 is a select now (wider text), 属性 is ONE dropdown instead of four checkboxes
- * (much narrower), and 自增 holds its reason as well as the box. */
+ * (much narrower), and 自增 holds its reason as well as the box.
+ *
+ * 默认值 was widened from 7% to 11%, taken from 属性, 索引名, 允许空 and 注释. The cell used to
+ * hold a dropdown AND a text field side by side, which in a 7% column left both of them a few
+ * pixels wide — reported as "填写值的框框和选择框都挤的看不见了". The cell now holds exactly one
+ * control, and this width is what makes that one control usable: measured at 1182px, the literal
+ * box comes out 90px rather than the 68px an 9% column gave, which is the difference between
+ * being able to read 'abc' and having to scroll a three-character literal. */
 .dbm-newtable-cols th:nth-child(1) { width: 10%; }
 .dbm-newtable-cols th:nth-child(2) { width: 13%; }
 .dbm-newtable-cols th:nth-child(3) { width: 7%; }
 .dbm-newtable-cols th:nth-child(4) { width: 11%; }
-.dbm-newtable-cols th:nth-child(5) { width: 11%; }
+.dbm-newtable-cols th:nth-child(5) { width: 10%; }
 .dbm-newtable-cols th:nth-child(6) { width: 8%; }
-.dbm-newtable-cols th:nth-child(7) { width: 10%; }
-.dbm-newtable-cols th:nth-child(8) { width: 5%; }
-.dbm-newtable-cols th:nth-child(9) { width: 7%; }
+.dbm-newtable-cols th:nth-child(7) { width: 8%; }
+.dbm-newtable-cols th:nth-child(8) { width: 4%; }
+.dbm-newtable-cols th:nth-child(9) { width: 11%; }
 .dbm-newtable-cols th:nth-child(10) { width: 8%; }
 .dbm-newtable-cols th:nth-child(11) { width: 8%; }
 .dbm-newtable-cols th:nth-child(12) { width: 2%; }

@@ -286,11 +286,11 @@ npm run build       # lib/index.js（host）+ lib/client.js（browser）
 | `scripts/probe-create-table-full.mjs` | 完整建表表单端到端（16 项）：以**几何**断言表单列未被截断（头单元格右边缘须在对话框可视区内、表格宽度须装进正文区），并从服务端核对长度、UNSIGNED、注释、联合索引的列顺序与唯一性、表引擎/整理/注释，以及 UNIQUE 确实被强制 |
 | `scripts/probe-create-table-grid.mjs` | 栅格与自定义类型的往返（9 项）：直接量测控件**右边缘**是否逐列对齐（而非由等宽+标签对齐去推断）、「自定义类型」换入/返回不丢输入、栅格列数 |
 | `scripts/probe-create-table-widths.mjs` | **宽度扫描**（520–1600px 共 11 档）：每档检查对话框是否超出视口、表单列是否被截断、控件是否越界、表格是否溢出，以及**控件内容是否被裁剪**（`table-layout: fixed` 下内容会被切掉而表格仍"装得下"，是"显示不全"的另一种形态） |
-| `scripts/probe-create-table-ui.mjs` | 新建表表单的**布局与控件形态**端到端（16 项）：表名框宽度占比、每个字段「左 label 右控件」且控件左边缘对齐（逐列比对，非全表）、类型下拉的分组、属性是下拉且无残留复选框、自增在不可用时给出可见文字 |
+| `scripts/probe-create-table-ui.mjs` | 新建表表单的**布局与控件形态**端到端（26 项）：表名框宽度占比、每个字段「左 label 右控件」且控件左边缘对齐（逐列比对，非全表）、**label 左对齐**（量文字自身左边缘，而非宽度固定的 label 盒）、类型下拉的分组、属性是下拉且无残留复选框、自增在不可用时给出可见文字；以及新增字段行的三项默认值（类型 INT、长度/值留空只留 255 占位、允许空不勾选）与「默认值」选自定义后**单元格换成单个可输入的框**（下拉消失、自动聚焦、↺ 可返回且回到不设置） |
 | `scripts/probe-autoincrement.mjs` | 自增的最小复现：分别记录「初始」「删掉默认字段后」「改为 PRIMARY 后」的 `disabled`、`title` 与**可见提示文字** |
 | `scripts/probe-two-autoincrement.mjs` | 「能选两个自增」的复现与验证：记录第二个复选框是否可点、界面上是否说明了限制、提交后的提示 |
 | `scripts/probe-multi-autoincrement.mjs` | 两引擎「一张表只能有一个自增」的实测（MySQL 的 `can be only one auto column`、SQLite 的 `more than one primary key`） |
-| `scripts/probe-default-dropdown.mjs` | 默认值下拉的四种状态端到端（10 项）：每项回服务端核对**存了什么默认值**，并实测「不设置」与「自定义+留空」在插入省略该列时的区别（NULL vs 空字符串） |
+| `scripts/probe-default-dropdown.mjs` | 默认值下拉的四种状态端到端（10 项）：每项回服务端核对**存了什么默认值**，并实测「不设置」与「自定义+留空」在插入省略该列时的区别（NULL vs 空字符串）。长度需自己填（表单不再预填 255），探针按用户的做法显式写入 |
 | `scripts/probe-default-values.mjs` / `probe-default-value-fixes.mjs` | 默认值的引擎行为探查：逐个输入形式（留空／裸文本／带引号／数字／NULL／CURRENT_TIMESTAMP／非法）在两引擎上的实际结果；`CURRENT_TIMESTAMP` 在时间类型上可用、在其它类型上被 MySQL 拒绝 |
 | `scripts/probe-create-table-capabilities.mjs` / `probe-sqlite-caps.mjs` / `probe-sqlite-traps.mjs` | 建表能力探查：逐条实测两引擎对长度、属性、列排序规则、索引类型、表选项的支持与**静默接受**（SQLite 会接受 `INT UNSIGNED` 并存进类型名而无任何效果） |
 | `scripts/probe-dbop-pane.mjs` | 库操作后右侧面板的状态（重命名/复制后不应停在「正在读取表和统计信息…」） |

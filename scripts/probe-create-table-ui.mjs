@@ -145,10 +145,23 @@ try {
       if (label === null || control === null) return null;
       const lr = label.getBoundingClientRect();
       const cr = control.getBoundingClientRect();
+      /*
+       * Where the label's TEXT starts, not where its box starts.
+       *
+       * The box is a fixed-width track either way, so its geometry says nothing about alignment.
+       * Right-alignment is the thing the request complained about, and it shows up as a short
+       * label ("表名") starting further right than a long one ("整理（排序规则）") — so the check
+       * has to measure the rendered text's own left edge, which a Range gives.
+       */
+      const range = document.createRange();
+      range.selectNodeContents(label);
+      const textLeft = Math.round(range.getBoundingClientRect().left);
       return {
         label: (label.textContent || '').trim(),
         labelLeft: Math.round(lr.left),
         labelRight: Math.round(lr.right),
+        textLeft,
+        textAlign: getComputedStyle(label).textAlign,
         controlLeft: Math.round(cr.left),
         controlWidth: Math.round(cr.width),
         labelIsLeftOfControl: lr.right <= cr.left + 1,
@@ -185,6 +198,63 @@ try {
     };
     // No checkbox attributes should remain.
     report.leftoverAttributeCheckboxes = dlg.querySelectorAll('[data-dbm-newtable-attr]').length;
+
+    /*
+     * ---- the defaults a fresh 添加字段 row must NOT impose -----------------
+     *
+     * Three separate requests, all about the form deciding answers the user did not give:
+     * 长度/值 must not arrive filled with 255, 类型 must arrive as a number (INT) rather than
+     * VARCHAR, and 允许空 must arrive UNCHECKED. Asserted on a freshly added row, because the
+     * complaint is specifically about what 添加字段 produces.
+     */
+    click(dlg.querySelector('[data-dbm-newtable-add]'));
+    await sleep(500);
+    const added = dlg.querySelector('[data-dbm-newtable-colname="1"]') !== null ? 1 : 0;
+    const addedTypeBox = dlg.querySelector('[data-dbm-newtable-coltype="' + added + '"]');
+    const addedLengthBox = dlg.querySelector('[data-dbm-newtable-collength="' + added + '"]');
+    const addedNullableBox = dlg.querySelector('[data-dbm-newtable-nullable="' + added + '"]');
+    report.freshRow = {
+      index: added,
+      rowCount: dlg.querySelectorAll('[data-dbm-newtable-colname]').length,
+      type: addedTypeBox === null ? null : addedTypeBox.value,
+      length: addedLengthBox === null ? null : addedLengthBox.value,
+      lengthPlaceholder: addedLengthBox === null ? null : addedLengthBox.getAttribute('placeholder'),
+      nullable: addedNullableBox === null ? null : addedNullableBox.checked,
+    };
+
+    /*
+     * ---- the 默认值 cell becomes ONE control you can type in --------------
+     *
+     * The cell used to hold the dropdown and the literal box side by side, which in a narrow
+     * column crushed both ("填写值的框框和选择框都挤的看不见了"). Choosing 自定义 must now swap the
+     * cell to a focused text field, and the ↺ button must bring the list back.
+     */
+    const defaultModeBox = dlg.querySelector('[data-dbm-newtable-coldefault-mode="' + added + '"]');
+    const beforeSwap = defaultModeBox === null ? null : defaultModeBox.getBoundingClientRect();
+    report.defaultCell = { beforeWidth: beforeSwap === null ? null : Math.round(beforeSwap.width) };
+    if (defaultModeBox !== null) setSelect(defaultModeBox, 'custom');
+    await sleep(500);
+    const defaultTextBox = dlg.querySelector('[data-dbm-newtable-coldefault-text="' + added + '"]');
+    const defaultBackBox = dlg.querySelector('[data-dbm-newtable-coldefault-list="' + added + '"]');
+    const textRect = defaultTextBox === null ? null : defaultTextBox.getBoundingClientRect();
+    report.defaultCell.afterCustom = {
+      hasTextBox: defaultTextBox !== null,
+      // The select must be GONE, or the cell still carries two controls fighting for the width.
+      selectGone: dlg.querySelector('[data-dbm-newtable-coldefault-mode="' + added + '"]') === null,
+      textWidth: textRect === null ? null : Math.round(textRect.width),
+      // "选择自定义后直接就可以输入": the box must already hold the focus.
+      focused: defaultTextBox !== null && document.activeElement === defaultTextBox,
+      hasBackButton: defaultBackBox !== null,
+    };
+    if (defaultBackBox !== null) defaultBackBox.click();
+    await sleep(500);
+    const backToMode = dlg.querySelector('[data-dbm-newtable-coldefault-mode="' + added + '"]');
+    report.defaultCell.afterBack = {
+      selectBack: backToMode !== null,
+      // Back means 不设置, so no DEFAULT clause is emitted for a cell that reads as "none".
+      value: backToMode === null ? null : backToMode.value,
+      textGone: dlg.querySelector('[data-dbm-newtable-coldefault-text="' + added + '"]') === null,
+    };
 
     // ---- requirement 5: 自增 explains itself visibly ---------------------
     // Delete the default row (add one first, since a lone row cannot be removed).
@@ -228,6 +298,8 @@ try {
     distinctLabelRights: out.distinctLabelRights,
     typeControl: out.typeControl,
     attribute: out.attribute,
+    freshRow: out.freshRow,
+    defaultCell: out.defaultCell,
     autoAfterDelete: out.autoAfterDelete,
     autoAfterFix: out.autoAfterFix,
   }, null, 2))
@@ -249,6 +321,26 @@ try {
    */
   const labelRights = [...new Set(grid.map(entry => entry.labelRight))].sort((a, b) => a - b)
   check('the labels align within each grid column', labelRights.length <= 2, { distinctLabelRights: labelRights.length, rights: labelRights })
+  /*
+   * The labels are LEFT-aligned, which is what was asked for.
+   *
+   * Asserted on the rendered TEXT's left edge rather than the label box: every label's box starts
+   * at the same x within its grid column by construction, so a box measurement passes under either
+   * alignment and would not have caught the original complaint. Under left-alignment every label's
+   * text starts within a pixel or two of its column's others; under the previous right-alignment
+   * the short ones were indented by the width of the longest in that column.
+   *
+   * Grouped by the label BOX's left edge, because the grid has two columns of field pairs and each
+   * column starts at its own x. Comparing across both would demand one x for a two-column layout.
+   */
+  const textLeftsByColumn = new Map()
+  for (const entry of grid) {
+    textLeftsByColumn.set(entry.labelLeft, [...(textLeftsByColumn.get(entry.labelLeft) ?? []), entry.textLeft])
+  }
+  const textSpreads = [...textLeftsByColumn.values()].map(lefts => Math.max(...lefts) - Math.min(...lefts))
+  check('the labels are left-aligned (their text starts at the same x within each column)',
+    textSpreads.length > 0 && textSpreads.every(spread => spread <= 2),
+    { textSpreads, textLefts: grid.map(entry => entry.textLeft), aligns: grid.map(entry => entry.textAlign) })
   /*
    * The controls' widths must match WITHIN a grid column.
    *
@@ -275,6 +367,22 @@ try {
   check('属性 is a dropdown', out.attribute?.tag === 'SELECT', out.attribute)
   check('属性 lists the four attributes', (out.attribute?.options ?? []).filter(option => option.value !== '').length >= 4, out.attribute?.options?.map(option => option.value))
   check('no attribute checkboxes remain', out.leftoverAttributeCheckboxes === 0, { remaining: out.leftoverAttributeCheckboxes })
+
+  // A fresh 添加字段 row imposes NOTHING: type INT, no length, 允许空 unchecked.
+  const fresh = out.freshRow ?? {}
+  check('a new row defaults to a numeric type (INT), not VARCHAR', fresh.type === 'INT', { type: fresh.type })
+  check('a new row has an EMPTY 长度/值, not 255', fresh.length === '', { length: fresh.length, placeholder: fresh.lengthPlaceholder })
+  check('255 stays available as the placeholder hint', fresh.lengthPlaceholder === '255', fresh.lengthPlaceholder)
+  check('a new row does NOT arrive with 允许空 ticked', fresh.nullable === false, { checked: fresh.nullable })
+
+  // 默认值: 自定义 swaps the cell to ONE focused box, and ↺ brings the list back.
+  const cell = out.defaultCell ?? {}
+  const afterCustom = cell.afterCustom ?? {}
+  check('choosing 自定义 replaces the dropdown with a text box', afterCustom.hasTextBox === true && afterCustom.selectGone === true, afterCustom)
+  check('the text box is immediately typable (it holds focus)', afterCustom.focused === true, afterCustom)
+  check('the text box is wide enough to actually type in', (afterCustom.textWidth ?? 0) >= 80, { width: afterCustom.textWidth, beforeWidth: cell.beforeWidth })
+  check('the 默认值 cell offers a way back to the list', afterCustom.hasBackButton === true, afterCustom)
+  check('going back restores the dropdown and means 不设置', cell.afterBack?.selectBack === true && cell.afterBack?.value === 'none' && cell.afterBack?.textGone === true, cell.afterBack)
 
   // requirement 5: 自增 says why, visibly, and stops saying it when it can be used.
   check('自增 after deleting the default row is refused', out.autoAfterDelete?.disabled === true, out.autoAfterDelete)

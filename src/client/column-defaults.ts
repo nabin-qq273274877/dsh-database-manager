@@ -36,10 +36,11 @@ const NO_LENGTH_TYPES = /^(TINYINT|SMALLINT|MEDIUMINT|INT|INTEGER|BIGINT|DATE|TI
 /**
  * Whether a declared type takes a length / values suffix.
  *
- * Used to drop a stale length when the type changes. The form's rows start as VARCHAR with 255
- * filled in, so switching to a type without a character width left `TIMESTAMP(255)` behind —
- * which MySQL refuses with "Invalid default value for 'v'", a message about the DEFAULT that
- * says nothing about the length.
+ * Used to drop a stale length when the type changes. The form's rows now start with an EMPTY
+ * length, but changing a filled-in one still has to be dropped: switching `VARCHAR(255)` to a
+ * type without a character width left `TIMESTAMP(255)` behind — which MySQL refuses with
+ * "Invalid default value for 'v'", a message about the DEFAULT that says nothing about the
+ * length.
  *
  * The temporal types do accept a fractional-seconds precision (`TIMESTAMP(6)`), but that is a
  * different number with a different meaning, so carrying 255 into it is never intended.
@@ -48,6 +49,45 @@ export function takesLength(type: string): boolean {
   const upper = type.trim().toUpperCase()
   if (upper === '') return true
   return !NO_LENGTH_TYPES.test(upper)
+}
+
+/**
+ * Types MySQL REFUSES without parentheses, measured one by one against 8.0.
+ *
+ * The form no longer pre-fills the length with 255 (the value is the user's to type), which
+ * makes this reachable in a way it was not before: pick VARCHAR, type a name, submit — and the
+ * engine answers with
+ *
+ *   You have an error in your SQL syntax; check the manual ... near 'NOT NULL',
+ *
+ * a message that names neither the column nor the missing length. Measured on 8.0:
+ *
+ *   VARCHAR, VARBINARY, ENUM, SET  → syntax error with no parentheses
+ *   CHAR, BINARY, DECIMAL, FLOAT, DOUBLE, INT, BIGINT, TEXT, BLOB,
+ *   TIMESTAMP, DATETIME, BIT       → accepted with no parentheses
+ *
+ * `CHAR` and `BINARY` are the surprising ones: both DEFAULT to 1, so a bare `CHAR` is legal.
+ * Only the four above are genuinely required, and guessing a default for them (`VARCHAR` → 255)
+ * is exactly what the form just stopped doing — so the form asks instead.
+ *
+ * A type that already carries its own parentheses needs nothing: `enum('a','b')` and
+ * `varchar(30)` are complete types, and the driver already ignores a separate length for them
+ * rather than rendering `VARCHAR(30)(255)`.
+ */
+const REQUIRES_PARENS_TYPES = /^(VARCHAR|VARBINARY|ENUM|SET)\b/
+
+/**
+ * Whether a type still needs the user to supply a length or value list.
+ *
+ * @param type - the declared type, which may be free text.
+ * @returns true when the statement would be a syntax error without parentheses.
+ */
+export function requiresLengthOrValues(type: string): boolean {
+  const upper = type.trim().toUpperCase()
+  if (upper === '') return false
+  // A type that carries its own parentheses is already complete.
+  if (upper.includes('(')) return false
+  return REQUIRES_PARENS_TYPES.test(upper)
 }
 
 /**
@@ -127,6 +167,28 @@ export function autoIncrementBlocker(kind: string, column: AutoIncrementInput): 
   if (kind === 'sqlite') return column.type.trim().toUpperCase() === 'INTEGER' ? undefined : 'notInteger'
   if (!NUMERIC_TYPES.test(column.type) && !/\bINTEGER\b/i.test(column.type)) return 'notNumeric'
   return undefined
+}
+
+/**
+ * Whether `DEFAULT NULL` on a NOT NULL column is a combination the engine refuses.
+ *
+ * Measured on MySQL 8.0: `v VARCHAR(50) NOT NULL DEFAULT NULL` is refused with "Invalid default
+ * value for 'v'" — a message that names neither 允许空 nor the fact that the two settings
+ * contradict each other. SQLite ACCEPTS the same DDL (measured; it only fails at INSERT time),
+ * so this is deliberately MySQL-only rather than applied to both.
+ *
+ * This became reachable when 允许空 stopped arriving ticked on a new row: every added column is
+ * NOT NULL until the user says otherwise, so a user who picks 默认值 = NULL without also ticking
+ * 允许空 is asking for two settings that cannot both hold. The form answers with both fields
+ * named, instead of letting the server answer with a message about the DEFAULT alone.
+ *
+ * @param kind - the engine, since the two do not agree.
+ * @param nullable - whether the column accepts NULL (允许空).
+ * @param mode - the chosen default mode.
+ */
+export function nullDefaultNeedsNullable(kind: string, nullable: boolean, mode: DefaultMode): boolean {
+  if (kind === 'sqlite') return false
+  return mode === 'null' && !nullable
 }
 
 /** Attributes that only apply to some types. */

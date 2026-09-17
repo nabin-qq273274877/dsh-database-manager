@@ -132,7 +132,7 @@ try {
      * across submissions only in the sense that it is still mounted, and a leftover value
      * from the previous case would make the next assertion meaningless.
      */
-    const buildTable = async (tableName, mode, text, columnType) => {
+    const buildTable = async (tableName, mode, text, columnType, tickNullable) => {
       // Reopen so each case starts from a clean form.
       if (document.querySelector('[data-dbm-newtable-submit]') === null) {
         click(document.querySelector('[data-dbm-dbop="create-table"]'));
@@ -156,6 +156,35 @@ try {
       const row = 1;
       setInput(fresh.querySelector('[data-dbm-newtable-colname="' + row + '"]'), 'v');
       setSelect(fresh.querySelector('[data-dbm-newtable-coltype="' + row + '"]'), columnType ?? 'VARCHAR');
+      /*
+       * The length must now be TYPED, because the form no longer pre-fills it — and only for a
+       * type that carries one.
+       *
+       * This probe used to rely on the new row arriving as VARCHAR with 255 already in the length
+       * box. That pre-fill was removed on request ("长度/值新增一个条目时不要默认 255"), and a bare
+       * VARCHAR is a MySQL syntax error — so the case failed with "syntax error near 'NOT NULL'"
+       * while the panel was behaving correctly. Setting it here is what the user does.
+       *
+       * The TIMESTAMP case must NOT get one: TIMESTAMP's parentheses hold a fractional-seconds
+       * precision, not a width, and 50 is refused with "Too-big precision 50 specified for 'v'.
+       * Maximum is 6". The very first run of this fix failed exactly there.
+       */
+      const lengthBox = fresh.querySelector('[data-dbm-newtable-collength="' + row + '"]');
+      if (lengthBox !== null && (columnType ?? 'VARCHAR') === 'VARCHAR') setInput(lengthBox, '50');
+      /*
+       * 允许空 is TICKED by default, because these cases are about the DEFAULT and not about
+       * nullability.
+       *
+       * A new column now arrives as NOT NULL (that too was asked for), so leaving the box alone
+       * would make 不设置 produce "Field 'v' doesn't have a default value" rather than the NULL
+       * this probe exists to distinguish from the empty string. Ticking it keeps the two
+       * comparable; the false case deliberately leaves it unticked, because the form is
+       * expected to refuse 默认值 = NULL on a NOT NULL column.
+       */
+      if (tickNullable !== false) {
+        const nullableBox = fresh.querySelector('[data-dbm-newtable-nullable="' + row + '"]');
+        if (nullableBox !== null && !nullableBox.checked) { click(nullableBox); await sleep(300); }
+      }
       /*
        * Re-read the mode dropdown AFTER the type change.
        *
@@ -206,17 +235,26 @@ try {
     report.caseEmpty = await buildTable('t_empty', 'custom', '');
     // Case 3: 自定义 + abc.
     report.caseText = await buildTable('t_text', 'custom', 'abc');
-    // Case 4: NULL.
+    // Case 4: NULL, with 允许空 ticked (which MySQL requires — see the case below).
     report.caseNull = await buildTable('t_null', 'null');
     // Case 5: CURRENT_TIMESTAMP on a TIMESTAMP column.
     report.caseTimestamp = await buildTable('t_ts', 'currentTimestamp', undefined, 'TIMESTAMP');
+    /*
+     * Case 6: 默认值 = NULL with 允许空 UNTICKED, which must be refused BY THE FORM.
+     *
+     * A new column arrives as NOT NULL now, so this combination became easy to reach. MySQL
+     * answers NOT NULL DEFAULT NULL with "Invalid default value for 'v'", naming neither of the
+     * two fields that contradict each other — so the form is expected to answer first, naming both.
+     */
+    report.caseNullNotNull = await buildTable('t_null_nn', 'null', undefined, 'VARCHAR', false);
 
     return report;
   })()`)
 
   for (const failure of flow.failures ?? []) check(`flow: ${failure.name}`, false, failure.detail)
   console.log(JSON.stringify({ dropdown: flow.dropdown, cases: {
-    none: flow.caseNone, empty: flow.caseEmpty, text: flow.caseText, null: flow.caseNull, timestamp: flow.caseTimestamp,
+    none: flow.caseNone, empty: flow.caseEmpty, text: flow.caseText, null: flow.caseNull,
+    timestamp: flow.caseTimestamp, nullNotNull: flow.caseNullNotNull,
   } }, null, 2))
 
   // ---- verify every case against the SERVER ----------------------------
@@ -272,6 +310,18 @@ try {
   const emptyInsert = await insertAndRead('t_empty')
   check('an omitted column with no default inserts NULL', String(noneInsert?.isNull) === '1', noneInsert)
   check('an omitted column with DEFAULT \'\' inserts the empty string', String(emptyInsert?.isNull) === '0' && emptyInsert?.value === '', emptyInsert)
+
+  /*
+   * 默认值 = NULL on a NOT NULL column must be refused by the FORM, naming both fields.
+   *
+   * MySQL's own answer is "Invalid default value for 'v'", which points at the default and says
+   * nothing about 允许空 — so the assertion is that the dialog stayed open with a message that
+   * mentions the nullability, not that the server complained.
+   */
+  const nullNotNull = flow.caseNullNotNull ?? {}
+  check('默认值 = NULL on a NOT NULL column is refused', nullNotNull.closed === false && typeof nullNotNull.error === 'string' && nullNotNull.error.length > 0, nullNotNull)
+  check('the refusal names 允许空 (the field to change), not just the default',
+    typeof nullNotNull.error === 'string' && nullNotNull.error.includes('允许空'), nullNotNull.error)
 } finally {
   try {
     const origin = baseUrl.replace(/\/\?.*$/, '')

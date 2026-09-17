@@ -9,6 +9,9 @@
  *     silently gets the wrong default.
  *   - `takesLength` decides when a length is dropped. Not dropping it produced `TIMESTAMP(255)`,
  *     which MySQL refuses with a message about the DEFAULT — pointing nowhere near the cause.
+ *   - `requiresLengthOrValues` answers the reverse question, which became reachable once the
+ *     length stopped being pre-filled: measured on 8.0, `VARCHAR` with no parentheses is a
+ *     syntax error whose message names neither the column nor the cause.
  *   - `autoIncrementBlocker` is deliberately more permissive than "must be PRIMARY" (measured:
  *     UNIQUE or a plain INDEX is enough on MySQL) and stricter about position.
  *
@@ -21,7 +24,9 @@ import {
   autoIncrementBlocker,
   defaultToWire,
   DEFAULT_MODES,
+  nullDefaultNeedsNullable,
   quoteDefaultLiteral,
+  requiresLengthOrValues,
   supportsCurrentTimestamp,
   takesLength,
 } from '../src/client/column-defaults.ts'
@@ -109,6 +114,43 @@ describe('takesLength: a length belongs to its type, so it must be dropped with 
   })
 })
 
+describe('requiresLengthOrValues: the types MySQL refuses without parentheses', () => {
+  it('requires one for the four types measured to be a syntax error without it', () => {
+    // Measured on 8.0: `CREATE TABLE t (v VARCHAR NOT NULL)` is refused with "syntax error
+    // near 'NOT NULL'", which names neither the column nor the missing length.
+    for (const type of ['VARCHAR', 'VARBINARY', 'ENUM', 'SET']) {
+      expect(requiresLengthOrValues(type)).toBe(true)
+    }
+  })
+
+  it('does NOT require one for the types MySQL accepts bare', () => {
+    /*
+     * CHAR and BINARY are the counter-intuitive ones: both default to 1, measured accepted with
+     * no parentheses. Requiring a length for them would demand input the engine does not need.
+     */
+    for (const type of ['CHAR', 'BINARY', 'DECIMAL', 'NUMERIC', 'FLOAT', 'DOUBLE', 'REAL', 'INT', 'BIGINT', 'TEXT', 'BLOB', 'TIMESTAMP', 'DATETIME', 'BIT']) {
+      expect(requiresLengthOrValues(type)).toBe(false)
+    }
+  })
+
+  it('accepts a type that already carries its own parentheses', () => {
+    // `enum('a','b')` and `varchar(30)` are complete types; a separate length is not wanted.
+    expect(requiresLengthOrValues("enum('a','b')")).toBe(false)
+    expect(requiresLengthOrValues('VARCHAR(30)')).toBe(false)
+    expect(requiresLengthOrValues('varchar(30)')).toBe(false)
+  })
+
+  it('asks for nothing when the type is still empty', () => {
+    // The row is being filled in; the missing type has its own, earlier message.
+    expect(requiresLengthOrValues('')).toBe(false)
+  })
+
+  it('is case-insensitive and tolerant of surrounding space', () => {
+    expect(requiresLengthOrValues('  varchar  ')).toBe(true)
+    expect(requiresLengthOrValues('VarBinary')).toBe(true)
+  })
+})
+
 describe('supportsCurrentTimestamp', () => {
   it('allows the temporal types', () => {
     expect(supportsCurrentTimestamp('TIMESTAMP')).toBe(true)
@@ -120,6 +162,32 @@ describe('supportsCurrentTimestamp', () => {
     for (const type of ['VARCHAR', 'INT', 'TEXT', 'DATE', 'TIME', 'JSON']) {
       expect(supportsCurrentTimestamp(type)).toBe(false)
     }
+  })
+})
+
+describe('nullDefaultNeedsNullable: NOT NULL + DEFAULT NULL, which MySQL refuses', () => {
+  it('flags the combination on MySQL', () => {
+    // Measured on 8.0: `v VARCHAR(50) NOT NULL DEFAULT NULL` → "Invalid default value for 'v'",
+    // a message naming neither 允许空 nor the contradiction.
+    expect(nullDefaultNeedsNullable('mysql', false, 'null')).toBe(true)
+  })
+
+  it('does not flag it when the column accepts NULL', () => {
+    expect(nullDefaultNeedsNullable('mysql', true, 'null')).toBe(false)
+  })
+
+  it('does not flag any other default mode', () => {
+    // `DEFAULT NULL` is the only mode that contradicts NOT NULL; no DEFAULT clause on a NOT NULL
+    // column is perfectly ordinary (the INSERT must supply the value).
+    expect(nullDefaultNeedsNullable('mysql', false, 'none')).toBe(false)
+    expect(nullDefaultNeedsNullable('mysql', false, 'custom')).toBe(false)
+    expect(nullDefaultNeedsNullable('mysql', false, 'currentTimestamp')).toBe(false)
+  })
+
+  it('does not flag it on SQLite, which ACCEPTS the DDL', () => {
+    // Measured: SQLite creates `v TEXT NOT NULL DEFAULT NULL` without complaint and only fails if
+    // a row actually inserts NULL. Refusing it in the form would reject a table SQLite allows.
+    expect(nullDefaultNeedsNullable('sqlite', false, 'null')).toBe(false)
   })
 })
 

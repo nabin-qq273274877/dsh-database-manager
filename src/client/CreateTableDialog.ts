@@ -34,7 +34,7 @@ import type { DbApi } from './api.ts'
  * The rules that do not need React live in `column-defaults.ts` so they can be tested directly.
  * A rule stated twice — once here, once there — is two places to get it wrong.
  */
-import { autoIncrementBlocker, defaultToWire, supportsCurrentTimestamp, takesLength, type DefaultMode } from './column-defaults.ts'
+import { autoIncrementBlocker, defaultToWire, nullDefaultNeedsNullable, requiresLengthOrValues, supportsCurrentTimestamp, takesLength, type DefaultMode } from './column-defaults.ts'
 import { Modal, t } from './ui.ts'
 
 /** The index kinds a single column can be assigned to. */
@@ -136,16 +136,34 @@ const STRING_TYPES = /\b(CHAR|VARCHAR|TEXT|BLOB|BINARY|VARBINARY|ENUM|SET)\b/i
 /** Types that take ON UPDATE CURRENT_TIMESTAMP. */
 const TEMPORAL_TYPES = /\b(TIMESTAMP|DATETIME)\b/i
 
-/** A blank starting row. */
+/**
+ * A blank starting row.
+ *
+ * Every row starts as an integer with NOTHING pre-filled beyond that, which is a change
+ * from the earlier VARCHAR(255)-nullable-already-ticked row. Reported as three separate
+ * complaints about 添加字段: the length arrived as a filled-in 255 so it looked typed by
+ * the user and could not be left out, the type arrived as VARCHAR when a numeric key is
+ * what a new column usually is, and 允许空 arrived TICKED so the form silently asked for
+ * a nullable column. A default that decides three answers for the user is not a default,
+ * it is an unasked-for decision — so nothing is decided here except "a column, for now an
+ * integer", and the placeholder on the length field says 255 is the usual value.
+ */
 let nextRowId = 1
 const blank = (kind: string, first: boolean): DraftColumn => ({
   id: nextRowId++,
   name: first ? 'id' : '',
-  type: first ? (kind === 'sqlite' ? 'INTEGER' : 'INT') : (kind === 'sqlite' ? 'TEXT' : 'VARCHAR'),
-  length: first ? '' : (kind === 'sqlite' ? '' : '255'),
+  /*
+   * SQLite spells the same idea INTEGER. `INT` is also an accepted type name there, but
+   * INTEGER is the affinity it actually acts on (and the only one AUTOINCREMENT works
+   * with), so the suggestion matches the engine rather than the MySQL habit.
+   */
+  type: kind === 'sqlite' ? 'INTEGER' : 'INT',
+  // Empty, NOT '255'. The value is the user's to type; '255' lives in the placeholder.
+  length: '',
   collate: '',
   attributes: [],
-  nullable: !first,
+  // Unchecked: a new column is NOT NULL until the user says otherwise.
+  nullable: false,
   // No default: that is what an empty field produced before, and it is the common case.
   defaultMode: 'none' as const,
   defaultText: '',
@@ -314,6 +332,20 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
           return { error: t('createTable.lengthInvalid', { name: columnName }) }
         }
       }
+      /*
+       * A type MySQL cannot declare without parentheses, with none given.
+       *
+       * This became reachable the moment the length stopped being pre-filled with 255: the form
+       * answers with the column that needs it, instead of letting the server answer with
+       * "syntax error near 'NOT NULL'", which names neither the column nor the cause.
+       *
+       * MySQL only. SQLite accepts a bare `VARCHAR` (it stores the whole thing as the declared
+       * type with no width), and its length field is DISABLED — requiring one there would ask
+       * for something the form does not let the user type.
+       */
+      if (!isSqlite && requiresLengthOrValues(column.type) && column.length.trim() === '') {
+        return { error: t('createTable.lengthRequired', { name: columnName, type: column.type.trim() }) }
+      }
 
       /*
        * The default, as the engine should receive it.
@@ -359,6 +391,22 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
         // without opening the server's own error.
         if (column.indexKind === 'fulltext') return { error: t('createTable.fulltextNeedsText', { name: columnName, type: column.type }) }
         if (column.indexKind === 'spatial') return { error: t('createTable.spatialNeedsGeometry', { name: columnName }) }
+      }
+      /*
+       * 默认值 = NULL together with 允许空 unticked.
+       *
+       * MySQL refuses `v VARCHAR(50) NOT NULL DEFAULT NULL` with "Invalid default value for 'v'",
+       * which names neither of the two fields that contradict each other. This became reachable
+       * once a new column stopped arriving with 允许空 ticked: every added row is NOT NULL until
+       * the user says otherwise, so 默认值 = NULL alone is now an easy mistake to make.
+       *
+       * The EFFECTIVE nullability is what matters, not the checkbox: a key column is forced NOT
+       * NULL further down, so a row that was made nullable and then set as the PRIMARY key would
+       * otherwise pass this check and still emit the statement MySQL refuses.
+       */
+      const effectiveNullable = column.indexKind === 'primary' ? false : column.nullable
+      if (nullDefaultNeedsNullable(kind, effectiveNullable, column.defaultMode)) {
+        return { error: t('createTable.nullDefaultNeedsNullable', { name: columnName }) }
       }
 
       const attributes = isSqlite ? [] : column.attributes
@@ -546,8 +594,9 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
            *
            * A length belongs to the type, and carrying one across is how the form produced
            * `TIMESTAMP(255)` — a statement the server rejects with "Invalid default value for
-           * 'v'", which points at the DEFAULT and says nothing about the length. The row starts
-           * as VARCHAR with 255 pre-filled, so switching it to any non-length type hit this.
+           * 'v'", which points at the DEFAULT and says nothing about the length. Rows no longer
+           * START with 255, but a user who typed one into VARCHAR and then switched the type will
+           * otherwise carry it into a type that cannot hold it.
            */
           patch(column.id, {
             type: value,
@@ -584,7 +633,7 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
    * they cannot have it.
    */
   /**
-   * The 默认值 cell: a dropdown, plus a text field when 自定义 is chosen.
+   * The 默认值 cell: a dropdown, which becomes a text field once 自定义 is chosen.
    *
    * Four states, because they are four different things:
    *   不设置      → no DEFAULT clause at all
@@ -595,9 +644,59 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
    *
    * A plain text field could only express the third and part of the fourth, and left the
    * first three indistinguishable.
+   *
+   * The literal box REPLACES the dropdown rather than sitting beside it. It used to be
+   * appended after it inside a flex cell (`.dbm-type-cell`), and in a 7%-wide column the two
+   * controls squeezed each other down to nothing — reported as "填写值的框框和选择框都挤的看不
+   * 见了". The mode is what decides which control belongs in the cell, so exactly one is
+   * rendered and neither can crush the other; a small ↺ button is the way back to the list,
+   * the same shape the 类型 cell already uses. The swap also focuses the box, which is the
+   * phpMyAdmin behaviour that was asked for ("选择框在选择自定义后直接就可以输入").
    */
   const defaultCell = (column: DraftColumn, index: number): React.ReactElement => {
-    const select = React.createElement(
+    if (column.defaultMode === 'custom') {
+      return React.createElement(
+        'div',
+        { className: 'dbm-type-cell' },
+        React.createElement('input', {
+          className: 'dbm-input dbm-mono',
+          value: column.defaultText,
+          // Empty is a real answer here — it means the empty string — so the placeholder says
+          // so instead of showing a "nothing" hint.
+          placeholder: t('createTable.default.emptyString'),
+          'aria-label': t('createTable.default.text'),
+          'data-dbm-newtable-coldefault-text': String(index),
+          spellcheck: false,
+          // The box mounts when the cell switches to 自定义, so this focuses it once — which
+          // is what makes typing possible straight after picking the entry.
+          autoFocus: true,
+          onChange: (event: { target: { value: string } }) => patch(column.id, { defaultText: event.target.value }),
+        }),
+        React.createElement(
+          'button',
+          {
+            type: 'button',
+            className: 'dbm-btn dbm-btn-sm',
+            title: t('createTable.default.backToList'),
+            'data-dbm-newtable-coldefault-list': String(index),
+            onClick: () => {
+              /*
+               * Back to the list AND back to 不设置.
+               *
+               * The dropdown's meaning IS the mode, so the mode has to move with it: leaving it
+               * at `custom` while showing the list would emit `DEFAULT ''` for a cell that reads
+               * as 不设置 — the one confusion this four-state design exists to prevent. What was
+               * typed stays in `defaultText`, so choosing 自定义 again brings it back.
+               */
+              patch(column.id, { defaultMode: 'none' })
+            },
+          },
+          '↺',
+        ),
+      )
+    }
+
+    return React.createElement(
       'select',
       {
         className: 'dbm-select',
@@ -621,25 +720,6 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
             : `CURRENT_TIMESTAMP（${t('createTable.default.needsTemporal')}）`,
         ),
       ],
-    )
-
-    if (column.defaultMode !== 'custom') return select
-
-    return React.createElement(
-      'div',
-      { className: 'dbm-type-cell' },
-      select,
-      React.createElement('input', {
-        className: 'dbm-input dbm-mono',
-        value: column.defaultText,
-        // Empty is a real answer here — it means the empty string — so the placeholder says
-        // so instead of showing a "nothing" hint.
-        placeholder: t('createTable.default.emptyString'),
-        'aria-label': t('createTable.default.text'),
-        'data-dbm-newtable-coldefault-text': String(index),
-        spellcheck: false,
-        onChange: (event: { target: { value: string } }) => patch(column.id, { defaultText: event.target.value }),
-      }),
     )
   }
 
@@ -722,16 +802,22 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
   const rowFor = (column: DraftColumn, index: number): React.ReactElement => {
     const autoBlocker = autoIncrementBlocker(kind, column)
     // Another column already has 自增. This row's checkbox is disabled so the second one
-    // cannot be ticked at all, and the reason names the column that has it.
+    // cannot be ticked at all.
     const autoHolder = column.autoIncrement ? undefined : autoIncrementTakenBy(columns, column)
     /**
      * The sentence shown when 自增 cannot be used; nothing when it can.
      *
-     * ON SCREEN, not in a title: the reported problem was a checkbox that could not be
-     * ticked and gave no reason, because the reason lived only in a tooltip.
+     * ON SCREEN, not in a title, for the rules the user has to act on: a checkbox that cannot
+     * be ticked and gives no reason in text is a control that looks broken.
+     *
+     * The "another column already has it" case is deliberately NOT one of them. It is
+     * self-evident from the form — one row's box is ticked, this one is not — and the sentence
+     * naming that column sat under every other row of the table, reported as noise to delete.
+     * Its explanation lives in the checkbox's `title` instead: available when asked for, out
+     * of the way when not.
      */
     const autoHint = autoHolder !== undefined
-      ? t('createTable.autoAlreadyTaken', { name: autoHolder.name.trim() === '' ? t('createTable.thisColumn') : autoHolder.name.trim() })
+      ? null
       : autoBlocker === undefined
         ? null
         : autoBlocker === 'notKey'
@@ -766,6 +852,12 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
        */
       React.createElement('td', null, typeCell(column, index)),
       /* 长度/值 */
+      /*
+       * The length is the USER's to type: the field starts EMPTY and 255 is only the
+       * placeholder. It used to arrive pre-filled with 255, which made the value look like
+       * something the form had decided — reported as "长度/值新增一个条目时不要默认 255，让用户
+       * 自己填". A placeholder carries the same hint without putting a value in the payload.
+       */
       React.createElement('td', null, React.createElement('input', {
         className: 'dbm-input dbm-mono',
         value: column.length,
@@ -831,15 +923,28 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
        */
       React.createElement('td', null, defaultCell(column, index)),
       /*
-       * 自增, WITH ITS REASON ON SCREEN.
+       * 自增, WITH ITS REASON ON SCREEN for the rules the user must act on.
        *
-       * The combination the engine cannot express is still refused, but the user is told
-       * what to change instead of facing a control that silently does nothing. That covers
-       * the "another column already has it" case too — the rule the form previously left to
-       * a submit-time error.
+       * The combination the engine cannot express is still refused, but the user is told what
+       * to change instead of facing a control that silently does nothing. "Another column
+       * already has it" is the exception: it is visible in the form itself, so it explains
+       * itself through the checkbox's title rather than a sentence under every row.
        */
       React.createElement('td', { className: 'dbm-auto-cell' },
-        React.createElement('label', { className: 'dbm-check' },
+        /*
+         * The explanation rides on the LABEL, not the checkbox.
+         *
+         * A `disabled` input does not fire mouse events, so its own `title` does not reliably
+         * appear — measured earlier in this form, which is why the reasons were moved to
+         * visible text in the first place. The label is not disabled, so hovering the cell
+         * still answers "why is this box greyed out?" without a sentence under every row.
+         */
+        React.createElement('label', {
+          className: 'dbm-check',
+          title: autoHolder === undefined
+            ? undefined
+            : t('createTable.autoAlreadyTaken', { name: autoHolder.name.trim() === '' ? t('createTable.thisColumn') : autoHolder.name.trim() }),
+        },
           React.createElement('input', {
             type: 'checkbox',
             checked: column.autoIncrement,
@@ -1027,7 +1132,6 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
           )
         : null,
     ),
-    React.createElement('div', { className: 'dbm-hint' }, t('createTable.intoSchema', { schema })),
 
     /* ---- the columns ---- */
     React.createElement(
