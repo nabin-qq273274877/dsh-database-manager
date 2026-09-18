@@ -9,7 +9,7 @@
  */
 
 import type { ColumnInfo, DataSourceEntry, IndexInfo, QueryResult, SchemaInfo, TableInfo, TablePage, TestResult } from '../protocol.ts'
-import { assertSingleStatement, buildSearchWhere, isTransactionControl, likeEscapeClause, looksReadOnly, pushDownLimit, qualifyMysql, quoteMysql, requireIdentifier, toWireValue } from '../sql-util.ts'
+import { assertSingleStatement, buildSearchWhere, groupSameColumns, isTransactionControl, likeEscapeClause, looksReadOnly, pushDownLimit, qualifyMysql, quoteMysql, requireIdentifier, toWireValue } from '../sql-util.ts'
 import { identifier, normalizeDefault, normalizeType } from '../sql-schema.ts'
 import type {
   ColumnSpec,
@@ -738,39 +738,66 @@ export class MysqlDriver implements SqlDriver {
   }
 
   /**
-   * Insert several rows as ONE multi-row statement.
+   * Insert several rows in ONE transaction.
    *
    * MySQL makes this cheap: a single `INSERT … VALUES (…),(…)` is one statement,
    * one round trip and one implicit transaction, so a large CSV import does not
    * pay per-row latency. Rows are chunked, because `max_allowed_packet` caps the
    * statement size and one packet per 500 rows is well inside every default.
    *
-   * Column order is taken from the FIRST row and enforced for the rest: a batch
-   * naming different columns per row cannot be one statement, and filling the
-   * gaps with NULL would be a data-corruption bug rather than an error.
+   * Rows are NOT required to name the same columns. They used to be, and the
+   * 插入 tab's phpMyAdmin-shaped forms are what made that wrong: each form is
+   * filled in independently, so a column left blank in one row and supplied in
+   * another is the ordinary case rather than a mistake. Measured: two such forms
+   * made the batch answer 500 "every row in one insert must name the same
+   * columns, in the same order". Rows that DO agree still share one multi-row
+   * statement — the CSV import's cheap path is unchanged — and only a change of
+   * column list costs another statement.
    */
   async insertRows(schema: string | undefined, table: string, rows: RowValue[][]): Promise<QueryResult> {
     if (rows.length === 0) throw new Error('insert requires at least one row')
     const target = this.requireSchema(schema)
     const qualified = qualifyMysql(target, table)
-    const columns = rows[0]!.map(item => item.column)
-    for (const row of rows) {
-      if (row.length !== columns.length || row.some((item, index) => item.column !== columns[index])) {
-        throw new Error('every row in one insert must name the same columns, in the same order')
+    const started = Date.now()
+    const pool = await this.open()
+    const connection = await pool.getConnection()
+    try {
+      await connection.query({ sql: `USE ${quoteMysql(target)}` })
+      await connection.query({ sql: 'START TRANSACTION' })
+      let affected = 0
+      try {
+        for (const group of groupSameColumns(rows)) {
+          const columns = group[0]!.map(item => item.column)
+          const names = columns.map(name => requireIdentifier(name, 'column name', quoteMysql)).join(', ')
+          const CHUNK = 500
+          for (let at = 0; at < group.length; at += CHUNK) {
+            const chunk = group.slice(at, at + CHUNK)
+            const placeholders = chunk.map(() => `(${columns.map(() => '?').join(', ')})`).join(', ')
+            const params = chunk.flatMap(row => row.map(item => item.value))
+            await connection.query({ sql: `INSERT INTO ${qualified} (${names}) VALUES ${placeholders}`, values: params })
+            affected += chunk.length
+          }
+        }
+        await connection.query({ sql: 'COMMIT' })
+      } catch (error) {
+        try {
+          await connection.query({ sql: 'ROLLBACK' })
+        } catch {
+          /* the transaction is already gone */
+        }
+        throw error
+      }
+      return { columns: [], rows: [], affected, durationMs: Date.now() - started, write: true, truncated: false }
+    } finally {
+      // Same reset-on-release rule as runQuery: a pooled connection must not
+      // carry this statement's session state into the next user's query.
+      try {
+        await connection.query({ sql: 'USE `information_schema`' })
+        connection.release()
+      } catch {
+        /* the pool will drop it */
       }
     }
-    const names = columns.map(name => requireIdentifier(name, 'column name', quoteMysql)).join(', ')
-    const started = Date.now()
-    let affected = 0
-    const CHUNK = 500
-    for (let at = 0; at < rows.length; at += CHUNK) {
-      const chunk = rows.slice(at, at + CHUNK)
-      const placeholders = chunk.map(() => `(${columns.map(() => '?').join(', ')})`).join(', ')
-      const params = chunk.flatMap(row => row.map(item => item.value))
-      const result = await this.runQuery(`INSERT INTO ${qualified} (${names}) VALUES ${placeholders}`, params, 0, target)
-      affected += result.affected
-    }
-    return { columns: [], rows: [], affected, durationMs: Date.now() - started, write: true, truncated: false }
   }
 
   async updateRow(schema: string | undefined, table: string, values: RowValue[], keys: RowKey[]): Promise<QueryResult> {

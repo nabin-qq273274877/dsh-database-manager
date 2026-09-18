@@ -479,19 +479,42 @@ describe('SqliteDriver schema editing', () => {
 
   it('inserts many rows in one transaction', async () => {
     const driver = driverFor('batch-insert.db')
-    await driver.exec('CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)', [])
+    await driver.exec('CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT DEFAULT \'dflt\')', [])
     const result = await driver.insertRows('main', 't', [
       [{ column: 'id', value: 1 }, { column: 'v', value: 'a' }],
       [{ column: 'id', value: 2 }, { column: 'v', value: 'b' }],
     ])
     expect(result.affected).toBe(2)
 
-    // Rows naming different columns cannot be one statement; filling the gaps
-    // with NULL would be a corruption bug rather than an error.
-    await expect(driver.insertRows('main', 't', [
+    /*
+     * Rows naming DIFFERENT columns are accepted, and the omitted column takes its
+     * own default.
+     *
+     * This used to be refused with "every row in one insert must name the same
+     * columns", which the 插入 tab's phpMyAdmin-shaped forms made untenable: each
+     * form is filled in on its own, so leaving a column blank in one row and
+     * supplying it in another is the ordinary case. Filling the gap with NULL
+     * would be the corruption bug; letting the engine apply the DEFAULT is not.
+     */
+    const mixed = await driver.insertRows('main', 't', [
       [{ column: 'id', value: 3 }, { column: 'v', value: 'c' }],
       [{ column: 'id', value: 4 }],
-    ])).rejects.toThrow(/same columns/)
+    ])
+    expect(mixed.affected).toBe(2)
+    const page = await driver.rows({ schema: 'main', table: 't', page: 1, pageSize: 10, mode: 'browse', orderByColumns: ['id'] })
+    expect(page.rows.map(row => `${row['id']}:${row['v']}`)).toEqual(['1:a', '2:b', '3:c', '4:dflt'])
+  })
+
+  it('rolls the whole batch back when one row of it fails', async () => {
+    // The all-or-nothing promise is the reason a batch is one request at all, and
+    // grouping rows by their column list must not weaken it.
+    const driver = driverFor('batch-rollback.db')
+    await driver.exec('CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)', [])
+    await expect(driver.insertRows('main', 't', [
+      [{ column: 'id', value: 1 }, { column: 'v', value: 'a' }],
+      [{ column: 'id', value: 1 }, { column: 'v', value: 'duplicate' }],
+    ])).rejects.toThrow()
+    expect((await driver.rows({ schema: 'main', table: 't', page: 1, pageSize: 10, mode: 'browse' })).rows).toEqual([])
   })
 
   it('sorts by a column list, in the order given', async () => {

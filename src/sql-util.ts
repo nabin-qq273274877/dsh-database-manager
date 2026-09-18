@@ -291,6 +291,43 @@ export function toWireValue(value: unknown): string | number | boolean | null {
   }
 }
 
+/**
+ * Group CONSECUTIVE rows that name the same columns, in the same order.
+ *
+ * Exists because a multi-row `INSERT` requires one column list for all of its
+ * rows, while the rows arriving from the 插入 tab are independent forms and may
+ * therefore name different columns — leaving a column blank in one row and
+ * supplying it in another is the ordinary case there, not a mistake.
+ *
+ * Only CONSECUTIVE equal rows are grouped, so the statements stay in the order
+ * they were given: an AUTO_INCREMENT column must assign ids in the order the
+ * forms were filled in. Grouping every row with an equal column list would
+ * reorder them.
+ *
+ * @param rows - value lists, each naming the columns it supplies.
+ * @param columnsOf - how to read the column names of one row, defaulting to the
+ *   `column` property of each entry.
+ */
+export function groupSameColumns<T>(
+  rows: T[][],
+  columnsOf: (row: T[]) => string[] = row => row.map(item => (item as { column: string }).column),
+): T[][][] {
+  const groups: T[][][] = []
+  let current: T[][] = []
+  let currentKey: string | undefined
+  for (const row of rows) {
+    const key = JSON.stringify(columnsOf(row))
+    if (currentKey !== key) {
+      if (current.length > 0) groups.push(current)
+      current = []
+      currentKey = key
+    }
+    current.push(row)
+  }
+  if (current.length > 0) groups.push(current)
+  return groups
+}
+
 import type { RowFilter } from './protocol.ts'
 export type { RowFilter }
 

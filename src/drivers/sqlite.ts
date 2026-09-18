@@ -15,7 +15,7 @@ import { existsSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { expandHome } from '../dsh-home.ts'
 import type { ColumnInfo, DataSourceEntry, IndexInfo, QueryResult, SchemaInfo, TableInfo, TablePage, TestResult } from '../protocol.ts'
-import { assertSingleStatement, buildSearchWhere, isTransactionControl, likeEscapeClause, looksReadOnly, pushDownLimit, qualifySqlite, quoteSqlite, requireIdentifier, toWireValue } from '../sql-util.ts'
+import { assertSingleStatement, buildSearchWhere, groupSameColumns, isTransactionControl, likeEscapeClause, looksReadOnly, pushDownLimit, qualifySqlite, quoteSqlite, requireIdentifier, toWireValue } from '../sql-util.ts'
 import {
   type ColumnDefinition,
   type TableShape,
@@ -623,30 +623,44 @@ export class SqliteDriver implements SqlDriver {
    * otherwise fsync 10 000 times, and a failure halfway would leave the table
    * holding an unknown prefix of the file with no way to tell how much landed.
    * Either every row is in or none is.
+   *
+   * Rows are NOT required to name the same columns. They used to be, and the
+   * 插入 tab's phpMyAdmin-shaped forms are what made that wrong: each form is
+   * filled in on its own, so leaving a column blank in one row and supplying it in
+   * another is the ordinary case rather than a mistake. Measured: two such forms
+   * made the batch answer 500 "every row in one insert must name the same
+   * columns", which is a refusal of the feature as designed. Each row is therefore
+   * its own statement — the same shape `deleteRows` already uses — and rows that
+   * DO agree still share one multi-row statement, which is the CSV import's cheap
+   * path.
    */
   async insertRows(schema: string | undefined, table: string, rows: RowValue[][]): Promise<QueryResult> {
     if (rows.length === 0) throw new Error('insert requires at least one row')
     const qualified = qualifySqlite(schema, table)
-    // Column order is taken from the FIRST row and enforced for the rest: a
-    // batch that names different columns per row cannot be one statement, and
-    // silently inserting NULLs for the columns a later row omitted would be a
-    // data-corruption bug rather than an error.
-    const columns = rows[0]!.map(item => item.column)
-    for (const row of rows) {
-      if (row.length !== columns.length || row.some((item, index) => item.column !== columns[index])) {
-        throw new Error('every row in one insert must name the same columns, in the same order')
-      }
-    }
-    const names = columns.map(name => requireIdentifier(name, 'column name', quoteSqlite)).join(', ')
-    const placeholders = columns.map(() => '?').join(', ')
-    const sql = `INSERT INTO ${qualified} (${names}) VALUES (${placeholders})`
     const started = Date.now()
     return this.run(db => {
       let affected = 0
       db.exec('BEGIN')
       try {
-        const statement = db.prepare(sql)
-        for (const row of rows) affected += Number(statement.run(...row.map(item => item.value)).changes ?? 0)
+        /**
+         * Consecutive rows naming the same columns, grouped.
+         *
+         * Grouping CONSECUTIVE rows rather than all rows with equal column lists
+         * keeps the statements in the order they were given, so an AUTO_INCREMENT
+         * column assigns ids in the order the forms were filled in.
+         */
+        for (const group of groupSameColumns(rows)) {
+          const names = group[0]!.map(item => requireIdentifier(item.column, 'column name', quoteSqlite)).join(', ')
+          const placeholders = group[0]!.map(() => '?').join(', ')
+          if (group.length === 1) {
+            const statement = db.prepare(`INSERT INTO ${qualified} (${names}) VALUES (${placeholders})`)
+            affected += Number(statement.run(...group[0]!.map(item => item.value)).changes ?? 0)
+            continue
+          }
+          const sql = `INSERT INTO ${qualified} (${names}) VALUES ${group.map(() => `(${placeholders})`).join(', ')}`
+          const statement = db.prepare(sql)
+          affected += Number(statement.run(...group.flatMap(row => row.map(item => item.value))).changes ?? 0)
+        }
         db.exec('COMMIT')
       } catch (error) {
         try {

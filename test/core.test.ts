@@ -11,7 +11,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { DataSourceStore } from '../src/store.ts'
 import { decideCall, DEFAULT_GATE_SETTINGS, isWriteTool, sourceIdOf } from '../src/auth.ts'
-import { assertSingleStatement, isSafeIdentifier, looksReadOnly, pushDownLimit, qualifyMysql, quoteMysql, quoteSqlite, toWireValue } from '../src/sql-util.ts'
+import { assertSingleStatement, groupSameColumns, isSafeIdentifier, looksReadOnly, pushDownLimit, qualifyMysql, quoteMysql, quoteSqlite, toWireValue } from '../src/sql-util.ts'
 import { isRedisReadCommand } from '../src/drivers/redis.ts'
 import { splitCommand } from '../src/client/command.ts'
 
@@ -349,5 +349,53 @@ describe('Redis command-line splitting', () => {
     expect(splitCommand('')).toEqual([])
     expect(splitCommand('   ')).toEqual([])
     expect(splitCommand('""')).toEqual([''])
+  })
+})
+
+describe('groupSameColumns: rows a multi-row INSERT can share', () => {
+  const row = (...names: string[]): Array<{ column: string }> => names.map(name => ({ column: name }))
+
+  it('puts rows with the same column list in one group', () => {
+    const groups = groupSameColumns([row('a', 'b'), row('a', 'b'), row('a', 'b')])
+    expect(groups.length).toBe(1)
+    expect(groups[0]!.length).toBe(3)
+  })
+
+  it('splits where the column list changes', () => {
+    const groups = groupSameColumns([row('a', 'b'), row('a'), row('a', 'b')])
+    expect(groups.map(group => group.length)).toEqual([1, 1, 1])
+  })
+
+  it('groups only CONSECUTIVE equal rows, so the order is preserved', () => {
+    /*
+     * The order is what assigns AUTO_INCREMENT ids, so grouping every row with an
+     * equal column list would reorder the inserts: this input has an 'a'-only row
+     * between two 'a','b' rows, and it must stay in the middle.
+     */
+    const groups = groupSameColumns([row('a', 'b'), row('a'), row('a', 'b')])
+    expect(groups[0]![0]!.map(item => item.column)).toEqual(['a', 'b'])
+    expect(groups[1]![0]!.map(item => item.column)).toEqual(['a'])
+    expect(groups[2]![0]!.map(item => item.column)).toEqual(['a', 'b'])
+  })
+
+  it('distinguishes the same names in a different ORDER', () => {
+    // Column order is part of the statement's shape: (a, b) values and (b, a)
+    // values are different lists even though they name the same columns.
+    const groups = groupSameColumns([row('a', 'b'), row('b', 'a')])
+    expect(groups.length).toBe(2)
+  })
+
+  it('returns nothing for no rows', () => {
+    expect(groupSameColumns([])).toEqual([])
+  })
+
+  it('reads the names through a caller-supplied accessor', () => {
+    // The drivers pass the real row shape, whose column name lives one level down.
+    const groups = groupSameColumns<[{ column: string }]>(
+      [[{ column: 'a' }], [{ column: 'a' }]],
+      entries => entries.map(entry => entry.column),
+    )
+    expect(groups.length).toBe(1)
+    expect(groups[0]!.length).toBe(2)
   })
 })

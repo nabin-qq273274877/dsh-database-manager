@@ -220,7 +220,7 @@ describe.skipIf(!reachable)('MySQL schema editing', () => {
   })
 
   it('deletes several rows atomically and inserts many at once', async () => {
-    await driver!.exec('CREATE TABLE batch(id INT PRIMARY KEY, v VARCHAR(10))', [], DB)
+    await driver!.exec('CREATE TABLE batch(id INT PRIMARY KEY, v VARCHAR(10) DEFAULT \'dflt\')', [], DB)
     await driver!.exec("INSERT INTO batch VALUES (1, 'a'), (2, 'b'), (3, 'c')", [], DB)
 
     const inserted = await driver!.insertRows(DB, 'batch', [
@@ -237,11 +237,27 @@ describe.skipIf(!reachable)('MySQL schema editing', () => {
     const page = await driver!.rows({ schema: DB, table: 'batch', page: 1, pageSize: 10, mode: 'browse', orderByColumns: ['id'] })
     expect(page.rows.map(row => row['id'])).toEqual([2, 3, 4])
 
-    // Rows naming different columns cannot be one statement.
-    await expect(driver!.insertRows(DB, 'batch', [
+    /*
+     * Rows naming DIFFERENT columns are accepted, and the omitted column takes its
+     * own default. Refusing them (as this used to, with "every row in one insert
+     * must name the same columns") made the 插入 tab's independent forms
+     * unusable for more than one row at a time.
+     */
+    const mixed = await driver!.insertRows(DB, 'batch', [
       [{ column: 'id', value: 6 }, { column: 'v', value: 'f' }],
       [{ column: 'id', value: 7 }],
-    ])).rejects.toThrow(/same columns/)
+    ])
+    expect(mixed.affected).toBe(2)
+    const after = await driver!.rows({ schema: DB, table: 'batch', page: 1, pageSize: 10, mode: 'browse', orderByColumns: ['id'] })
+    expect(after.rows.map(row => `${row['id']}:${row['v']}`)).toEqual(['2:b', '3:c', '4:d', '6:f', '7:dflt'])
+
+    // The batch is still all-or-nothing: the duplicate key fails the whole request.
+    await expect(driver!.insertRows(DB, 'batch', [
+      [{ column: 'id', value: 8 }, { column: 'v', value: 'g' }],
+      [{ column: 'id', value: 8 }, { column: 'v', value: 'again' }],
+    ])).rejects.toThrow()
+    const unchanged = await driver!.rows({ schema: DB, table: 'batch', page: 1, pageSize: 10, mode: 'browse', orderByColumns: ['id'] })
+    expect(unchanged.rows.map(row => row['id'])).toEqual([2, 3, 4, 6, 7])
     await driver!.exec('DROP TABLE batch', [], DB)
   })
 
