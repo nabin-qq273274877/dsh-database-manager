@@ -533,6 +533,78 @@ export const PANEL_CSS = `
 .dbm-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .dbm-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
 .dbm-hint { color: var(--dsw-alias-label-secondary); font-size: 12px; }
+
+/*
+ * ---- the insert form (phpMyAdmin-shaped) -------------------------------
+ *
+ * ONE COLUMN PER ROW: the column name in a fixed left track, its control
+ * filling everything to the right. That is the shape phpMyAdmin's insert page
+ * has, and it is what makes a wide table readable — a card grid puts the fields
+ * in an order that depends on the viewport width, so which control follows which
+ * changes when the window is resized.
+ *
+ * The name track is a FIXED length rather than max-content: max-content is
+ * resolved per row, so a short name and a long one would put their controls at
+ * different x positions. One width for every row is what makes the controls line
+ * up as a column, which is the whole reason the two-track layout exists.
+ *
+ * 280px fits the longest realistic name cell on one line: at 240px measured, the
+ * DEFAULT note on "ordered_at · TEXT NOT NULL · 默认：datetime('now')" wrapped to a
+ * second line, making that row twice as tall as its neighbours and reading as a
+ * broken table. The control loses 40px, which the 560px cap above makes free.
+ */
+.dbm-insert-form {
+  border: 1px solid var(--dsw-alias-border-l3);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.dbm-insert-grid {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 6px 12px;
+  align-items: center;
+}
+/*
+ * The name cell: name and type on ONE line, wrapping only when the pair is too
+ * long for the track. No overflow-wrap:anywhere — breaking mid-identifier turns
+ * "ordered_at" into "ordered_" / "at", which is unreadable and which the wider
+ * track above is what avoids.
+ */
+.dbm-insert-name {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0 6px;
+  font-weight: 500;
+  font-size: 12px;
+  min-width: 0;
+}
+.dbm-insert-name > .dbm-hint { font-weight: 400; }
+/*
+ * The control and its tick boxes share the right-hand cell, control first.
+ *
+ * The control is capped rather than stretched: a 1000px-wide text box beside a
+ * 48px label is the shape of a form nobody reads, and the cap is also what keeps
+ * the NULL box near the box it applies to instead of at the far end of the row.
+ * The cap is a max-width, so a narrow panel still shrinks the control with it.
+ */
+.dbm-insert-value { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.dbm-insert-value > .dbm-input,
+.dbm-insert-value > .dbm-select,
+.dbm-insert-value > .dbm-textarea { flex: 1 1 auto; min-width: 0; max-width: 560px; }
+.dbm-insert-value > .dbm-check { flex: none; white-space: nowrap; }
+/*
+ * Below the width where a 240px name track leaves a usable control, the name
+ * goes ABOVE its control instead of beside it. The single track keeps the form
+ * usable on a narrow panel rather than squeezing a date picker into 80px.
+ */
+@media (max-width: 720px) {
+  .dbm-insert-grid { grid-template-columns: minmax(0, 1fr); }
+  .dbm-insert-value { align-items: flex-start; }
+}
 .dbm-error {
   color: var(--dsw-alias-label-danger, #d33);
   background: color-mix(in srgb, currentColor 8%, transparent);

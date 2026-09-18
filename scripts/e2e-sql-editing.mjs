@@ -265,8 +265,46 @@ ${PRELUDE}
     await sleep(200);
     click(byText('.dbm-modal-foot .dbm-btn', '保存') || byText('.dbm-modal-foot .dbm-btn', 'Save'));
 
-    const listed = await waitFor(() => byIncludes('.dbm-table td', ${JSON.stringify(SOURCE_NAME)}), 10000);
-    if (!listed) { fail('the created source is not listed'); return JSON.stringify(report, null, 2); }
+    /*
+     * Wait for the save to appear in the list, and RECORD how long it took.
+     *
+     * This was a 10s wait, and it is the step that flaked: the failure report
+     * showed the source was already present (the list held it AND the API returned
+     * it) at the moment of the report, so the wait had simply expired first — the
+     * save was followed by a list reload slow enough to outlast it. Raising the
+     * deadline alone would hide that, so the elapsed time is reported: the next
+     * reader can tell a slow environment from a real refusal without rebuilding a
+     * probe to find out.
+     */
+    const waitStarted = Date.now();
+    const listed = await waitFor(() => byIncludes('.dbm-table td', ${JSON.stringify(SOURCE_NAME)}), 30000);
+    report.listWaitMs = Date.now() - waitStarted;
+    if (!listed) {
+      /*
+       * Report WHY, not just that it failed.
+       *
+       * "not listed" alone cannot tell a refused save from a list that never
+       * refreshed: the dialog's own message, the names the list does show, and the
+       * names the API returns are the three facts that separate them.
+       */
+      let apiNames = null;
+      try {
+        apiNames = (await api('/api/dsh-database/sources')).sources.map((s) => s.name);
+      } catch (error) {
+        apiNames = String(error);
+      }
+      fail('the created source is not listed', {
+        listWaitMs: report.listWaitMs,
+        modalOpen: document.querySelector('.dbm-modal') !== null,
+        modalError: (document.querySelector('.dbm-modal .dbm-error') || {}).textContent || null,
+        pageError: (document.querySelector('.dbm-error') || {}).textContent || null,
+        listRows: Array.from(document.querySelectorAll('.dbm-table tbody tr')).length,
+        listText: Array.from(document.querySelectorAll('.dbm-table tbody tr'))
+          .map((tr) => (tr.textContent || '').trim().slice(0, 60)),
+        apiNames,
+      });
+      return JSON.stringify(report, null, 2);
+    }
 
     /*
      * The id the API assertions read, resolved by this run's UNIQUE name.
@@ -520,6 +558,69 @@ ${PRELUDE}
     check('a date column gets a date input', report.insertControls.joined === 'INPUT:date', report.insertControls);
     check('a boolean column gets a select', report.insertControls.active !== null && report.insertControls.active.startsWith('SELECT'), report.insertControls);
 
+    /*
+     * The form is phpMyAdmin-shaped: one ordinary control per column, usable
+     * WITHOUT choosing a mode first.
+     *
+     * Checked as behaviour, not as markup: every control must be ENABLED on
+     * arrival. The previous version opened with all of them disabled behind a
+     * 填入值 / 使用默认值 / 设为 NULL radio, and a screenshot alone could not tell
+     * the two apart.
+     */
+    report.insertDisabled = Array.from(document.querySelectorAll('[data-dbm-insert-for]'))
+      .filter((el) => el.disabled)
+      .map((el) => el.getAttribute('data-dbm-insert-for'));
+    check('every insert control is usable on arrival', report.insertDisabled.length === 0, report.insertDisabled);
+
+    // The name and its control are on the SAME line, which is what the layout is for.
+    const ageInput = document.querySelector('[data-dbm-insert-for$=":age"]');
+    const ageName = ageInput === null ? null : ageInput.closest('.dbm-insert-value').previousElementSibling;
+    report.insertRowShape = ageInput === null || ageName === null ? null : {
+      nameBottom: Math.round(ageName.getBoundingClientRect().bottom),
+      controlTop: Math.round(ageInput.getBoundingClientRect().top),
+      controlLeft: Math.round(ageInput.getBoundingClientRect().left),
+      nameLeft: Math.round(ageName.getBoundingClientRect().left),
+    };
+    check(
+      'the column name sits beside its control, not above it',
+      report.insertRowShape !== null && report.insertRowShape.controlLeft > report.insertRowShape.nameLeft,
+      report.insertRowShape,
+    );
+
+    // A ticked NULL box sends NULL, which a blank box does NOT — the two must differ.
+    const bioInput = document.querySelector('[data-dbm-insert-for$=":bio"]');
+    const bioNull = document.querySelector('[data-dbm-insert-null$=":bio"]');
+    if (!bioInput || !bioNull) {
+      fail('the nullable bio column has no NULL box');
+    } else {
+      check('the NULL box starts unticked', bioNull.checked === false);
+      click(bioNull);
+      await sleep(300);
+      report.nullLocksInput = bioInput.disabled;
+      check('ticking NULL disables the box it overrides', bioInput.disabled === true, report.nullLocksInput);
+      click(bioNull);
+      await sleep(300);
+      check('unticking NULL gives the box back', bioInput.disabled === false);
+    }
+
+    /*
+     * The row count at the top creates that many separate forms — the
+     * phpMyAdmin gesture this page was asked to match.
+     */
+    const countBox = document.querySelector('[data-dbm-insert-count]');
+    const applyBtn = document.querySelector('[data-dbm-insert-apply]');
+    if (!countBox || !applyBtn) {
+      fail('the insert tab has no row-count control');
+    } else {
+      setInput(countBox, '2');
+      click(applyBtn);
+      await sleep(600);
+      report.formsAfterApply = document.querySelectorAll('[data-dbm-insert-form]').length;
+      check('asking for 2 rows gives 2 separate forms', report.formsAfterApply === 2, report.formsAfterApply);
+      // The second form is an independent set of controls, keyed by its own index.
+      check('the second form has its own controls', document.querySelector('[data-dbm-insert-for^="1:"]') !== null);
+    }
+
     const nameInput = document.querySelector('[data-dbm-insert-for$=":name"]');
     if (!nameInput) {
       fail('the insert form has no name field');
@@ -540,6 +641,13 @@ ${PRELUDE}
       }
       report.afterInsert = afterInsert.length;
       check('the form insert reached the server', afterInsert.includes('inserted-by-form'), afterInsert.length);
+      /*
+       * Only the FIRST form was filled in, so exactly one row may have arrived:
+       * an empty sibling form is an untouched one, not an all-defaults row. A
+       * page that sent it anyway would insert a row nobody asked for.
+       */
+      report.insertedCount = afterInsert.filter((n) => n === 'inserted-by-form').length;
+      check('the untouched second form did not insert a row', report.insertedCount === 1, report.insertedCount);
     }
 
     // ---- requirement 8: the structure tab --------------------------------
