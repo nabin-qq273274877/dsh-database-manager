@@ -101,6 +101,16 @@ export function SqlSearchTab(props: SqlSearchTabProps): React.ReactElement {
    * seeded for every column on every structural reload.
    */
   const [criteria, setCriteria] = React.useState<Record<string, Criterion>>(() => criteriaFrom(filters))
+  /**
+   * The result grid's box, so a submitted search can be brought into view.
+   *
+   * Needed because the field list is now shown in FULL rather than inside a capped
+   * scroll box: on a wide table the form is taller than the viewport, so the results
+   * render below the fold. Without this the user presses 执行 and sees nothing happen —
+   * the search did run, but its outcome is off-screen. `nearest` keeps it
+   * non-intrusive: when the grid is already visible nothing moves.
+   */
+  const resultsRef = React.useRef<HTMLDivElement | null>(null)
 
   /**
    * The form adopts a search issued from elsewhere — a column's 非重复值 shortcut,
@@ -174,6 +184,18 @@ export function SqlSearchTab(props: SqlSearchTabProps): React.ReactElement {
     }
     onError(undefined)
     onSearch(parsed)
+    /*
+     * Bring the results into view AFTER the request has been issued.
+     *
+     * A frame is yielded first so the grid exists and has been laid out: scrolling to
+     * a box that is about to appear would compute its position from the pre-search
+     * layout. `nearest` then does nothing when the grid is already on screen — the
+     * case on a table narrow enough to fit — so this only moves the viewport when the
+     * outcome would otherwise be unreachable.
+     */
+    requestAnimationFrame(() => {
+      resultsRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+    })
   }
 
   const clear = (): void => {
@@ -247,8 +269,16 @@ export function SqlSearchTab(props: SqlSearchTabProps): React.ReactElement {
       { className: 'dbm-search-form' },
       React.createElement('div', { className: 'dbm-hint' }, t('search.qbeHint')),
       React.createElement(
-        // Only this part scrolls, so the buttons below stay visible however many
-        // columns the table has. See the styles for the measurement.
+        /*
+         * The field table, shown in FULL: no inner scroll box.
+         *
+         * It used to be a 45%-capped scroll area, which on a 25-column table showed
+         * four rows and hid twenty-one — measured. An inner scrollbar on a list of
+         * fields reads as "these are the fields" rather than "there is more below",
+         * so the user concludes the column they want does not exist. The page scrolls
+         * instead; see the styles for the measurement and for why the 执行 button is
+         * still not inside a box.
+         */
         'div',
         { className: 'dbm-search-scroll' },
         React.createElement(
@@ -353,8 +383,8 @@ export function SqlSearchTab(props: SqlSearchTabProps): React.ReactElement {
       ),
       React.createElement('div', { className: 'dbm-hint' }, t('search.hint')),
     ),
-    // The result grid, in its own scroll area so the form above keeps its height
-    // and the rows get the rest of the tab.
-    results === undefined ? null : React.createElement('div', { className: 'dbm-tab-body', style: { minHeight: 0 } }, results),
+    // The result grid, in its own box under the form. The page scrolls as a whole
+    // (see the styles), so the grid only needs a height it can lay rows out in.
+    results === undefined ? null : React.createElement('div', { className: 'dbm-search-results', ref: resultsRef }, results),
   )
 }

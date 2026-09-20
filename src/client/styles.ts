@@ -1096,28 +1096,77 @@ textarea.dbm-cell-input {
  * to decide which row to fill in, so they belong on the same line as the operator
  * and the value.
  *
- * The form is a flex COLUMN of three parts, and only the middle one scrolls:
- * the heading, then the table, then the action row. Making the whole form scroll
- * instead put the 执行 button inside the scroll area, and at seven columns it was
- * already scrolled out of sight — measured on the screenshot pass, where the page
- * showed no run button at all. The primary action of a form must not be reachable
- * only by scrolling.
+ * THE FIELD LIST IS NEVER SCROLLED. Every column of the table is visible, and the
+ * whole PAGE scrolls if the list is long.
+ *
+ * This was reported as a usability defect and it was one: the field list had its own
+ * scroll box, capped at 45% of the tab, and a 25-column table showed FOUR rows with
+ * the other 21 hidden inside it — measured, the box was 235px against 1182px of
+ * content. A scrollbar inside a list of fields does not read as "there is more
+ * below"; it reads as "these are the fields", so the user concludes the column they
+ * want does not exist and stops looking. The rows of a table's field list are its
+ * content, and content that answers "which fields are there" has to be shown whole.
+ *
+ * The earlier reason for the cap is still honoured, one level up: the 执行 button
+ * must not be reachable only by scrolling INSIDE a box the user cannot see the end
+ * of. With the page as the scroller the button sits in normal flow after the list —
+ * the arrangement phpMyAdmin itself has — and the section headings and hints that
+ * follow tell the user there is more below.
  */
 .dbm-search-form {
   padding: 10px 14px;
   display: flex;
   flex-direction: column;
   gap: 8px;
-  /* Bounded so the result grid always has room; a wide table's form is long. */
-  max-height: 45%;
-  min-height: 0;
-  overflow: hidden;
+  /* Natural height: the form is content, not a viewport onto content. */
   flex: none;
 }
-/* The scrolling part: the table, and nothing else. */
-.dbm-search-scroll { overflow: auto; min-height: 0; flex: 1 1 auto; }
-/* The action row and the hints stay put, whatever the table's height. */
-.dbm-search-actions { flex: none; }
+/*
+ * The field table's wrapper, kept as a hook but no longer a scroll container.
+ *
+ * It used to be overflow:auto with flex:1 1 auto, which is what produced the 235px
+ * box. The name stays so the geometry assertions in the e2e still address the same
+ * element — the thing they check is that this area is NOT scrolled.
+ */
+.dbm-search-scroll { min-height: 0; }
+/*
+ * The whole search page scrolls, and the result grid keeps its own height.
+ *
+ * min-height rather than flex-basis on the results: a long field list must not
+ * squeeze the grid away, so the grid holds a usable height and the page scrolls
+ * past it. Below that it behaves like the 浏览 tab's grid, which it reuses.
+ */
+[data-dbm-search-page] { overflow: auto; }
+/*
+ * The action row rides the bottom of the viewport while the field list is in view.
+ *
+ * Showing every field and keeping 执行 reachable pull in opposite directions: a full
+ * field list makes the form taller than the panel, so a button in normal flow after it
+ * ends up below the fold — measured at 24 columns, where the button sat at y=1316 in an
+ * 804px viewport. That was the ORIGINAL complaint this page had, so the fix must not
+ * trade one known defect for the other.
+ *
+ * Sticky resolves it: the field list is complete and scrolls with the page, and the
+ * action row stays on screen the whole time the list is being read. bottom:0 is
+ * against the page scrollport, and the form is its containing block, so once the list
+ * ends the bar settles into its own place rather than covering the results.
+ *
+ * The solid background is required, not cosmetic: field rows scroll UNDER the bar, and
+ * without it the two would overlap and read as a rendering fault.
+ */
+.dbm-search-actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  flex: none;
+  /* Full-bleed, so the bar reads as its own surface rather than as a table row. */
+  margin-left: -14px;
+  margin-right: -14px;
+  padding: 8px 14px;
+  background: var(--dsw-alias-bg-base);
+  border-top: 1px solid var(--dsw-alias-border-l3);
+}
+.dbm-search-results { flex: 1 1 auto; min-height: 240px; min-width: 0; }
 .dbm-search-table { width: auto; }
 /*
  * A fixed layout for the four control columns.

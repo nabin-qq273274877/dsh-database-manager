@@ -58,12 +58,22 @@ if (baseUrl === undefined || sqliteFile === undefined) {
  * 'note' is where the wildcard and null cases point: a literal '100%' and two
  * NULLs. Pointing them at 'name' would have made the wildcard case pass for the
  * wrong reason — a '%' that matched nothing because the value was not there.
+ *
+ * 'wide' exists for the field-list cases. The clipping defect is INVISIBLE on a
+ * three-column table: three rows fit in the old 45%-capped box, so every assertion
+ * about them passed while a 25-column table showed four rows out of twenty-five.
+ * A regression test for it therefore needs a table wide enough to overflow the box
+ * the defect lived in.
  */
 function seed(file) {
   const db = new DatabaseSync(file)
   db.exec('DROP TABLE IF EXISTS items')
   db.exec('CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT, note TEXT)')
   db.exec("INSERT INTO items(name, note) VALUES ('alpha', 'x'), ('beta', NULL), ('gamma', '100%'), ('delta', NULL)")
+  db.exec('DROP TABLE IF EXISTS wide')
+  const wideColumns = Array.from({ length: 24 }, (_, index) => `field_${String(index + 1).padStart(2, '0')} VARCHAR(20)`)
+  db.exec(`CREATE TABLE wide(id INTEGER PRIMARY KEY, ${wideColumns.join(', ')})`)
+  db.exec('INSERT INTO wide(id) VALUES (1)')
   db.close()
 }
 
@@ -158,8 +168,10 @@ try {
    *   (omit it for a unary operator, which has no value control). An empty list
    *   presses 执行 with nothing filled in, which is its own case: phpMyAdmin sends
    *   no WHERE then and shows every row.
+   * @param table - which table to open. 'wide' is for the field-list geometry cases,
+   *   which need more columns than fit in the old capped box.
    */
-  const runSearch = async (tag, criteria) => {
+  const runSearch = async (tag, criteria, table = 'items') => {
     /** This case's own source name, so no two entries ever share one. */
     const sourceName = `${SOURCE_NAME} ${tag}`
     const flow = `(async () => {
@@ -205,9 +217,17 @@ try {
         .find((b) => ['连接', 'Connect'].includes(b.textContent.trim()));
       click(connect);
 
-      const itemsRow = await waitFor(() => byIncludes('.dbm-side-body .dbm-tree-item', 'items'), 15000);
-      if (!itemsRow) return { fatal: 'the table tree never appeared', error: (document.querySelector('.dbm-error') || {}).textContent };
+      const itemsRow = await waitFor(() => byIncludes('.dbm-side-body .dbm-tree-item', ${JSON.stringify(table)}), 15000);
+      if (!itemsRow) return { fatal: 'the table tree never appeared', table, error: (document.querySelector('.dbm-error') || {}).textContent };
       click(itemsRow);
+      // Exact match on the tree entry: 'items' is a substring of nothing here, but a
+      // table whose name is a PREFIX of another would otherwise pick the wrong one.
+      const exactRow = await waitFor(() => Array.from(document.querySelectorAll('.dbm-side-body .dbm-tree-item'))
+        .find((el) => {
+          const name = el.querySelector('.dbm-tree-name');
+          return name !== null && (name.textContent || '').trim() === ${JSON.stringify(table)};
+        }) || null, 8000);
+      if (exactRow !== null && !exactRow.classList.contains('dbm-tree-item-active')) click(exactRow);
       await sleep(1500);
 
       // The 搜索 tab.
@@ -248,14 +268,60 @@ try {
       const runBtn = page.querySelector('[data-dbm-search-run]');
       if (runBtn === null) return { fatal: 'no search button' };
       /*
-       * The run button must be REACHABLE without scrolling.
+       * The field list must be shown WHOLE, with no scroll box of its own.
        *
-       * Measured while checking the page visually: the whole form was the scroll
-       * container, so on a seven-column table the 执行 button sat below the fold and
-       * the screenshot showed no run button at all. That is a presence check's blind
-       * spot — the element exists and responds to a synthetic click, so every other
-       * assertion here passed. Only the geometry catches it.
+       * Reported by the user: the field list scrolled inside a capped box, and a
+       * 25-column table showed four rows with twenty-one hidden — measured, a 235px box
+       * holding 1182px of content. An inner scrollbar on a list of fields reads as
+       * "these are the fields" rather than "there is more below", so the user concludes
+       * the column they want does not exist. Asserted on the volume of visible rows and
+       * on the box's own scroll state, not on the absence of a scrollbar anywhere: the
+       * PAGE still scrolls, which is what makes every row reachable.
        */
+      const fieldRows = Array.from(document.querySelectorAll('[data-dbm-search-row]'));
+      const fieldBox = document.querySelector('.dbm-search-scroll');
+      const fieldBoxScrolls = fieldBox !== null && fieldBox.scrollHeight > fieldBox.clientHeight + 1;
+      /*
+       * Rows must not be clipped by an INNER box. The page-level scroller is excluded:
+       * on a wide table the form is legitimately taller than the viewport, and those
+       * rows are reachable by scrolling the page.
+       */
+      const innerClipped = fieldRows.filter((tr) => {
+        let node = tr.parentElement;
+        const viewers = [];
+        while (node !== null && node !== document.body) {
+          if (node.scrollHeight > node.clientHeight + 1 && /(auto|scroll|hidden)/.test(getComputedStyle(node).overflowY)) viewers.push(node);
+          node = node.parentElement;
+        }
+        for (const box of viewers.slice(0, -1)) {
+          const outer = box.getBoundingClientRect();
+          const r = tr.getBoundingClientRect();
+          if (r.bottom > outer.bottom + 1 || r.top < outer.top - 1) return true;
+        }
+        return false;
+      }).map((tr) => tr.getAttribute('data-dbm-search-row'));
+      /*
+       * The run button must be reachable at every scroll position.
+       *
+       * This is the OLD defect, and showing every field is exactly what could bring it
+       * back: the button sits after the field list in normal flow, so a tall list pushes
+       * it below the fold (measured at 24 columns: y=1316 in an 804px viewport). It is
+       * sticky, so it must be on screen at the top, the middle and the bottom.
+       */
+      const reachability = () => {
+        const r = runBtn.getBoundingClientRect();
+        return r.top >= 0 && r.bottom <= window.innerHeight && r.width > 0 && r.height > 0;
+      };
+      const reachAtTop = reachability();
+      page.scrollTop = Math.round((page.scrollHeight - page.clientHeight) / 2);
+      await sleep(250);
+      const reachAtMid = reachability();
+      page.scrollTop = page.scrollHeight;
+      await sleep(250);
+      const reachAtBottom = reachability();
+      page.scrollTop = 0;
+      await sleep(250);
+
       const rect = runBtn.getBoundingClientRect();
       const viewport = { w: window.innerWidth, h: window.innerHeight };
       const reachable = rect.top >= 0 && rect.bottom <= viewport.h && rect.width > 0 && rect.height > 0
@@ -271,6 +337,17 @@ try {
       }, 10000);
       await sleep(400);
 
+      /*
+       * Running a search must SHOW its outcome.
+       *
+       * A full field list makes the form taller than the viewport, so the grid renders
+       * below the fold. Without the scroll-into-view the user presses 执行 and the
+       * screen does not move — the search ran, but nothing visible happened.
+       */
+      const grid = document.querySelector('.dbm-search-results');
+      const gridRect = grid === null ? null : grid.getBoundingClientRect();
+      const gridVisibleAfterRun = gridRect !== null && gridRect.top < window.innerHeight && gridRect.bottom > 0;
+
       return {
         hasRawWhere,
         headers,
@@ -278,6 +355,15 @@ try {
         runRect: { top: Math.round(rect.top), bottom: Math.round(rect.bottom), height: Math.round(rect.height) },
         viewportH: viewport.h,
         runReachable: reachable,
+        fieldRowCount: fieldRows.length,
+        fieldBoxScrolls,
+        innerClipped,
+        reachAtTop,
+        reachAtMid,
+        reachAtBottom,
+        pageScrollHeight: page.scrollHeight,
+        pageClientHeight: page.clientHeight,
+        gridVisibleAfterRun,
         countText: countLine === null ? null : countLine.textContent.trim(),
         rows: Array.from(document.querySelectorAll('.dbm-data tbody tr')).map((tr) => (tr.textContent || '').trim()),
         errors: Array.from(document.querySelectorAll('.dbm-error')).map((el) => el.textContent.trim()),
@@ -328,9 +414,34 @@ try {
    * in a dropdown.
    */
   check('every column of the table has a row', JSON.stringify(shape.rowNames) === JSON.stringify(['id', 'name', 'note']), shape.rowNames)
-  // The run button must be on screen without scrolling. Only the geometry catches
-  // this: the element is present and clickable either way.
+  /*
+   * THE FIELD LIST IS SHOWN WHOLE. No inner scroll box, and no row clipped by one.
+   *
+   * The regression this pins: the list had its own scroll container capped at 45% of
+   * the tab, so a wide table showed a handful of rows with the rest hidden inside it.
+   * The failure mode is not "a row is missing from the DOM" — every row was there and
+   * addressable, which is why the earlier assertions here all passed. It is that the
+   * user cannot SEE the rest, and reads the visible handful as the complete list.
+   */
+  check('the field list is not scrolled inside its own box', shape.fieldBoxScrolls === false, { fields: shape.fieldRowCount })
+  check('no field row is clipped by an inner box', shape.innerClipped.length === 0, shape.innerClipped)
+  /*
+   * And the run button stays reachable while that whole list is displayed.
+   *
+   * These two pull against each other — a full list makes the form taller than the
+   * viewport — so both have to be asserted together. Checked at three scroll
+   * positions because "visible at the top of the page" is satisfied by a button that
+   * then scrolls away, which is the defect this page started with.
+   */
   check('the run button is visible without scrolling', shape.runReachable === true, { rect: shape.runRect, viewportH: shape.viewportH })
+  check('the run button stays visible while the field list scrolls', shape.reachAtTop === true && shape.reachAtMid === true && shape.reachAtBottom === true, { top: shape.reachAtTop, mid: shape.reachAtMid, bottom: shape.reachAtBottom })
+  /*
+   * Running a search shows its outcome rather than silently scrolling nowhere.
+   *
+   * With every field displayed the grid can sit below the fold, so pressing 执行 must
+   * bring it into view — otherwise the search looks like it did nothing.
+   */
+  check('the results are brought into view after running', shape.gridVisibleAfterRun === true, { page: shape.pageScrollHeight, client: shape.pageClientHeight })
   // phpMyAdmin builds no WHERE clause with nothing filled in, so pressing 执行 on a
   // blank form must search for everything rather than refuse.
   check('an empty search shows all rows', shape.rows.length === 4, { rows: shape.rows.length, count: shape.countText, errors: shape.errors })
@@ -368,6 +479,27 @@ try {
   const nulls = await runSearch('isnull', [{ column: 'note', operator: 'isNull' }])
   check('is NULL returned exactly the two NULL rows', nulls.rows.length === 2, nulls.rows)
   await reset()
+
+  /*
+   * ---- case 7: a WIDE table, where the field list used to hide most of itself ----
+   *
+   * Its own case because the defect is invisible on 'items': three rows fit in the box
+   * the clipping lived in, so every assertion above passed while a 25-column table
+   * showed four rows. The table has 25 columns; all 25 must be visible with no inner
+   * scroll box, and the run button must stay reachable while they are.
+   */
+  const wide = await runSearch('wide', [], 'wide')
+  check('a wide table shows every field row in its own box', wide.fieldRowCount === 25, { count: wide.fieldRowCount, clipped: wide.innerClipped })
+  check('the wide field list has no scroll box of its own', wide.fieldBoxScrolls === false, { fields: wide.fieldRowCount })
+  check('no wide field row is clipped by an inner box', wide.innerClipped.length === 0, wide.innerClipped)
+  /*
+   * The list is now taller than the viewport, so the PAGE must scroll — and the run
+   * button must remain reachable at every position, which is the requirement the old
+   * 45% cap was there to protect.
+   */
+  check('a long field list scrolls the page rather than a box', wide.pageScrollHeight > wide.pageClientHeight, { scrollHeight: wide.pageScrollHeight, clientHeight: wide.pageClientHeight })
+  check('the run button is reachable at top, middle and bottom', wide.reachAtTop === true && wide.reachAtMid === true && wide.reachAtBottom === true, { top: wide.reachAtTop, mid: wide.reachAtMid, bottom: wide.reachAtBottom })
+  check('a wide table still runs an empty search', wide.rows.length === 1, { rows: wide.rows.length, errors: wide.errors })
 
   const failed = checks.filter(entry => !entry.ok)
   console.log(`\n${checks.length - failed.length}/${checks.length} checks passed`)
