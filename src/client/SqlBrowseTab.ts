@@ -68,15 +68,6 @@ export interface SqlBrowseTabProps {
   onExport(options?: { rowsOnly?: boolean; selectedKeys?: RowKey[] }): void
   /** Open the import dialog. */
   onImport(): void
-  /**
-   * Show the rows without offering to change them.
-   *
-   * Set by the 搜索 tab: a result set is a view onto a query, not a table with
-   * stable keys, so the in-cell editor and the row actions would act on a row
-   * whose identity came from a join or an expression. The paging, the sorting and
-   * the cell copy stay available — those only read.
-   */
-  readOnly?: boolean
   /** Structure changes elsewhere may have changed the table; reported upward. */
   onNotice(message: string | undefined): void
   onError(message: string | undefined): void
@@ -115,7 +106,7 @@ export { isNumericType, isDateType, isBooleanType, fieldKind, operatorsFor } fro
 
 /** The 浏览 tab. */
 export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
-  const { api, sourceId, schema, table, rows, query, onQuery, onReload, onExport, onImport, readOnly, onNotice, onError } = props
+  const { api, sourceId, schema, table, rows, query, onQuery, onReload, onExport, onImport, onNotice, onError } = props
   /** The cell being edited, by row index and column name. */
   const [editing, setEditing] = React.useState<{ row: number; column: string; value: string } | undefined>(undefined)
   /** Keys of the rows selected for a batch action, serialized for set membership. */
@@ -275,10 +266,11 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
   if (rows.error !== undefined && page === undefined) return React.createElement(ErrorBanner, { message: rows.error })
 
   const pages = page === undefined ? 1 : Math.max(1, Math.ceil(page.total / page.pageSize))
-  // A read-only grid still needs a row key to offer a selection for, but not one
-  // to edit with: every action that would WRITE is dropped below.
-  const canSelectRows = primaryKey.length > 0 && readOnly !== true
-  const canEditCells = primaryKey.length > 0 && readOnly !== true
+  // Selection and in-cell editing both need a row KEY: a row is addressed by its primary
+  // key, and without one there is no way to say which row a write means. A table with no
+  // key is therefore browsable but not editable.
+  const canSelectRows = primaryKey.length > 0
+  const canEditCells = primaryKey.length > 0
   const canActOnRows = canSelectRows
 
   /** One action button in the 操作 cell. */
@@ -344,7 +336,6 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
     )
   }
   header.push(React.createElement('th', { key: '__actions', className: 'dbm-row-actions' }, t('browse.actions')))
-  if (readOnly === true) header.pop()
 
   const body: unknown[] = []
   for (const [index, row] of (page?.rows ?? []).entries()) {
@@ -450,10 +441,6 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
         ),
       )
     }
-    // The action cell is omitted entirely in read-only mode rather than rendered
-    // empty: a column of buttons that do nothing is worse than no column, and the
-    // header would otherwise promise actions the grid does not have.
-    if (readOnly === true) { body.push(React.createElement('tr', { key: index, 'data-selected': String(isSelected) }, ...cells as never[])); continue }
     cells.push(
       React.createElement(
         'td',
@@ -487,6 +474,29 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
     )
     body.push(React.createElement('tr', { key: index, 'data-selected': String(isSelected) }, ...cells as never[]))
   }
+
+  /**
+   * The 搜索 tab's conditions, when the grid is showing a filtered read.
+   *
+   * Shown because the grid now receives searches from another tab: landing here with
+   * "共 2 行" on a table of thousands is indistinguishable from a broken table unless
+   * the page says the rows are filtered — and offers the way back to all of them. The
+   * count is of CONDITIONS rather than of rows, because that is what the user typed.
+   */
+  const filterBar = (query.filters === undefined || query.filters.length === 0) ? null : React.createElement(
+    'div',
+    { className: 'dbm-batch-bar', 'data-dbm-browse-filters': '' },
+    React.createElement('span', null, t('browse.filtered', { n: query.filters.length })),
+    ...query.filters.map(filter => React.createElement('span', { key: filter.column, className: 'dbm-hint dbm-mono' },
+      `${filter.column} ${t(`search.op.${filter.operator}` as never)}${filter.value === undefined ? '' : ` ${filter.value}`}`)),
+    React.createElement('span', { className: 'dbm-spacer' }),
+    React.createElement('button', {
+      type: 'button',
+      className: 'dbm-btn dbm-btn-sm',
+      'data-dbm-browse-clear-filters': '',
+      onClick: () => onQuery({ page: 1, filters: undefined, filterJoin: undefined }),
+    }, t('browse.clearFilters')),
+  )
 
   const toolbar = React.createElement(
     'div',
@@ -608,6 +618,7 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
     // screen are still the last good answer, and blanking them would lose the
     // user's place for a transient failure.
     rows.error === undefined ? null : React.createElement(ErrorBanner, { message: rows.error }),
+    filterBar,
     batchBar,
     page === undefined || page.columns.length === 0
       ? React.createElement(Empty, { message: t('browse.empty') })

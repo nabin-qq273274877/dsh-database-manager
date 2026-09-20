@@ -14,7 +14,7 @@ import * as React from 'react'
  * be read in isolation.
  */
 
-import type { ColumnInfo, DataSourceSummary, IndexInfo, MaintenanceOpView, MaintenanceOutcome, RowFilter, TableActionOp, TableInfo, TablePage } from '../protocol.ts'
+import type { ColumnInfo, DataSourceSummary, IndexInfo, MaintenanceOpView, MaintenanceOutcome, QueryResult, RowFilter, TableActionOp, TableInfo, TablePage } from '../protocol.ts'
 import type { DbApi } from './api.ts'
 import { SqlBrowseTab, type BrowseQuery } from './SqlBrowseTab.ts'
 import { SqlInsertTab } from './SqlInsertTab.ts'
@@ -124,6 +124,28 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
    * would notice taking time.
    */
   const [structureLoading, setStructureLoading] = React.useState(false)
+  /**
+   * The SQL tab's editor text and its write switch.
+   *
+   * Held HERE rather than inside {@link SqlTabView} because that component unmounts
+   * whenever another tab is shown — and running a SELECT now switches to 浏览, so
+   * local state would clear the statement the user just ran. Going back to the SQL
+   * tab to tweak it is the normal next step, and finding an empty editor there would
+   * be losing their work.
+   */
+  const [sqlText, setSqlText] = React.useState('')
+  const [sqlAllowWrite, setSqlAllowWrite] = React.useState(false)
+  /**
+   * The last SELECT run from the SQL tab, so the 浏览 tab can show its result.
+   *
+   * A result set is not a table read: it has columns but no types, no keys and no
+   * paging. It is kept separately from `rows` (the 浏览 read of a real table) so the
+   * two cannot be confused, and the 浏览 tab renders one or the other — never a mix.
+   */
+  const [sqlResult, setSqlResult] = React.useState<{
+    sql: string
+    result: QueryResult
+  } | undefined>(undefined)
   /** The open transfer dialog, if any. */
   const [transfer, setTransfer] = React.useState<TransferDialog | undefined>(undefined)
   /** The schema's table list, read when a transfer dialog needs it. */
@@ -612,6 +634,9 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     setActiveSchema(schema)
     setActiveTable(table)
     setTab(nextTab)
+    // Opening a table replaces whatever was on screen, including a SQL result set
+    // shown in 浏览: the grid is about to show a different table's rows.
+    setSqlResult(undefined)
     // A new table starts unsorted on its first page: a sort carried over from the
     // previous table would order by a column this one may not have.
     setBrowse(current => ({ ...current, page: 1, orderBy: undefined, orderByColumns: undefined, filters: undefined }))
@@ -627,28 +652,54 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
    * 操作 loads the structure too: its 表选项 block needs to know whether the object is
    * a view, and the tab strip only knows the name.
    */
-  const changeTab = (next: SqlTab): void => {
+  const changeTab = (next: SqlTab, options: { keepSqlResult?: boolean; browse?: BrowseQuery } = {}): void => {
     setTab(next)
     setError(undefined)
     setNotice(undefined)
+    /*
+     * A result set belongs to the 浏览 tab and is dropped the moment the user navigates
+     * away from it.
+     *
+     * NOT cleared when the SQL tab itself switches here (`keepSqlResult`): there the
+     * result is the destination, and clearing it would throw away the rows just
+     * fetched. Any other tab change is the user asking for that tab's content, and a
+     * stale result reappearing later — under a toolbar whose controls all act on a
+     * TABLE — would make the same grid mean two different things.
+     */
+    if (options.keepSqlResult !== true) setSqlResult(undefined)
     if (activeTable === undefined || activeSchema === undefined) return
+    /*
+     * A table read is skipped when a result set is being shown: the grid on screen is
+     * the query's own output, so re-reading the table would fetch rows nothing renders
+     * and leave the tab with two sources of truth for what it contains.
+     */
+    if (next === 'browse' && options.keepSqlResult === true) return
     // The 搜索 tab needs the column list too, not only 结构 and 插入: its form is a
     // list of columns with per-type operators, so without them it renders an empty
     // condition row and offers nothing to search by.
     if (next === 'structure' || next === 'insert' || next === 'search' || next === 'operation') {
       void loadStructure(activeSchema, activeTable)
     }
+    /*
+     * The read uses the query the CALLER passed, when there is one.
+     *
+     * A caller that sets `browse` and immediately switches tabs (the 搜索 tab does) cannot
+     * rely on this closure: `setBrowse` has not been applied yet, so reading `browse`
+     * here would issue the read with the PREVIOUS filters — the form would say "3
+     * conditions" and the grid would show the whole table.
+     */
+    const layout = options.browse ?? browse
     if (next === 'browse') void loadRows({
       schema: activeSchema,
       table: activeTable,
-      page: browse.page,
-      pageSize: browse.pageSize,
+      page: layout.page,
+      pageSize: layout.pageSize,
       mode: 'browse',
-      ...(browse.orderBy === undefined ? {} : { orderBy: browse.orderBy }),
-      ...(browse.orderByColumns === undefined ? {} : { orderByColumns: browse.orderByColumns }),
-      ...(browse.filters === undefined ? {} : { filters: browse.filters }),
-      ...(browse.filterJoin === undefined ? {} : { filterJoin: browse.filterJoin }),
-      orderDir: browse.orderDir,
+      ...(layout.orderBy === undefined ? {} : { orderBy: layout.orderBy }),
+      ...(layout.orderByColumns === undefined ? {} : { orderByColumns: layout.orderByColumns }),
+      ...(layout.filters === undefined ? {} : { filters: layout.filters }),
+      ...(layout.filterJoin === undefined ? {} : { filterJoin: layout.filterJoin }),
+      orderDir: layout.orderDir,
       withIndexes: true,
     })
   }
@@ -988,48 +1039,93 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     )
 
     if (tab === 'browse') {
-      body.push(React.createElement(SqlBrowseTab, {
-        key: 'browse-body',
-        api,
-        sourceId: source.id,
-        schema: selection.schema,
-        table: selection.table,
-        rows,
-        query: browse,
-        knownColumns: columns,
-        /**
-         * A layout change re-reads from page 1 unless it is a page move.
-         *
-         * Sorting, filtering and a page-size change all redefine what "page 1" is,
-         * so staying on page 7 of the old ordering would show an arbitrary slice.
-         */
-        onQuery: (next) => {
-          const merged: BrowseQuery = { ...browse, ...next }
-          setBrowse(merged)
-          void loadRows({
-            schema: selection.schema,
-            table: selection.table,
-            page: merged.page,
-            pageSize: merged.pageSize,
-            mode: 'browse',
-            ...(merged.orderBy === undefined ? {} : { orderBy: merged.orderBy }),
-            ...(merged.orderByColumns === undefined ? {} : { orderByColumns: merged.orderByColumns }),
-            ...(merged.filters === undefined ? {} : { filters: merged.filters }),
-            ...(merged.filterJoin === undefined ? {} : { filterJoin: merged.filterJoin }),
-            orderDir: merged.orderDir,
-            withIndexes: true,
-          })
-        },
-        onReload: reloadCurrent,
-        onExport: options => setTransfer({
-          kind: 'export',
-          ...(options?.rowsOnly === true ? { rowsOnly: true } : {}),
-          ...(options?.selectedKeys === undefined ? {} : { selectedKeys: options.selectedKeys }),
-        }),
-        onImport: () => { void openImport(selection.schema) },
-        onNotice: message => { setNotice(message); if (message !== undefined) setError(undefined) },
-        onError: message => { setError(message); if (message !== undefined) setNotice(undefined) },
-      }))
+      /*
+       * A SQL result set takes over this tab until the user runs another table read.
+       *
+       * The two are mutually exclusive rather than stacked: a result set describes no
+       * table, so the toolbar's paging, index sorting and export/import would be
+       * addressing a table the grid is not showing. `changeTab('browse')` and any
+       * toolbar action clear it (see `clearSqlResult`).
+       */
+      if (sqlResult !== undefined) {
+        body.push(
+          React.createElement(
+            'div',
+            { key: 'sql-result', className: 'dbm-tab-body', 'data-dbm-sql-result-page': '' },
+            React.createElement(
+              'div',
+              { className: 'dbm-row', style: { padding: '8px 12px' } },
+              React.createElement('span', { className: 'dbm-hint' }, t('sql.resultFrom', { schema: activeSchema ?? '', n: sqlResult.result.rows.length })),
+              React.createElement('span', { className: 'dbm-spacer' }),
+              React.createElement('button', {
+                type: 'button',
+                className: 'dbm-btn dbm-btn-sm',
+                'data-dbm-sql-result-table': '',
+                onClick: () => {
+                  // Back to the table read. The result set is dropped rather than kept
+                  // behind the grid, because the toolbar's controls all act on the
+                  // TABLE — leaving a stale result one click away would make the same
+                  // grid mean two things.
+                  setSqlResult(undefined)
+                  void loadRows({
+                    schema: selection.schema,
+                    table: selection.table,
+                    page: 1,
+                    pageSize: browse.pageSize,
+                    mode: 'browse',
+                    withIndexes: true,
+                  })
+                },
+              }, t('sql.showTable', { table: selection.table })),
+            ),
+            React.createElement('div', { className: 'dbm-pad dbm-hint dbm-mono', style: { paddingTop: 0 } }, sqlResult.sql),
+            React.createElement(SqlResultGrid, { result: sqlResult.result }),
+          ),
+        )
+      } else {
+        body.push(React.createElement(SqlBrowseTab, {
+          key: 'browse-body',
+          api,
+          sourceId: source.id,
+          schema: selection.schema,
+          table: selection.table,
+          rows,
+          query: browse,
+          knownColumns: columns,
+          /**
+           * A layout change re-reads from page 1 unless it is a page move.
+           *
+           * Sorting, filtering and a page-size change all redefine what "page 1" is,
+           * so staying on page 7 of the old ordering would show an arbitrary slice.
+           */
+          onQuery: (next) => {
+            const merged: BrowseQuery = { ...browse, ...next }
+            setBrowse(merged)
+            void loadRows({
+              schema: selection.schema,
+              table: selection.table,
+              page: merged.page,
+              pageSize: merged.pageSize,
+              mode: 'browse',
+              ...(merged.orderBy === undefined ? {} : { orderBy: merged.orderBy }),
+              ...(merged.orderByColumns === undefined ? {} : { orderByColumns: merged.orderByColumns }),
+              ...(merged.filters === undefined ? {} : { filters: merged.filters }),
+              ...(merged.filterJoin === undefined ? {} : { filterJoin: merged.filterJoin }),
+              orderDir: merged.orderDir,
+              withIndexes: true,
+            })
+          },
+          onReload: reloadCurrent,
+          onExport: options => setTransfer({
+            kind: 'export',
+            ...(options?.rowsOnly === true ? { rowsOnly: true } : {}),
+            ...(options?.selectedKeys === undefined ? {} : { selectedKeys: options.selectedKeys }),
+          }),
+          onImport: () => { void openImport(selection.schema) },
+          onNotice: message => { setNotice(message); if (message !== undefined) setError(undefined) },
+          onError: message => { setError(message); if (message !== undefined) setNotice(undefined) },
+        }))
+      }
     }
 
     if (tab === 'structure') {
@@ -1060,6 +1156,23 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
           source,
           schema: activeSchema,
           api,
+          sql: sqlText,
+          allowWrite: sqlAllowWrite,
+          onSql: setSqlText,
+          onAllowWrite: setSqlAllowWrite,
+          /*
+           * A SELECT switches to 浏览 and shows its result THERE.
+           *
+           * Both halves matter and in this order: `changeTab` clears the notice, so the
+           * "returned N rows" message has to be set after the switch — the same
+           * ordering the insert flow needs. The result is stored before switching so the
+           * grid has it on its first render.
+           */
+          onSelect: (ranSql, result) => {
+            setSqlResult({ sql: ranSql, result })
+            changeTab('browse', { keepSqlResult: true })
+            setNotice(`${t('sql.resultShownInBrowse', { n: result.rows.length })} · ${t('sql.rerun')}`)
+          },
           onResult: (message) => { setNotice(message); setError(undefined) },
           onError: (message) => { setError(message); setNotice(undefined) },
         }),
@@ -1074,80 +1187,42 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
           filters: browse.filters ?? [],
           loading: rows?.loading === true,
           ...(rows?.page === undefined ? {} : { total: rows.page.total }),
+          /*
+           * A search runs in the 浏览 tab, not under the form.
+           *
+           * The conditions are stored in `browse` and the read is issued BY `changeTab`,
+           * so there is exactly one path that reads a table and one place the result
+           * appears. `mode` is plain 浏览: with filters in hand the driver builds the
+           * same WHERE either way, and the browse mode is what lets the grid page,
+           * sort and (on a table with a key) edit the matching rows — all of which the
+           * separate search mode had to give up.
+           *
+           * An EMPTY list is a real search and not a no-op: phpMyAdmin sends no `WHERE`
+           * when no row holds a value, so "search with nothing filled in" means every
+           * row. The filter list is DROPPED from the query state in that case rather
+           * than stored as `[]`, because the two are indistinguishable to the drivers
+           * and `undefined` is what a plain read uses.
+           */
           onSearch: filters => {
-            /*
-             * A search always starts at page 1: the previous page number was a
-             * position in the PREVIOUS result set, and keeping it would land the user
-             * past the end of a narrower one.
-             *
-             * An EMPTY list is a real search and not a no-op: phpMyAdmin's page sends
-             * no `WHERE` when no row holds a value, so "search with nothing filled in"
-             * means every row. The filter list is DROPPED from the query state in that
-             * case rather than stored as `[]`, because the two are indistinguishable
-             * to the drivers and `undefined` is what a plain read uses.
-             */
-            const merged: BrowseQuery = {
+            // Built once and handed to BOTH the state and the read, so the form's
+            // conditions and the grid's rows cannot disagree (see `changeTab`).
+            const next: BrowseQuery = {
               ...browse,
               page: 1,
+              // A new search redefines the result set, so a sort carried over from the
+              // previous one would order by the wrong thing — and on a filtered set the
+              // index it named may no longer be the useful one.
+              orderBy: undefined,
+              orderByColumns: undefined,
               ...(filters.length === 0 ? { filters: undefined, filterJoin: undefined } : { filters, filterJoin: 'and' as const }),
             }
-            setBrowse(merged)
-            void loadRows({
-              schema: selection.schema,
-              table: selection.table,
-              page: 1,
-              pageSize: merged.pageSize,
-              mode: 'search',
-              ...(filters.length === 0 ? {} : { filters, filterJoin: 'and' as const }),
-            })
+            setBrowse(next)
+            changeTab('browse', { browse: next })
+            setNotice(filters.length === 0
+              ? t('search.jumpedAll')
+              : t('search.jumpedWith', { n: filters.length }))
           },
           onError: message => { setError(message); if (message !== undefined) setNotice(undefined) },
-          /*
-           * The RESULTS, rendered by the browse grid in read-only mode.
-           *
-           * Without this the tab was a form with nothing under it: a search ran,
-           * the rows came back, and the user saw no result at all. Reusing the
-           * grid keeps the paging, the sort and the cell copy identical to 浏览 —
-           * and the rows are shown WITHOUT editing, because a result set is a
-           * view onto a query rather than a table with stable keys.
-           */
-          results: React.createElement(SqlBrowseTab, {
-            key: 'search-results',
-            api,
-            sourceId: source.id,
-            schema: selection.schema,
-            table: selection.table,
-            rows,
-            query: { ...browse, mode: 'search' } as never,
-            knownColumns: columns,
-            readOnly: true,
-            onQuery: next => {
-              const merged: BrowseQuery = { ...browse, ...next }
-              setBrowse(merged)
-              void loadRows({
-                schema: selection.schema,
-                table: selection.table,
-                page: merged.page,
-                pageSize: merged.pageSize,
-                mode: 'search',
-                ...(merged.filters === undefined ? {} : { filters: merged.filters }),
-                ...(merged.filterJoin === undefined ? {} : { filterJoin: merged.filterJoin }),
-                ...(merged.orderBy === undefined ? {} : { orderBy: merged.orderBy }),
-                ...(merged.orderByColumns === undefined ? {} : { orderByColumns: merged.orderByColumns }),
-                orderDir: merged.orderDir,
-                withIndexes: true,
-              })
-            },
-            onReload: reloadCurrent,
-            onExport: options => setTransfer({
-              kind: 'export',
-              ...(options?.rowsOnly === true ? { rowsOnly: true } : {}),
-              ...(options?.selectedKeys === undefined ? {} : { selectedKeys: options.selectedKeys }),
-            }),
-            onImport: () => { void openImport(selection.schema) },
-            onNotice: message => { setNotice(message); if (message !== undefined) setError(undefined) },
-            onError: message => { setError(message); if (message !== undefined) setNotice(undefined) },
-          }),
         }),
       )
     }
@@ -1784,24 +1859,92 @@ function emptyPage(): TablePage {
   return { columns: [], rows: [], total: 0, page: 1, pageSize: 200, primaryKey: [] }
 }
 
-/** The SQL tab: an editor plus its result grid. */
+/**
+ * A query result set, as a grid.
+ *
+ * This is NOT the browse grid, and deliberately so. A `SELECT` result has column
+ * NAMES but no declared types, no primary key and no total count, so none of what the
+ * browse grid adds on top of a `TablePage` is available here: no paging (the driver
+ * already applied its own row limit), no sorting, no in-cell editing, no row keys.
+ * Offering any of them would promise something the result of an arbitrary query cannot
+ * support — a join has no single table to write a row back to.
+ *
+ * What it does share is how a NULL is rendered and the read-only cell text, so a value
+ * looks the same in both grids.
+ */
+function SqlResultGrid(props: { result: QueryResult }): React.ReactElement {
+  const { result } = props
+  if (result.columns.length === 0) {
+    return React.createElement('div', { className: 'dbm-pad dbm-hint' }, t('sql.noColumns'))
+  }
+  return React.createElement(
+    'div',
+    { className: 'dbm-data', 'data-dbm-sql-result': '' },
+    React.createElement(
+      'table',
+      null,
+      React.createElement(
+        'thead',
+        null,
+        React.createElement('tr', null, ...result.columns.map(column => React.createElement('th', { key: column }, column))),
+      ),
+      React.createElement(
+        'tbody',
+        null,
+        ...result.rows.map((row, index) =>
+          React.createElement(
+            'tr',
+            { key: index },
+            ...row.map((cell, cellIndex) =>
+              React.createElement(
+                'td',
+                // The same ellipsis and code font as the browse grid, and the full
+                // value in the tooltip, so a long value is inspectable without a
+                // column that can be widened.
+                { key: cellIndex, className: isNull(cell) ? 'dbm-null' : undefined, title: renderCell(cell) },
+                renderCell(cell),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  )
+}
+
+/**
+ * The SQL tab: an editor for one statement.
+ *
+ * It no longer renders a result grid of its own. A `SELECT` hands its result to the
+ * caller, which shows it in the 浏览 tab — the same place every other read in this
+ * panel is shown. Keeping a second grid here meant the same rows appeared in two
+ * different shapes depending on which tab you were on.
+ *
+ * A statement that returns no rows (an `INSERT`, an `UPDATE`, a `DDL`) has nothing to
+ * put in a grid, so it stays here and reports what it did. Switching tabs would hide
+ * the message that says the write happened.
+ */
 function SqlTabView(props: {
   api: DbApi
   source: DataSourceSummary
   schema: string | undefined
+  sql: string
+  allowWrite: boolean
+  onSql(text: string): void
+  onAllowWrite(next: boolean): void
+  /** A SELECT produced rows: show them in the 浏览 tab. */
+  onSelect(sql: string, result: QueryResult): void
   onResult(message: string): void
   onError(message: string): void
 }): React.ReactElement {
-  const { api, source, schema, onResult, onError } = props
-  const [sql, setSql] = React.useState('')
-  const [allowWrite, setAllowWrite] = React.useState(false)
-  const [result, setResult] = React.useState<{ columns: string[]; rows: Array<Array<string | number | boolean | null>>; message: string } | undefined>(undefined)
+  const { api, source, schema, sql, allowWrite, onSql, onAllowWrite, onSelect, onResult, onError } = props
+  const [message, setMessage] = React.useState<string | undefined>(undefined)
   const [busy, setBusy] = React.useState(false)
 
   const run = async (): Promise<void> => {
     if (sql.trim() === '') return
     setBusy(true)
-    setResult(undefined)
+    setMessage(undefined)
     try {
       const value = await api.runSql(source.id, {
         sql,
@@ -1809,12 +1952,19 @@ function SqlTabView(props: {
         allowWrite,
       })
       if (value.write) {
-        setResult({ columns: [], rows: [], message: t('sql.affected', { n: value.affected, ms: value.durationMs }) })
-        onResult(t('sql.affected', { n: value.affected, ms: value.durationMs }))
+        const text = t('sql.affected', { n: value.affected, ms: value.durationMs })
+        setMessage(text)
+        onResult(text)
       } else {
-        const message = `${t('sql.rows', { n: value.rows.length, ms: value.durationMs })}${value.truncated ? ` · ${t('sql.truncated')}` : ''}`
-        setResult({ columns: value.columns, rows: value.rows, message })
-        onResult(message)
+        const text = `${t('sql.rows', { n: value.rows.length, ms: value.durationMs })}${value.truncated ? ` · ${t('sql.truncated')}` : ''}`
+        /*
+         * A statement that returned a result set leaves for the 浏览 tab, WITH its
+         * message, so the notice survives the switch. `changeTab` clears notices, and
+         * the caller sets this one AFTER switching — the same ordering the insert
+         * flow needs.
+         */
+        onSelect(sql, value)
+        onResult(text)
       }
     } catch (failure) {
       onError(failure instanceof Error ? failure.message : String(failure))
@@ -1835,7 +1985,8 @@ function SqlTabView(props: {
         value: sql,
         placeholder: t('sql.placeholder'),
         spellcheck: false,
-        onChange: (event: { target: { value: string } }) => setSql(event.target.value),
+        'data-dbm-sql-editor': '',
+        onChange: (event: { target: { value: string } }) => onSql(event.target.value),
         onKeyDown: (event: { key: string; ctrlKey: boolean; metaKey: boolean; preventDefault(): void }) => {
           if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
             event.preventDefault()
@@ -1846,55 +1997,21 @@ function SqlTabView(props: {
       React.createElement(
         'div',
         { className: 'dbm-row' },
-        React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-primary', disabled: busy, onClick: () => { void run() } }, busy ? t('sql.running') : t('sql.run')),
+        React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-primary', disabled: busy, 'data-dbm-sql-run': '', onClick: () => { void run() } }, busy ? t('sql.running') : t('sql.run')),
         React.createElement(
           'label',
           { className: 'dbm-check' },
           React.createElement('input', {
             type: 'checkbox',
             checked: allowWrite,
-            onChange: (event: { target: { checked: boolean } }) => setAllowWrite(event.target.checked),
+            onChange: (event: { target: { checked: boolean } }) => onAllowWrite(event.target.checked),
           }),
           t('sql.allowWrite'),
         ),
         React.createElement('span', { className: 'dbm-hint' }, t('sql.allowWrite.hint')),
       ),
+      message === undefined ? null : React.createElement('div', { className: 'dbm-hint', 'data-dbm-sql-message': '' }, message),
     ),
-    result === undefined
-      ? null
-      : React.createElement(
-          'div',
-          { className: 'dbm-tab-body', style: { minHeight: 0 } },
-          React.createElement('div', { className: 'dbm-pad dbm-hint' }, result.message),
-          result.columns.length === 0
-            ? null
-            : React.createElement(
-                'div',
-                { className: 'dbm-data' },
-                React.createElement(
-                  'table',
-                  null,
-                  React.createElement('thead', null, React.createElement('tr', null, result.columns.map(column => React.createElement('th', { key: column }, column)))),
-                  React.createElement(
-                    'tbody',
-                    null,
-                    result.rows.map((row, index) =>
-                      React.createElement(
-                        'tr',
-                        { key: index },
-                        row.map((cell, cellIndex) =>
-                          React.createElement(
-                            'td',
-                            { key: cellIndex, className: isNull(cell) ? 'dbm-null' : undefined, title: renderCell(cell) },
-                            renderCell(cell),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-        ),
   )
 }
 

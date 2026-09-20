@@ -1166,7 +1166,6 @@ textarea.dbm-cell-input {
   background: var(--dsw-alias-bg-base);
   border-top: 1px solid var(--dsw-alias-border-l3);
 }
-.dbm-search-results { flex: 1 1 auto; min-height: 240px; min-width: 0; }
 .dbm-search-table { width: auto; }
 /*
  * A fixed layout for the four control columns.

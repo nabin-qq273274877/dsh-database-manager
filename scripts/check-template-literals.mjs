@@ -57,6 +57,7 @@ const files = [
   'scripts/e2e-insert-tinyint.mjs',
   'scripts/e2e-sqlite-boolean.mjs',
   'scripts/e2e-structure-edit.mjs',
+  'scripts/e2e-select-jump.mjs',
   'scripts/probe-side-refresh.mjs',
   'scripts/probe-side-refresh-poll.mjs',
   'scripts/probe-collate-link.mjs',

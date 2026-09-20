@@ -326,27 +326,34 @@ try {
       const viewport = { w: window.innerWidth, h: window.innerHeight };
       const reachable = rect.top >= 0 && rect.bottom <= viewport.h && rect.width > 0 && rect.height > 0
         && rect.top < viewport.h;
+      /*
+       * The page's own height, measured BEFORE running.
+       *
+       * Running now leaves this tab (the rows appear in 浏览), so anything measured
+       * afterwards would read the grid's page instead of the form's. The wide-table
+       * case asserts that a long field list scrolls the PAGE rather than a box, and
+       * that is a property of the form as rendered — hence before.
+       */
+      const pageScrollHeight = page.scrollHeight;
+      const pageClientHeight = page.clientHeight;
       click(runBtn);
 
-      // Wait for the reported count, which is what identifies the NEW result: the
-      // grid keeps the previous page while the query runs.
+      /*
+       * A search now lands in the 浏览 tab, so what identifies the NEW result is the
+       * ACTIVE TAB plus the rows in the browse grid. The old version waited for a
+       * "matched N rows" line under the form, which no longer exists — the count moved
+       * to the browse toolbar (共 N 行).
+       */
+      const browseTab = await waitFor(() => {
+        const el = document.querySelector('.dbm-tab[data-active="true"]');
+        return el !== null && /浏览|Browse/.test(el.textContent || '') ? el : null;
+      }, 12000);
       const countLine = await waitFor(() => {
         const el = Array.from(document.querySelectorAll('.dbm-hint'))
-          .find((e) => /(匹配到|matched)\\s*\\d/.test(e.textContent || ''));
+          .find((e) => /(共|of)\\s*\\d/.test(e.textContent || ''));
         return el || null;
       }, 10000);
       await sleep(400);
-
-      /*
-       * Running a search must SHOW its outcome.
-       *
-       * A full field list makes the form taller than the viewport, so the grid renders
-       * below the fold. Without the scroll-into-view the user presses 执行 and the
-       * screen does not move — the search ran, but nothing visible happened.
-       */
-      const grid = document.querySelector('.dbm-search-results');
-      const gridRect = grid === null ? null : grid.getBoundingClientRect();
-      const gridVisibleAfterRun = gridRect !== null && gridRect.top < window.innerHeight && gridRect.bottom > 0;
 
       return {
         hasRawWhere,
@@ -361,9 +368,13 @@ try {
         reachAtTop,
         reachAtMid,
         reachAtBottom,
-        pageScrollHeight: page.scrollHeight,
-        pageClientHeight: page.clientHeight,
-        gridVisibleAfterRun,
+        pageScrollHeight,
+        pageClientHeight,
+        // The new contract: the rows are in the browse tab, and this tab is left.
+        landedOnBrowse: browseTab !== null,
+        // The search page's own result box must be gone entirely.
+        searchPageHasOwnGrid: document.querySelector('[data-dbm-search-page] .dbm-search-results') !== null,
+        filterBar: (document.querySelector('[data-dbm-browse-filters]') || {}).textContent || null,
         countText: countLine === null ? null : countLine.textContent.trim(),
         rows: Array.from(document.querySelectorAll('.dbm-data tbody tr')).map((tr) => (tr.textContent || '').trim()),
         errors: Array.from(document.querySelectorAll('.dbm-error')).map((el) => el.textContent.trim()),
@@ -436,12 +447,15 @@ try {
   check('the run button is visible without scrolling', shape.runReachable === true, { rect: shape.runRect, viewportH: shape.viewportH })
   check('the run button stays visible while the field list scrolls', shape.reachAtTop === true && shape.reachAtMid === true && shape.reachAtBottom === true, { top: shape.reachAtTop, mid: shape.reachAtMid, bottom: shape.reachAtBottom })
   /*
-   * Running a search shows its outcome rather than silently scrolling nowhere.
+   * Running a search lands in the 浏览 tab, and this page shows no grid of its own.
    *
-   * With every field displayed the grid can sit below the fold, so pressing 执行 must
-   * bring it into view — otherwise the search looks like it did nothing.
+   * Both halves are the point: the rows must be visible somewhere the user can page
+   * and sort them, and the form must not keep a second copy underneath. Asserted on the
+   * ACTIVE tab because presence checks cannot tell the two arrangements apart — both
+   * render a table in the document.
    */
-  check('the results are brought into view after running', shape.gridVisibleAfterRun === true, { page: shape.pageScrollHeight, client: shape.pageClientHeight })
+  check('running a search lands on the 浏览 tab', shape.landedOnBrowse === true, { count: shape.countText, errors: shape.errors })
+  check('the search page keeps no result grid of its own', shape.searchPageHasOwnGrid === false, null)
   // phpMyAdmin builds no WHERE clause with nothing filled in, so pressing 执行 on a
   // blank form must search for everything rather than refuse.
   check('an empty search shows all rows', shape.rows.length === 4, { rows: shape.rows.length, count: shape.countText, errors: shape.errors })

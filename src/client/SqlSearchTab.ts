@@ -30,6 +30,9 @@ import * as React from 'react'
  * literal percent sign), and the value control follows the column's declared type
  * — a date gets the browser's date picker, an enum a list of exactly its members.
  * The SQL tab remains the escape hatch for a query this form cannot express.
+ *
+ * This component renders the FORM ONLY. The rows appear in the 浏览 tab, which the
+ * caller switches to when a search runs — see {@link SqlSearchTabProps.onSearch}.
  */
 
 import type { ColumnInfo, RowFilter, RowFilterOperator } from '../protocol.ts'
@@ -59,17 +62,15 @@ export interface SqlSearchTabProps {
   loading: boolean
   /** Rows the last search matched, for the count line. */
   total?: number
-  /** Send the criteria; an empty list means "no filter", i.e. every row. */
+  /**
+   * Send the criteria; an empty list means "no filter", i.e. every row.
+   *
+   * The caller shows the results in the 浏览 tab rather than under this form. Both tabs
+   * present rows the same way, and a second grid here meant the same data appeared in
+   * two shapes depending on where you ran the query.
+   */
   onSearch(filters: RowFilter[]): void
   onError(message: string | undefined): void
-  /**
-   * The result grid, rendered by the caller.
-   *
-   * Passed in rather than built here because it is the 浏览 tab's grid in
-   * read-only mode — the same paging, sorting and cell copy. A second grid
-   * implementation would be a second place for those to differ.
-   */
-  results?: React.ReactNode
 }
 
 /** The starting operator for a column, so a fresh row is already usable. */
@@ -92,7 +93,7 @@ function criteriaFrom(filters: RowFilter[]): Record<string, Criterion> {
 
 /** The 搜索 tab. */
 export function SqlSearchTab(props: SqlSearchTabProps): React.ReactElement {
-  const { columns, filters, loading, total, onSearch, onError, results } = props
+  const { columns, filters, loading, total, onSearch, onError } = props
   /**
    * The typed criteria, keyed by column name.
    *
@@ -101,16 +102,6 @@ export function SqlSearchTab(props: SqlSearchTabProps): React.ReactElement {
    * seeded for every column on every structural reload.
    */
   const [criteria, setCriteria] = React.useState<Record<string, Criterion>>(() => criteriaFrom(filters))
-  /**
-   * The result grid's box, so a submitted search can be brought into view.
-   *
-   * Needed because the field list is now shown in FULL rather than inside a capped
-   * scroll box: on a wide table the form is taller than the viewport, so the results
-   * render below the fold. Without this the user presses 执行 and sees nothing happen —
-   * the search did run, but its outcome is off-screen. `nearest` keeps it
-   * non-intrusive: when the grid is already visible nothing moves.
-   */
-  const resultsRef = React.useRef<HTMLDivElement | null>(null)
 
   /**
    * The form adopts a search issued from elsewhere — a column's 非重复值 shortcut,
@@ -183,19 +174,13 @@ export function SqlSearchTab(props: SqlSearchTabProps): React.ReactElement {
       return
     }
     onError(undefined)
-    onSearch(parsed)
     /*
-     * Bring the results into view AFTER the request has been issued.
-     *
-     * A frame is yielded first so the grid exists and has been laid out: scrolling to
-     * a box that is about to appear would compute its position from the pre-search
-     * layout. `nearest` then does nothing when the grid is already on screen — the
-     * case on a table narrow enough to fit — so this only moves the viewport when the
-     * outcome would otherwise be unreachable.
+     * The caller switches to the 浏览 tab, which is where the rows appear — so there is
+     * nothing to scroll into view here any more. The previous version kept a handle on a
+     * result grid below the form and scrolled to it; that grid no longer exists, and
+     * leaving the call behind would have scrolled a detached node.
      */
-    requestAnimationFrame(() => {
-      resultsRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
-    })
+    onSearch(parsed)
   }
 
   const clear = (): void => {
@@ -383,8 +368,5 @@ export function SqlSearchTab(props: SqlSearchTabProps): React.ReactElement {
       ),
       React.createElement('div', { className: 'dbm-hint' }, t('search.hint')),
     ),
-    // The result grid, in its own box under the form. The page scrolls as a whole
-    // (see the styles), so the grid only needs a height it can lay rows out in.
-    results === undefined ? null : React.createElement('div', { className: 'dbm-search-results', ref: resultsRef }, results),
   )
 }
