@@ -1072,14 +1072,25 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
           key: 'search-body',
           columns,
           filters: browse.filters ?? [],
-          join: browse.filterJoin ?? 'and',
           loading: rows?.loading === true,
           ...(rows?.page === undefined ? {} : { total: rows.page.total }),
-          onSearch: (filters, join) => {
-            // A search always starts at page 1: the previous page number was a
-            // position in the PREVIOUS result set, and keeping it would land the
-            // user past the end of a narrower one.
-            const merged: BrowseQuery = { ...browse, page: 1, filters, filterJoin: join }
+          onSearch: filters => {
+            /*
+             * A search always starts at page 1: the previous page number was a
+             * position in the PREVIOUS result set, and keeping it would land the user
+             * past the end of a narrower one.
+             *
+             * An EMPTY list is a real search and not a no-op: phpMyAdmin's page sends
+             * no `WHERE` when no row holds a value, so "search with nothing filled in"
+             * means every row. The filter list is DROPPED from the query state in that
+             * case rather than stored as `[]`, because the two are indistinguishable
+             * to the drivers and `undefined` is what a plain read uses.
+             */
+            const merged: BrowseQuery = {
+              ...browse,
+              page: 1,
+              ...(filters.length === 0 ? { filters: undefined, filterJoin: undefined } : { filters, filterJoin: 'and' as const }),
+            }
             setBrowse(merged)
             void loadRows({
               schema: selection.schema,
@@ -1087,8 +1098,7 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
               page: 1,
               pageSize: merged.pageSize,
               mode: 'search',
-              filters,
-              filterJoin: join,
+              ...(filters.length === 0 ? {} : { filters, filterJoin: 'and' as const }),
             })
           },
           onError: message => { setError(message); if (message !== undefined) setNotice(undefined) },

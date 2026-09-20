@@ -147,18 +147,19 @@ try {
   await wait(4500)
 
   /**
-   * Run one search and return what the grid shows.
+   * Run one search through the QBE form and return what the grid shows.
    *
    * @param tag - a per-case tag appended to the source name. Each case reloads the
    *   page and creates its own source, so a SHARED name would put several
    *   same-named entries in the user's configuration at once — the ambiguity that
-   *   made an earlier version of the sibling script read the wrong database.
-   * @param column - the field to search.
-   * @param operator - 'contains' or 'isNull', by the operator's option VALUE
-   *   (which is the wire name, not the label).
-   * @param text - what to type, or undefined for a unary operator.
+   *   made an earlier version of this script read the wrong database.
+   * @param criteria - one entry per row to fill in: { column, operator, text }.
+   *   'operator' is the wire name of the option's VALUE, 'text' the operand to type
+   *   (omit it for a unary operator, which has no value control). An empty list
+   *   presses 执行 with nothing filled in, which is its own case: phpMyAdmin sends
+   *   no WHERE then and shows every row.
    */
-  const runSearch = async (tag, column, operator, text) => {
+  const runSearch = async (tag, criteria) => {
     /** This case's own source name, so no two entries ever share one. */
     const sourceName = `${SOURCE_NAME} ${tag}`
     const flow = `(async () => {
@@ -173,6 +174,7 @@ try {
         el.dispatchEvent(new Event('change', { bubbles: true }));
       };
       const sourceName = ${JSON.stringify(sourceName)};
+      const criteria = ${JSON.stringify(criteria)};
 
       const row = Array.from(document.querySelectorAll('nav button[aria-label]'))
         .find((b) => ['数据库管理', 'Database'].includes((b.getAttribute('aria-label') || '').trim()));
@@ -213,39 +215,52 @@ try {
       if (!searchTab) return { fatal: 'no search tab' };
       click(searchTab);
 
-      const cond = await waitFor(() => document.querySelector('[data-dbm-condition="0"]'), 8000);
-      if (!cond) return { fatal: 'the search form rendered no condition row' };
+      const page = await waitFor(() => document.querySelector('[data-dbm-search-page]'), 8000);
+      if (!page) return { fatal: 'the search page did not render', error: (document.querySelector('.dbm-error') || {}).textContent };
       const hasRawWhere = document.querySelector('.dbm-tab-body textarea[placeholder*="WHERE"]') !== null
         || document.querySelector('.dbm-tab-body input[placeholder*="WHERE"]') !== null;
+      const headers = Array.from(page.querySelectorAll('.dbm-search-table thead th')).map((th) => (th.textContent || '').trim());
+      const rowNames = Array.from(page.querySelectorAll('[data-dbm-search-row]')).map((tr) => tr.getAttribute('data-dbm-search-row'));
 
-      // The field, by the wire value of its option.
-      const selects = cond.querySelectorAll('select');
-      const fieldOption = Array.from(selects[0].options).find((o) => o.value === ${JSON.stringify(column)});
-      if (!fieldOption) return { fatal: 'the form offers no ' + ${JSON.stringify(column)} + ' column', options: Array.from(selects[0].options).map((o) => o.value) };
-      setSelect(selects[0], fieldOption.value);
-      await sleep(400);
+      for (const criterion of criteria) {
+        const target = page.querySelector('[data-dbm-search-row="' + criterion.column + '"]');
+        if (target === null) return { fatal: 'the form has no row for ' + criterion.column, rowNames };
+        const ops = target.querySelector('[data-dbm-search-operator]');
+        if (ops === null) return { fatal: 'the row has no operator control' };
+        if (criterion.operator !== undefined) {
+          const offered = Array.from(ops.options).map((o) => o.value);
+          if (!offered.includes(criterion.operator)) return { fatal: 'the row offers no ' + criterion.operator, offered };
+          setSelect(ops, criterion.operator);
+          await sleep(350);
+        }
+        if (criterion.text !== undefined) {
+          const value = target.querySelector('[data-dbm-search-value]');
+          if (value === null) return { fatal: 'the row has no value control for ' + criterion.operator };
+          value.focus();
+          // Ask the driver for real typed input: a native value setter leaves
+          // React's state empty, so the form would refuse a box holding text.
+          window.__dbmTypingRequest = criterion.text;
+          const started = Date.now();
+          while (window.__dbmTypingRequest !== null && Date.now() - started < 20000) await sleep(120);
+        }
+      }
 
-      const ops = cond.querySelectorAll('select')[1];
-      const opOption = Array.from(ops.options).find((o) => o.value === ${JSON.stringify(operator)});
-      if (!opOption) return { fatal: 'the form offers no ' + ${JSON.stringify(operator)} + ' operator', options: Array.from(ops.options).map((o) => o.value) };
-      setSelect(ops, opOption.value);
-      await sleep(300);
-
-      // Type real input into the value field, or skip it for a unary operator.
-      const valueField = cond.querySelector('input.dbm-input');
-      ${text === undefined
-        ? 'if (valueField) return { fatal: "a unary operator still shows a value field" };'
-        : `if (!valueField) return { fatal: 'the operator has no value field' };
-      valueField.focus();
-      window.__dbmWaitingForTyping = true;
-      window.__dbmTyped = () => { window.__dbmWaitingForTyping = false; };
-      const started = Date.now();
-      while (window.__dbmWaitingForTyping && Date.now() - started < 20000) await sleep(120);`}
-
-      const searchBtn = Array.from(document.querySelectorAll('.dbm-btn'))
-        .find((b) => (b.textContent || '').trim() === '搜索' || (b.textContent || '').trim() === 'Search');
-      if (!searchBtn) return { fatal: 'no search button' };
-      click(searchBtn);
+      const runBtn = page.querySelector('[data-dbm-search-run]');
+      if (runBtn === null) return { fatal: 'no search button' };
+      /*
+       * The run button must be REACHABLE without scrolling.
+       *
+       * Measured while checking the page visually: the whole form was the scroll
+       * container, so on a seven-column table the 执行 button sat below the fold and
+       * the screenshot showed no run button at all. That is a presence check's blind
+       * spot — the element exists and responds to a synthetic click, so every other
+       * assertion here passed. Only the geometry catches it.
+       */
+      const rect = runBtn.getBoundingClientRect();
+      const viewport = { w: window.innerWidth, h: window.innerHeight };
+      const reachable = rect.top >= 0 && rect.bottom <= viewport.h && rect.width > 0 && rect.height > 0
+        && rect.top < viewport.h;
+      click(runBtn);
 
       // Wait for the reported count, which is what identifies the NEW result: the
       // grid keeps the previous page while the query runs.
@@ -258,6 +273,11 @@ try {
 
       return {
         hasRawWhere,
+        headers,
+        rowNames,
+        runRect: { top: Math.round(rect.top), bottom: Math.round(rect.bottom), height: Math.round(rect.height) },
+        viewportH: viewport.h,
+        runReachable: reachable,
         countText: countLine === null ? null : countLine.textContent.trim(),
         rows: Array.from(document.querySelectorAll('.dbm-data tbody tr')).map((tr) => (tr.textContent || '').trim()),
         errors: Array.from(document.querySelectorAll('.dbm-error')).map((el) => el.textContent.trim()),
@@ -265,21 +285,30 @@ try {
     })()`
 
     const flowPromise = session.evaluate(flow)
-    // Type with the browser as soon as the flow asks for it. Skipped for a unary
-    // operator, which has no value field.
-    if (text !== undefined) {
-      for (let attempt = 0; attempt < 250; attempt++) {
-        const waiting = await session.evaluate('window.__dbmWaitingForTyping === true')
-        if (waiting === true) {
-          await session.send('Input.insertText', { text })
-          await wait(300)
-          await session.evaluate('window.__dbmTyped && window.__dbmTyped()')
-          break
-        }
-        await wait(120)
+    /*
+     * Serve the page's typing requests until the flow resolves.
+     *
+     * One request per filled-in row, and the number of them depends on the case, so
+     * this cannot be a single fixed round: it loops until the flow settles. A fixed
+     * loop left the second value box empty and the form then searched for the wrong
+     * thing — a failure that reads as a product bug rather than as a harness one.
+     */
+    let settled = false
+    const outcome = flowPromise.then(
+      value => { settled = true; return value },
+      error => { settled = true; throw error },
+    )
+    for (let attempt = 0; attempt < 900 && !settled; attempt++) {
+      await wait(120)
+      if (settled) break
+      const pending = await session.evaluate('window.__dbmTypingRequest === undefined || window.__dbmTypingRequest === null ? null : window.__dbmTypingRequest')
+      if (typeof pending === 'string' && pending !== '') {
+        await session.send('Input.insertText', { text: pending })
+        await wait(300)
+        await session.evaluate('window.__dbmTypingRequest = null')
       }
     }
-    return flowPromise
+    return outcome
   }
 
   /** Reload so each case starts from a fresh panel with its own source. */
@@ -288,26 +317,55 @@ try {
     await wait(4500)
   }
 
-  // ---- case 1: contains finds exactly the matching row ---------------------
-  const contains = await runSearch('contains', 'name', 'contains', 'alph')
-  check('the search tab has no raw-WHERE box', contains.hasRawWhere === false, contains.hasRawWhere)
+  // ---- case 1: the form is phpMyAdmin's QBE shape, and empty means all ----
+  const shape = await runSearch('shape', [])
+  check('the search tab has no raw-WHERE box', shape.hasRawWhere === false, shape.hasRawWhere)
+  check('the header is 字段 / 类型 / 排序规则 / 运算符 / 值', JSON.stringify(shape.headers) === JSON.stringify(['字段', '类型', '排序规则', '运算符', '值']), shape.headers)
+  /*
+   * EVERY column has a row, in the table's own order. That is what makes this the
+   * phpMyAdmin page rather than the "add a condition and pick a column" form it
+   * replaced: the user reads the list to find the field, instead of hunting for it
+   * in a dropdown.
+   */
+  check('every column of the table has a row', JSON.stringify(shape.rowNames) === JSON.stringify(['id', 'name', 'note']), shape.rowNames)
+  // The run button must be on screen without scrolling. Only the geometry catches
+  // this: the element is present and clickable either way.
+  check('the run button is visible without scrolling', shape.runReachable === true, { rect: shape.runRect, viewportH: shape.viewportH })
+  // phpMyAdmin builds no WHERE clause with nothing filled in, so pressing 执行 on a
+  // blank form must search for everything rather than refuse.
+  check('an empty search shows all rows', shape.rows.length === 4, { rows: shape.rows.length, count: shape.countText, errors: shape.errors })
+  await reset()
+
+  // ---- case 2: contains finds exactly the matching row --------------------
+  const contains = await runSearch('contains', [{ column: 'name', operator: 'contains', text: 'alph' }])
   check('contains matched the single expected row', contains.rows.length === 1 && contains.rows[0].includes('alpha'), contains.rows)
   await reset()
 
-  // ---- case 2: a wildcard character is a literal --------------------------
+  // ---- case 3: two filled rows combine with AND --------------------------
+  // 'a' matches every name; the second row keeps only the rows with a note, so the
+  // two NULL rows must be gone. A form that ORed them would return all four.
+  const anded = await runSearch('anded', [
+    { column: 'name', operator: 'contains', text: 'a' },
+    { column: 'note', operator: 'isNotNull' },
+  ])
+  check('two filled rows combine with AND', anded.rows.length === 2, anded.rows)
+  check('the AND excluded the NULL rows', !anded.rows.some(r => r.includes('beta') || r.includes('delta')), anded.rows)
+  await reset()
+
+  // ---- case 4: a wildcard character is a literal --------------------------
   // '100%' is in the note column, so a wildcard interpretation would also match
   // the rows whose note is non-null — and 'x' contains no percent at all.
-  const percent = await runSearch('percent', 'note', 'contains', '%')
+  const percent = await runSearch('percent', [{ column: 'note', operator: 'contains', text: '%' }])
   check('a percent sign matches only the literal 100% row', percent.rows.length === 1 && percent.rows[0].includes('100%'), percent.rows)
   await reset()
 
-  // ---- case 3: an injection-shaped operand is a value ---------------------
-  const injection = await runSearch('injection', 'name', 'contains', "' OR 1=1 --")
+  // ---- case 5: an injection-shaped operand is a value ---------------------
+  const injection = await runSearch('injection', [{ column: 'name', operator: 'contains', text: "' OR 1=1 --" }])
   check('an injection-shaped value matches nothing', injection.rows.length === 0, { rows: injection.rows, count: injection.countText })
   await reset()
 
-  // ---- case 4: is NULL, which no text operand can express ----------------
-  const nulls = await runSearch('isnull', 'note', 'isNull', undefined)
+  // ---- case 6: is NULL, which no text operand can express ----------------
+  const nulls = await runSearch('isnull', [{ column: 'note', operator: 'isNull' }])
   check('is NULL returned exactly the two NULL rows', nulls.rows.length === 2, nulls.rows)
   await reset()
 

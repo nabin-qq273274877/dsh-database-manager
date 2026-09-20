@@ -27,7 +27,22 @@ export type FieldKind =
   | { kind: 'text'; maxLength?: number; multiline: boolean }
   | { kind: 'binary' }
 
-/** Decide which control a column's declared type gets. */
+/**
+ * Decide which control a column's declared type gets.
+ *
+ * `TINYINT(1)` deliberately gets a NUMBER box, not two labelled choices. `BOOL`,
+ * `BOOLEAN` and `TINYINT(1)` are the same type on the server — measured:
+ * `information_schema.COLUMNS` answers `tinyint(1)` for all three, and for `BOOL`
+ * too — so the browser cannot tell a column the schema author declared as a flag
+ * from one declared as a small integer. Offering two choices for the first would
+ * offer them for the second as well, and a `TINYINT(1)` holding 2, 3 or -1 (all
+ * legal) could not be typed at all. A text box accepts everything the column
+ * accepts, so it is the control that is never wrong.
+ *
+ * SQLite is unaffected and keeps its two choices: its `BOOLEAN` is a declared
+ * type of its own and that literal name survives into `ColumnInfo.type`, so the
+ * `^(bool|boolean)$` branch below is the one it takes.
+ */
 export function fieldKind(column: ColumnInfo): FieldKind {
   // An enum's members decide the control before the type name does: MySQL spells
   // it `enum('a','b')` and the list is exactly what the user may choose from.
@@ -36,9 +51,6 @@ export function fieldKind(column: ColumnInfo): FieldKind {
   }
   const type = column.type.trim().toLowerCase()
   if (/^(bool|boolean)$/.test(type)) return { kind: 'boolean' }
-  // MySQL's conventional boolean is `TINYINT(1)`. A different width is a number:
-  // treating `TINYINT(4)` as a flag would offer two choices for a small integer.
-  if (/^tinyint\(1\)/.test(type)) return { kind: 'boolean' }
   if (/^(tiny|small|medium|big)?(int|year)/.test(type)) return { kind: 'number', integer: true }
   if (/^(decimal|numeric|float|double|real|bit)/.test(type)) return { kind: 'number', integer: false }
   if (/^date$/.test(type)) return { kind: 'date' }
@@ -93,6 +105,48 @@ export function operatorsFor(type: string): RowFilterOperator[] {
     return ['contains', 'notContains', 'startsWith', 'endsWith', 'eq', 'neq', 'in', 'isNull', 'isNotNull']
   }
   return [...ROW_FILTER_OPERATORS]
+}
+
+/**
+ * The operators the 搜索 tab offers for one column.
+ *
+ * Same as {@link operatorsFor} with one narrowing: an `enum` column gets only
+ * equality and the null tests. Its value control is a dropdown of the declared
+ * members (see {@link searchValueKind}), so a pattern operator would ask for part
+ * of a member in a control that cannot accept one, and `in` would ask for a
+ * comma-separated list where only one member can be picked — the same set
+ * phpMyAdmin's own search page gives an enum (`=`, `!=`).
+ *
+ * A `set` column is deliberately NOT narrowed: it holds several comma-separated
+ * members, so its value is typed freely and the pattern and membership operators
+ * all apply. phpMyAdmin reaches the same split by class (`enum` → enum operators,
+ * `set` → the text branch).
+ */
+export function searchOperators(column: ColumnInfo): RowFilterOperator[] {
+  if (/^enum\b/.test(column.type.trim().toLowerCase())) {
+    return ['eq', 'neq', 'isNull', 'isNotNull']
+  }
+  return operatorsFor(column.type)
+}
+
+/**
+ * How the 搜索 tab should render a column's value control.
+ *
+ * `members` only for an `enum` whose list the host actually reported. A `set` is
+ * excluded even though it also has members: picking one from a single-select
+ * cannot express a value that holds several, so a set is typed freely.
+ *
+ * ABSENT (not `members: []`) when the host reported no list: a `enum` whose list
+ * could not be read must fall back to a text box rather than render a dropdown
+ * with nothing in it, which would make the column unsearchable.
+ */
+export type SearchValueKind = { kind: 'members'; options: string[] } | { kind: 'input' }
+
+/** Decide the 搜索 tab's value control for one column. */
+export function searchValueKind(column: ColumnInfo): SearchValueKind {
+  if (!/^enum\b/.test(column.type.trim().toLowerCase())) return { kind: 'input' }
+  if (column.options === undefined || column.options.length === 0) return { kind: 'input' }
+  return { kind: 'members', options: column.options }
 }
 
 /** Whether an operator takes no operand (so its input field is hidden). */

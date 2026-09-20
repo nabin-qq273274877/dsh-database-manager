@@ -1088,6 +1088,70 @@ textarea.dbm-cell-input {
 .dbm-op-block .dbm-field-inline > .dbm-input { width: 160px; }
 
 /*
+ * ---- the 搜索 tab (phpMyAdmin's query by example) ----------------------
+ *
+ * One row per column under a 字段 / 类型 / 排序规则 / 运算符 / 值 header — the shape
+ * of phpMyAdmin's search page, and the reason the form is a TABLE rather than a
+ * list of controls: the column, its type and its collation are what the user reads
+ * to decide which row to fill in, so they belong on the same line as the operator
+ * and the value.
+ *
+ * The form is a flex COLUMN of three parts, and only the middle one scrolls:
+ * the heading, then the table, then the action row. Making the whole form scroll
+ * instead put the 执行 button inside the scroll area, and at seven columns it was
+ * already scrolled out of sight — measured on the screenshot pass, where the page
+ * showed no run button at all. The primary action of a form must not be reachable
+ * only by scrolling.
+ */
+.dbm-search-form {
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  /* Bounded so the result grid always has room; a wide table's form is long. */
+  max-height: 45%;
+  min-height: 0;
+  overflow: hidden;
+  flex: none;
+}
+/* The scrolling part: the table, and nothing else. */
+.dbm-search-scroll { overflow: auto; min-height: 0; flex: 1 1 auto; }
+/* The action row and the hints stay put, whatever the table's height. */
+.dbm-search-actions { flex: none; }
+.dbm-search-table { width: auto; }
+/*
+ * A fixed layout for the four control columns.
+ *
+ * Without it the browser sizes each column from its own content, which differs per
+ * row: a decimal(10,2) type cell is wider than int, so the operator dropdowns of two
+ * rows do not line up — and lining up is the whole reason the column, its type and
+ * its collation sit on the same line as the controls. Column 1 (the name) is the only
+ * one that sizes to content.
+ */
+.dbm-search-table { table-layout: fixed; }
+.dbm-search-table th:first-child { width: 200px; }
+.dbm-search-table th:nth-child(2) { width: 130px; }
+.dbm-search-table th:nth-child(3) { width: 150px; }
+.dbm-search-table th:nth-child(4) { width: 150px; }
+.dbm-search-table th:nth-child(5) { width: auto; }
+/* The name is a row header, so it is not bold-shrunken like a data cell. */
+.dbm-search-table tbody th { font-weight: 500; text-align: left; }
+/* The operator and the value fill their column; the value cell holds up to two. */
+.dbm-search-operator { width: 100%; box-sizing: border-box; }
+.dbm-search-value-cell { display: flex; align-items: center; gap: 6px; }
+.dbm-search-value-cell > .dbm-input,
+.dbm-search-value-cell > .dbm-select { flex: 1 1 auto; min-width: 0; max-width: 320px; }
+/*
+ * A row that holds a condition is marked.
+ *
+ * The whole point of this form is "which rows are taking part", and without a mark
+ * the user has to re-read every value box to find out — on a 40-column table that
+ * is the difference between a usable page and a guessing game.
+ */
+.dbm-search-table tbody tr[data-used="true"] > th:first-child { color: var(--dsw-alias-label-primary); font-weight: 600; }
+.dbm-search-table tbody tr[data-used="true"] { background: var(--dsw-alias-interactive-bg-hover); }
+
+/*
  * The TTL countdown. Tabular figures so a ticking number does not make the row
  * jitter as digits change width, and the code font so it reads as a value rather
  * than as prose.
