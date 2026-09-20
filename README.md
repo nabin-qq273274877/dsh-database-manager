@@ -11,7 +11,7 @@ DSH（DeepSeek Harness）数据库管理插件：侧边栏「数据库管理」�
 
 **MySQL / SQLite 面板**（类 phpMyAdmin）
 - 左侧：库 / 表树（搜索过滤、视图标记、行数）
-- 右侧标签页：**浏览**（分页与跳页、点列排序、按索引排序、双击单元格就地编辑、行编辑/复制/删除、多选批量删除）、**结构**（改列/删列/新增列、主键编辑、唯一约束、索引管理、非重复值计数）、**SQL**（编辑器，Ctrl+Enter 执行）、**搜索**（字段+比较+值表单，不写 SQL）、**插入**（按列类型给控件）
+- 右侧标签页：**浏览**（分页与跳页、点列排序、按索引排序、双击单元格就地编辑、行编辑/复制/删除、多选批量删除）、**结构**（改列/删列/新增列、主键编辑、唯一约束、索引管理、非重复值计数）、**SQL**（编辑器，Ctrl+Enter 执行）、**搜索**（字段+比较+值表单，不写 SQL）、**插入**（按列类型给控件）、**操作**（照 phpMyAdmin 的操作页：移动表 / 表选项 / 复制表 / 表维护 / 删除数据或表）
 - 导入导出：SQL 转储（结构/数据/DROP 可选，整库或单表）与 CSV（当前表），在浏览器侧完成
 
 ### 编辑面各处的取舍
@@ -46,6 +46,21 @@ DSH（DeepSeek Harness）数据库管理插件：侧边栏「数据库管理」�
 顶部「要插入的行数」选定组数后生成对应数量的**独立表单**（和 phpMyAdmin 一样），也可「+ 再加一行」；整批在一个事务里提交，中途失败不会只进一半。没填过的空表单会被跳过，所以多要几行比实际填的多没有关系。
 
 多行提交时各行**可以**列出不同的列：每个表单是独立填的，一行留空某列、另一行填上它是常态。驱动按「连续且列清单相同」分组，相同的那几行仍合成一条多行 `INSERT`（CSV 导入的省往返路径没有变）。
+
+**两个提交按钮的落点不同**：**插入**成功后切到**浏览**页——写进去的那一行才是接下来要看的东西；**插入并再填一行**留在插入页，因为它的存在理由就是继续填同一批数据，跳走会让它变成第二个「插入」。两个按钮的区别就是这一步，所以完成语也分开写（「已插入 N 行，已切到浏览」）。切页在写提示之前：`changeTab` 会清掉上一条提示，反过来写就会连这次插入的确认一起清掉，表单消失而屏幕上没有任何说明。
+
+**操作页**（照 phpMyAdmin 的操作页做，排在标签最后 —— 一个能删表的页签不该夹在只读写行的页签之间）
+
+五块，依次是**将数据表移动到**、**表选项**、**将数据表复制到**、**表维护**、**删除数据或数据表**。每块自带目标或取值表单，不做一个「点一下就动」的工具条：移动一张表没有撤销，一次点击不足以作为它的确认。
+
+- **移动**：MySQL 走一条 `RENAME TABLE a.t TO b.t`（服务器搬文件，数据/索引/触发器/外键都跟着走，不复制行）；同库改名走的也是它。**视图不能换库**——MySQL 直接拒绝（`Changing schema from 'a' to 'b' is not allowed`），所以这一条在驱动里就被拒了，并说明原因。SQLite 的库就是一个文件，没有可搬的目标，「移动」只能是同库改名（`ALTER TABLE … RENAME TO`），跨库明确拒绝。
+- **复制**：`CREATE TABLE new LIKE old` + `INSERT INTO new (列清单) SELECT …`。列清单**点名**且排除生成列——`INSERT INTO new SELECT * FROM old` 在有 STORED 生成列的表上会被 MySQL 拒绝（实测 `The value specified for generated column … is not allowed`）。索引、主键、AUTO_INCREMENT 跟着 `LIKE` 走；**触发器与指向表外的外键不复制**，界面上写明。`CREATE TABLE … LIKE` 对视图会报「不是 BASE TABLE」，所以复制视图也在驱动里拒绝并说明。
+- **表选项**：存储引擎、整理（排序规则）、表注释、下一个 AUTO_INCREMENT 值、行格式。**只提交改过的字段**——没动过的保持服务端原值，否则「只改注释」会顺手把别人刚改过的引擎改回去。字符集不求用户填：排序规则唯一决定它属于哪个字符集，host 从 `information_schema.COLLATIONS` 查出来。`DEFAULT CHARACTER SET … COLLATE …` 与 `CONVERT TO …` 是两件事（前者只改新列的默认，后者重写每一列），所以后者单独一个勾选框。表注释里的反斜杠直接拒绝并说明（MySQL 把它当转义符，写进去的和读出来的会不一致）。
+- **AUTO_INCREMENT 的当前值从 `SHOW CREATE TABLE` 读**，不读 `information_schema.TABLES` 也不读 `SHOW TABLE STATUS`。实测：`ALTER TABLE t AUTO_INCREMENT=900` 之后下一次插入真的发出 900，而 `information_schema`（新连接也一样）与 `SHOW TABLE STATUS` 都还报 4 —— InnoDB 的计数器在内存里，那两处读的是数据字典里的旧副本。用它们预填，用户看到的就是一个服务器已经越过的值。
+- **维护**：四个按钮走的是本表的维护语句，引擎不支持的那个**仍渲染但禁用**并写明原因（SQLite 没有 REPAIR）。结果弹窗原样列出引擎自己的说明——InnoDB 的 `repair` 会回一句「不支持」，那是答案而不是错误。
+- **删除数据或数据表**：两个都不可恢复，各自带确认框（单个表会点名；清空在视图上禁用并说明视图没有自己的数据）。
+
+**引擎不支持的那几块，禁用并写明原因，而不是藏起来**：藏起来会让按文档找过来的用户找不到控件；SQLite 上三块都不可用（没有可搬的目标库、没有忠实的复制表语句、没有可改的表选项），理由就写在块里。
 
 **导出 / 导入**
 - 导出：SQL 转储或 CSV。转储用引擎自己的建表语句原文（SQLite 另附 `sqlite_master` 里的索引与触发器原文，MySQL 的 `SHOW CREATE TABLE` 已内联），行按 100 行一条 `INSERT` 批量写出；生成列不进列清单（两种引擎都拒绝写入生成列，写进去整份 dump 就导不进来）。表按外键引用做拓扑排序，否则先建子表会被引擎拒绝。
@@ -239,6 +254,7 @@ node scripts/probe-surface.mjs lib/index.js   # 离线：列出注册的工具 /
 ```bash
 curl "http://127.0.0.1:3080/api/dsh-database/sources"     # 期望 200 + allowAgentWrite 字段
 curl "http://127.0.0.1:3080/api/dsh-database/engines"     # 期望三个引擎的可用性
+curl "http://127.0.0.1:3080/api/dsh-database/sources/<id>/table-actions"   # 期望该引擎支持的表操作，SQLite 是空数组、MySQL 是三个
 ```
 
 **不要拿别的端口去验。** desktop 的 dsh 端口是随机挑的，在它上面验等于在测另一份部署（另一个 home、另一份 `dsh-database.json`）。
@@ -293,6 +309,8 @@ npm run build       # lib/index.js（host）+ lib/client.js（browser）
 | `scripts/e2e-sql-search.mjs` | 搜索表单端到端：用 `Input.insertText` 走浏览器真实输入，断言绑定语义（`%` 是字符、`' OR 1=1 --` 匹配 0 行） |
 | `scripts/probe-mysql-schema.mts` | 对本地 MySQL 逐步验证结构编辑与导入导出，可重复运行 |
 | `scripts/e2e-table-actions.mjs` | 表批量操作与库操作工具条的端到端（MySQL 29 项 / SQLite 26 项；断言两引擎的差异，如 SQLite 无「新建数据库」、无「修复」） |
+| `scripts/e2e-operations.mjs` | 「操作」页端到端（MySQL 44 项 / SQLite 32 项）：tab 排在最后、五个区块按 phpMyAdmin 顺序、维护按钮的支持标记与引擎一致、视图上的清空被禁用且给出原因；MySQL 侧还核对**表选项表单预填的是服务端实时值**（自增值必须等于 `SHOW CREATE TABLE` 的值）、只改注释后引擎与行格式原样保留、复制带数据且原表不动、移动后表从原库消失并出现在目标库且右侧跟着走。写入均回读服务端核对，每次提交后还断言错误条为空 —— 第一版脚本没建目标库，复制被 `Unknown database` 拒绝而错误条没人看，直到后面读目标库时才以一句「no such table」暴露出来 |
+| `scripts/e2e-insert-jump.mjs` | 插入表单两个按钮的落点（8 项）：提交前确认当前 tab 是「插入」，**插入**提交后 active 的 tab 必须变成「浏览」且表格真的渲染、写进去的行真的在服务端、完成语说到了这次跳转；**插入并再填一行**必须留在插入页且表单还在（只测第一个按钮发现不了这个区别） |
 | `scripts/verify-db-ops.mjs` | 对真实 MySQL 逐项核对**破坏性操作的效果**（清空是否真的清了、复制是否带数据、改名是否删掉原库、改编码是否落库），19 项 |
 | `scripts/probe-collate-link.mjs` | 排序规则随字符集联动：拿服务端 `information_schema` 真实列表逐项比对，含切换字符集后旧值不残留 |
 | `scripts/probe-table-stats.mjs` | 表列表的**行数与大小**端到端（9 项）：`TABLE_ROWS` / `DATA_LENGTH` / `INDEX_LENGTH` 在 information_schema 里是 `bigint unsigned`，而连接池开着 `supportBigNumbers` + `bigNumberStrings`（防止 BIGINT 精度丢失），mysql2 因此把这些列一律返回**字符串**——驱动曾用 `typeof === 'number'` 判断，于是每张表的行数都显示「未知」、大小都空白。探针直接读**渲染后的单元格**（而非只看驱动），并和服务端返回逐项对账，同时断言数值是 number 而非数字字符串 |

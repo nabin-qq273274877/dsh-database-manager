@@ -35,7 +35,7 @@ import type {
 import { REDIS_CREATABLE_TYPES } from './protocol.ts'
 import type { ColumnSpec, ColumnAttribute, RowFilter, RowFilterOperator } from './drivers/types.ts'
 import { COLUMN_ATTRIBUTES, INDEX_KINDS, MAINTENANCE_OPS, ROW_FILTER_OPERATORS } from './drivers/types.ts'
-import type { DatabaseOperationOptions, MaintenanceOp, TableIndexSpec, TableOptions } from './drivers/types.ts'
+import type { DatabaseOperationOptions, MaintenanceOp, TableIndexSpec, TableOptionPatch, TableOptions, TableTarget } from './drivers/types.ts'
 import { isRedisDriver, isSqlDriver, type Driver, type SqlDriver } from './drivers/types.ts'
 import { isRedisReadCommand } from './drivers/redis.ts'
 import type { IndexRegistry } from './index-registry.ts'
@@ -146,6 +146,85 @@ function parseFilters(value: unknown): RowFilter[] {
       ...(read('value2') === undefined ? {} : { value2: read('value2')! }),
     }
   })
+}
+
+/** Read a `schema` field from a request body, or undefined. */
+function readSchema(body: Record<string, unknown>): string | undefined {
+  return typeof body['schema'] === 'string' && body['schema'] !== '' ? body['schema'] : undefined
+}
+
+/** Read a `schema` query parameter, or undefined. */
+function readSchemaFrom(url: URL): string | undefined {
+  return queryParam(url, 'schema')
+}
+
+/**
+ * Read the `table` field of a request body.
+ *
+ * The table name itself is NOT validated here: it reaches a driver, which quotes and
+ * checks every identifier it uses ({@link requireIdentifier}). Validating it twice
+ * would be a second grammar to keep in step with that one — and the one that matters
+ * is the one next to the statement.
+ *
+ * @returns the name, or a message naming what is missing.
+ */
+function readTableName(body: Record<string, unknown>): { table: string } | { error: string } {
+  const table = body['table']
+  if (typeof table !== 'string' || table === '') return { error: 'table is required' }
+  return { table }
+}
+
+/**
+ * Read the `target` object of a move or copy request.
+ *
+ * @returns the target, or a message naming the first missing field.
+ */
+function readTableTarget(body: Record<string, unknown>): { target: TableTarget } | { error: string } {
+  const raw = asJsonObject(body['target'])
+  if (raw === undefined) return { error: 'target must be an object with a schema and a table' }
+  const schema = raw['schema']
+  if (typeof schema !== 'string' || schema === '') return { error: 'target.schema is required' }
+  const table = raw['table']
+  if (typeof table !== 'string' || table === '') return { error: 'target.table is required' }
+  return { target: { schema, table } }
+}
+
+/**
+ * Validate a 表选项 patch.
+ *
+ * Only the fields PRESENT are returned, because absent means "leave it alone" — the
+ * page edits a table's options, and emitting a field the user did not touch would
+ * revert a change someone else made since the page was opened. The values are checked
+ * for TYPE here and for grammar in the driver, which is where the statements are
+ * built: a mistyped field must be a 400 naming it, and an unusable value must be an
+ * error next to the statement that would carry it.
+ *
+ * @returns the patch, or a message naming the first problem.
+ */
+function parseTableOptionPatch(body: Record<string, unknown>): { patch: TableOptionPatch } | { error: string } {
+  const patch: TableOptionPatch = {}
+  const readText = (key: string, into: (value: string) => void): string | undefined => {
+    const value = body[key]
+    if (value === undefined) return undefined
+    if (typeof value !== 'string') return `${key} must be a string`
+    into(value)
+    return undefined
+  }
+
+  for (const key of ['engine', 'collation', 'charset', 'comment', 'rowFormat'] as const) {
+    const problem = readText(key, value => { patch[key] = value })
+    if (problem !== undefined) return { error: problem }
+  }
+  if (body['autoIncrement'] !== undefined) {
+    const value = body['autoIncrement']
+    if (typeof value !== 'number' || !Number.isInteger(value)) return { error: 'autoIncrement must be an integer' }
+    patch.autoIncrement = value
+  }
+  if (body['convertColumns'] !== undefined) {
+    if (typeof body['convertColumns'] !== 'boolean') return { error: 'convertColumns must be a boolean' }
+    patch.convertColumns = body['convertColumns']
+  }
+  return { patch }
 }
 
 /** Read a {@link ColumnSpec} out of a request body field. */
@@ -1264,6 +1343,124 @@ export function makeRoutes(deps: RoutesDeps): { routes: WebRoute[]; upgrade: Web
           return
         }
         writeError(res, 400, 'op must be "truncate" or "drop"')
+        return
+      }
+
+      /*
+       * ---- the 操作 tab ---------------------------------------------------
+       *
+       * Support is asked for first and reported here, so the browser disables what the
+       * engine cannot do and says why — the same contract the maintenance routes use.
+       * A route that let an unsupported action through would surface it as an engine
+       * error, which for SQLite's "cannot move a table between files" reads as a bug
+       * rather than as a fact about the engine.
+       */
+      if (action === 'table-actions' && method === 'GET') {
+        if (!isSqlDriver(driver)) {
+          writeError(res, 400, 'table-actions is only available for SQL data sources')
+          return
+        }
+        writeJson(res, 200, { support: driver.tableActionSupport() })
+        return
+      }
+
+      if (action === 'table/move' && method === 'POST') {
+        if (!isSqlDriver(driver)) {
+          writeError(res, 400, 'table/move is only available for SQL data sources')
+          return
+        }
+        const body = asJsonObject(await readJsonBody(req))
+        if (body === undefined) {
+          writeError(res, 400, 'body must be a JSON object')
+          return
+        }
+        const named = readTableName(body)
+        if ('error' in named) {
+          writeError(res, 400, named.error)
+          return
+        }
+        const readTarget = readTableTarget(body)
+        if ('error' in readTarget) {
+          writeError(res, 400, readTarget.error)
+          return
+        }
+        const support = driver.tableActionSupport()
+        if (!support.includes('move')) {
+          writeError(res, 400, `${driver.kind} 不支持移动表`)
+          return
+        }
+        writeJson(res, 200, { result: await driver.moveTable(readSchema(body), named.table, readTarget.target) })
+        return
+      }
+
+      if (action === 'table/copy' && method === 'POST') {
+        if (!isSqlDriver(driver)) {
+          writeError(res, 400, 'table/copy is only available for SQL data sources')
+          return
+        }
+        const body = asJsonObject(await readJsonBody(req))
+        if (body === undefined) {
+          writeError(res, 400, 'body must be a JSON object')
+          return
+        }
+        const named = readTableName(body)
+        if ('error' in named) {
+          writeError(res, 400, named.error)
+          return
+        }
+        const readTarget = readTableTarget(body)
+        if ('error' in readTarget) {
+          writeError(res, 400, readTarget.error)
+          return
+        }
+        const support = driver.tableActionSupport()
+        if (!support.includes('copy')) {
+          writeError(res, 400, `${driver.kind} 不支持复制表`)
+          return
+        }
+        writeJson(res, 200, {
+          result: await driver.copyTable(readSchema(body), named.table, readTarget.target, {
+            includeData: body['includeData'] !== false,
+            isView: body['isView'] === true,
+          }),
+        })
+        return
+      }
+
+      if (action === 'table/options') {
+        if (!isSqlDriver(driver)) {
+          writeError(res, 400, 'table/options is only available for SQL data sources')
+          return
+        }
+        const table = queryParam(url, 'table')
+        if (table === undefined) {
+          writeError(res, 400, 'table is required')
+          return
+        }
+        if (method === 'GET') {
+          writeJson(res, 200, { options: await driver.tableOptionInfo(readSchemaFrom(url), table) })
+          return
+        }
+        if (method === 'POST') {
+          const body = asJsonObject(await readJsonBody(req))
+          if (body === undefined) {
+            writeError(res, 400, 'body must be a JSON object')
+            return
+          }
+          const parsed = parseTableOptionPatch(body)
+          if ('error' in parsed) {
+            writeError(res, 400, parsed.error)
+            return
+          }
+          const support = driver.tableActionSupport()
+          if (!support.includes('options')) {
+            writeError(res, 400, `${driver.kind} 不支持修改表选项`)
+            return
+          }
+          writeJson(res, 200, { result: await driver.alterTableOptions(readSchemaFrom(url), table, parsed.patch) })
+          return
+        }
+        writeError(res, 405, `${method} is not allowed on ${path}`)
         return
       }
 

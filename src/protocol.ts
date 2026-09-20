@@ -364,6 +364,16 @@ export type { ColumnAttribute, IndexKind, TableIndexSpec, TableOptions } from '.
 export { COLUMN_ATTRIBUTES, INDEX_KINDS } from './drivers/types.ts'
 
 /**
+ * The 操作 tab's own contract, re-exported for the same reason.
+ *
+ * `TableActionOp` is what the panel enables and disables its blocks by, and
+ * `TableOptionInfo` / `TableOptionPatch` are the 表选项 form's read and write shapes —
+ * all three cross the wire, so all three live in one place.
+ */
+export type { TableActionOp, TableOptionInfo, TableOptionPatch, TableTarget } from './drivers/types.ts'
+export { TABLE_ACTION_OPS } from './drivers/types.ts'
+
+/**
  * One column-spec edit, as the host expects it.
  *
  * Lives here rather than in a client module because it crosses the wire: the 结构
@@ -800,6 +810,14 @@ export const DB_API = {
   maintenanceSupport: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/maintenance-support`,
   /** Database-level operations: create / drop / rename / copy / charset. */
   databaseOp: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/database`,
+  /** Which table-level operations this engine can perform (移动 / 表选项 / 复制). */
+  tableActions: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/table-actions`,
+  /** Move a table to another database (「将数据表移动到」). */
+  tableMove: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/table/move`,
+  /** Copy a table (structure and optionally data) into another database. */
+  tableCopy: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/table/copy`,
+  /** Read (GET) or change (POST) one existing table's options. */
+  tableOptions: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/table/options?${params}`,
   query: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/query`,
   redisInfo: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/info`,
   redisKeys: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/keys?${params}`,

@@ -195,6 +195,124 @@ export interface TableOptions {
 }
 
 /**
+ * One EXISTING table's option values, as phpMyAdmin's 表选项 page reads them.
+ *
+ * Distinct from {@link TableOptions}, which is what a CREATE TABLE is asked for:
+ * this is what the server reports about a table that already exists, so its fields
+ * are the ones a server actually stores and can be read back — `autoIncrement` and
+ * `rowFormat` have no place in a create request, and `tail` (SQLite's own trailing
+ * keywords) cannot be changed after the fact at all.
+ *
+ * Every field is optional and ABSENT means "this engine does not report it", not
+ * "it is empty": a comment that was never set and a comment that was set to the
+ * empty string are the same state in MySQL, but an engine with no notion of a table
+ * comment must not be shown an empty one.
+ */
+export interface TableOptionInfo {
+  /**
+   * True when the object is a VIEW rather than a base table.
+   *
+   * A view has none of the options this page edits — measured: MySQL reports NULL
+   * for its engine, collation and row format and the literal `VIEW` as its comment —
+   * so the page must say that rather than present four fields whose values mean
+   * nothing there.
+   */
+  isView?: boolean
+  /** MySQL `ENGINE`. */
+  engine?: string
+  /** MySQL `TABLE_COLLATION`. */
+  collation?: string
+  /**
+   * The character set the collation belongs to.
+   *
+   * Read from `information_schema.COLLATIONS` rather than by splitting the
+   * collation's name: a collation belongs to exactly one character set, but the
+   * name does not always start with it (`utf8mb3_general_ci` is not in the
+   * `utf8` set), so a prefix match would eventually emit a pair the server
+   * rejects with "COLLATION … is not valid for CHARACTER SET …".
+   */
+  charset?: string
+  /** MySQL `TABLE_COMMENT`. */
+  comment?: string
+  /**
+   * The next value an AUTO_INCREMENT column will hand out.
+   *
+   * ABSENT when the table has no auto-increment column, which is why the page shows
+   * the field only when this is present. Read from `SHOW CREATE TABLE` and NOT from
+   * `information_schema.TABLES.AUTO_INCREMENT` — measured: after
+   * `ALTER TABLE … AUTO_INCREMENT=900` the table really did issue id 900, while both
+   * `information_schema` and `SHOW TABLE STATUS` still reported 4 on a fresh
+   * connection, because InnoDB's counter lives in memory and those two read the data
+   * dictionary's cached copy. `SHOW CREATE TABLE` agreed with the id actually issued.
+   */
+  autoIncrement?: number
+  /** MySQL `ROW_FORMAT`. */
+  rowFormat?: string
+}
+
+/**
+ * The changes phpMyAdmin's 表选项 page can make to an existing table.
+ *
+ * Every field is optional and an absent one means "leave it alone" — the page edits
+ * a table's options, and a field the user did not touch must not be rewritten with
+ * the value the page happened to read on open (a second user's change in between
+ * would be silently reverted). An EMPTY STRING is different from absent for
+ * `comment`, where it is the way to remove the comment.
+ */
+export interface TableOptionPatch {
+  /** MySQL: convert the table to this storage engine. */
+  engine?: string
+  /**
+   * MySQL: the collation to set, and the character set it belongs to.
+   *
+   * Emitted as `DEFAULT CHARACTER SET x COLLATE y`, which changes the default for
+   * NEW columns only. {@link convertColumns} switches to the `CONVERT TO` form,
+   * which rewrites every existing textual column.
+   */
+  collation?: string
+  charset?: string
+  /**
+   * Use `CONVERT TO CHARACTER SET … COLLATE …` rather than `DEFAULT CHARACTER SET …`.
+   *
+   * The difference is not cosmetic and is why this is a separate flag rather than
+   * being implied: `DEFAULT` changes what a new column will be declared as, while
+   * `CONVERT TO` re-encodes every existing column of the table — a data-rewriting
+   * operation proportional to the table's size. Measured on the same table:
+   * `DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_bin` left the existing column's
+   * collation alone, and `CONVERT TO … COLLATE utf8mb4_general_ci` changed it.
+   */
+  convertColumns?: boolean
+  /** MySQL: the new table comment; an empty string removes it. */
+  comment?: string
+  /** MySQL: the next AUTO_INCREMENT value. */
+  autoIncrement?: number
+  /** MySQL: the row format. */
+  rowFormat?: string
+}
+
+/** What a table is moved or copied to. */
+export interface TableTarget {
+  /** The database it goes into. */
+  schema: string
+  /** Its name there; the same name as the source is the ordinary case. */
+  table: string
+}
+
+/**
+ * The table-level operations phpMyAdmin's 操作 page offers.
+ *
+ * Enumerated rather than inferred from "the method failed": the page disables what
+ * the engine cannot do and says why, in the same way `maintenanceSupport` does — a
+ * button whose only outcome is an engine error message is worse than a disabled one
+ * that explains itself.
+ */
+export type TableActionOp = 'move' | 'copy' | 'options'
+
+/** Every table action, for validation and the UI's list. */
+export const TABLE_ACTION_OPS: readonly TableActionOp[] = ['move', 'options', 'copy']
+
+
+/**
  * Whether a table-maintenance operation actually does anything on InnoDB.
  *
  * `repair` is a MyISAM-era statement: on InnoDB the server answers with a NOTE
@@ -292,6 +410,16 @@ export interface SqlDriver {
    * an engine error message.
    */
   maintenanceSupport(): MaintenanceOp[]
+  /**
+   * Which of the table-level operations this engine can actually perform.
+   *
+   * The 操作 tab's equivalent of {@link maintenanceSupport}, and asked for the same
+   * reason: SQLite's "database" is a file, so a table cannot be moved or copied into
+   * another one, and it has no storage engine, table collation or table comment to
+   * change. Reporting that up front is what lets those controls be disabled with the
+   * reason attached, rather than offered and then failed.
+   */
+  tableActionSupport(): TableActionOp[]
   /** Run maintenance on one or more tables. */
   maintain(schema: string | undefined, tables: string[], op: MaintenanceOp): Promise<MaintenanceResult[]>
   /**
@@ -369,6 +497,43 @@ export interface SqlDriver {
   createIndex(schema: string | undefined, table: string, spec: { name: string; columns: string[]; unique: boolean }): Promise<QueryResult>
   /** Drop an index. Refuses a primary key's own index. */
   dropIndex(schema: string | undefined, table: string, name: string): Promise<QueryResult>
+  /**
+   * Move a table to another database, keeping its data.
+   *
+   * A whole-table MOVE, so the source object is gone afterwards — that is what
+   * distinguishes it from {@link copyTable} and it is the reason the panel confirms
+   * it. `target.schema` may be the table's own database, in which case this is a
+   * rename; the drivers decide that from the arguments rather than from a separate
+   * "rename" entry point, because a rename and a cross-database move are the same
+   * statement on MySQL.
+   *
+   * @throws when the source and target are identical, when the target table already
+   *   exists, or when the engine cannot move objects between schemas at all.
+   */
+  moveTable(schema: string | undefined, table: string, target: TableTarget): Promise<QueryResult>
+  /**
+   * Copy a table (and, when asked, its rows) to another database.
+   *
+   * `includeData: false` copies the structure alone — phpMyAdmin's 「仅结构」.
+   * A source that is a VIEW is refused rather than copied: neither engine has a
+   * statement that clones a view, and the `CREATE TABLE … LIKE` a naive
+   * implementation would use turns a view into an ordinary empty TABLE.
+   */
+  copyTable(
+    schema: string | undefined,
+    table: string,
+    target: TableTarget,
+    options?: { includeData?: boolean; isView?: boolean },
+  ): Promise<QueryResult>
+  /** The option values the server reports for one existing table. */
+  tableOptionInfo(schema: string | undefined, table: string): Promise<TableOptionInfo>
+  /**
+   * Change an existing table's options.
+   *
+   * Every field of the patch is optional and only the ones present are emitted, so a
+   * value the page did not touch is left as the server has it.
+   */
+  alterTableOptions(schema: string | undefined, table: string, patch: TableOptionPatch): Promise<QueryResult>
   /**
    * The `CREATE TABLE` statement for a table, as the engine stores it.
    *

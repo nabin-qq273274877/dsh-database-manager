@@ -42,6 +42,10 @@ import {
   type MaintenanceOpView,
   type MaintenanceOutcome,
   type DatabaseOpView,
+  type TableActionOp,
+  type TableOptionInfo,
+  type TableOptionPatch,
+  type TableTarget,
 } from '../protocol.ts'
 
 /** Error carrying the route's JSON error message. */
@@ -314,8 +318,7 @@ export class DbApi {
     return (await send<{ result: QueryResult }>(DB_API.row(id), 'DELETE', body)).result
   }
 
-  /**
-   * Empty a table or drop it.
+  /** Empty a table or drop it.
    *
    * `op` is explicit rather than inferred from the HTTP method: both actions
    * are destructive and irreversible, so a malformed request must not be able
@@ -323,6 +326,47 @@ export class DbApi {
    */
   async tableAction(id: string, body: { schema?: string; table: string; op: 'truncate' | 'drop'; isView?: boolean }): Promise<QueryResult> {
     return (await send<{ result: QueryResult }>(DB_API.table(id), 'POST', body)).result
+  }
+
+  /** Which of the 操作 tab's three blocks this engine can actually perform. */
+  async tableActionSupport(id: string): Promise<TableActionOp[]> {
+    return (await readJson<{ support: TableActionOp[] }>(await fetch(DB_API.tableActions(id)))).support
+  }
+
+  /** Move a table to another database. Irreversible for the source: the object moves. */
+  async moveTable(id: string, body: { schema?: string; table: string; target: TableTarget }): Promise<QueryResult> {
+    return (await send<{ result: QueryResult }>(DB_API.tableMove(id), 'POST', body)).result
+  }
+
+  /** Copy a table's structure, and optionally its rows, into another database. */
+  async copyTable(id: string, body: {
+    schema?: string
+    table: string
+    target: TableTarget
+    includeData?: boolean
+    isView?: boolean
+  }): Promise<QueryResult> {
+    return (await send<{ result: QueryResult }>(DB_API.tableCopy(id), 'POST', body)).result
+  }
+
+  /**
+   * The option values one existing table reports.
+   *
+   * Read fresh each time the 表选项 block is opened, rather than cached: the values
+   * are what the form is filled in against, and a cached copy would let the form
+   * submit a value the server has since changed.
+   */
+  async tableOptions(id: string, options: { schema?: string; table: string }): Promise<TableOptionInfo> {
+    return (await readJson<{ options: TableOptionInfo }>(await fetch(DB_API.tableOptions(id, query(options))))).options
+  }
+
+  /** Change an existing table's options; absent fields are left alone. */
+  async setTableOptions(id: string, body: { schema?: string; table: string; patch: TableOptionPatch }): Promise<QueryResult> {
+    return (await send<{ result: QueryResult }>(
+      DB_API.tableOptions(id, query({ schema: body.schema, table: body.table })),
+      'POST',
+      body.patch,
+    )).result
   }
 
   /** Run one SQL statement. `allowWrite` is the 允许写入 checkbox. */

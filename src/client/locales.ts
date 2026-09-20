@@ -220,6 +220,84 @@ export const zh = {
   'db.op.refreshSchemas': '刷新库列表',
   'db.op.createTable': '新建表',
 
+  /*
+   * 操作 tab: the table-level page phpMyAdmin's 操作 offers.
+   *
+   * The wording follows phpMyAdmin's own, because the user asked for that page by
+   * name ("像 phpmyadmin 一样") — 「将数据表移动到」、「表选项」、「将数据表复制到」. A
+   * clearer phrasing invented here would make the user hunt for the control they
+   * described.
+   *
+   * The block titles are the actions, and the reason a block is disabled is stated in
+   * the block itself rather than only in a tooltip: a tooltip needs a hover, and a
+   * control that reads as broken until hovered is the thing this avoids.
+   */
+  'tableop.title': '表操作',
+  'tableop.scope': '{schema} · {table}',
+  'tableop.viewHint': '「{table}」是视图，下面这些操作只对表有效。',
+
+  'tableop.move.title': '将数据表移动到',
+  'tableop.move.body': '把这张表和它的全部数据整体移动到另一个库；原库中不再有这张表。',
+  'tableop.move.target': '目标（数据库.数据表）',
+  'tableop.move.submit': '移动',
+  'tableop.move.busy': '正在移动…',
+  'tableop.move.done': '已把「{from}」移动到「{to}」',
+  'tableop.move.same': '这就是它现在的位置，请换一个库或换一个表名',
+  'tableop.move.needsName': '请填写目标表名',
+
+  'tableop.options.title': '表选项',
+  'tableop.options.body': '改这张表自身的选项；只提交你改过的字段，没动过的保持原样。',
+  'tableop.options.loading': '正在读取表选项…',
+  'tableop.options.engine': '存储引擎',
+  'tableop.options.collation': '整理（排序规则）',
+  'tableop.options.collationHint': '字符集由排序规则决定，会自动一并设置。',
+  'tableop.options.convert': '同时转换已有列的字符集（CONVERT TO，会重写整表数据）',
+  'tableop.options.convertHint': '不勾选时只改表的默认值，已有列不变；勾选后按新字符集重写每一列，耗时与表大小成正比。',
+  'tableop.options.comment': '表注释',
+  'tableop.options.autoIncrement': '下一个 AUTO_INCREMENT 值',
+  'tableop.options.autoIncrementHint': '只在这张表有自增列时出现。比当前已用过的值小时，MySQL 会忽略下调的部分。',
+  'tableop.options.rowFormat': '行格式',
+  'tableop.options.rowFormatDefault': '（不指定）',
+  'tableop.options.submit': '保存表选项',
+  'tableop.options.busy': '正在保存…',
+  'tableop.options.done': '已保存「{table}」的表选项',
+  'tableop.options.unchanged': '没有改过任何字段',
+  'tableop.options.aiInvalid': 'AUTO_INCREMENT 需要是一个不小于 1 的整数',
+  'tableop.options.commentBackslash': '表注释不能包含反斜杠：MySQL 会把反斜杠当转义符，写进去的和读出来的不一致',
+
+  'tableop.copy.title': '将数据表复制到',
+  'tableop.copy.body': '把结构与数据复制成另一个库里的新表，原表保持不变。索引、主键会一并复制；触发器与指向外部的外键不会。',
+  'tableop.copy.target': '目标（数据库.数据表）',
+  'tableop.copy.data': '同时复制数据',
+  'tableop.copy.dataHint': '不勾选则只复制结构（phpMyAdmin 的「仅结构」）。',
+  'tableop.copy.submit': '复制',
+  'tableop.copy.busy': '正在复制…',
+  'tableop.copy.done': '已复制为「{to}」',
+  'tableop.copy.needsName': '请填写目标表名',
+  'tableop.copy.same': '源和目标不能是同一张表',
+
+  'tableop.maint.title': '表维护',
+  'tableop.maint.body': '对这张表执行引擎的维护语句，结果里会原样列出引擎自己的说明（例如 InnoDB 的表不支持 repair）。',
+  'tableop.maint.check': '检查表',
+  'tableop.maint.optimize': '优化表',
+  'tableop.maint.repair': '修复表',
+  'tableop.maint.analyze': '分析表',
+  'tableop.maint.unsupported': '该引擎不支持此操作',
+  'tableop.maint.repairMissing': 'SQLite 没有 REPAIR 语句；表损坏时请从备份恢复或导出后重建，可先用「检查表」确认范围。',
+
+  'tableop.danger.title': '删除数据或数据表',
+  'tableop.danger.body': '两个都不可恢复；清空只删数据，删除表连结构一起去掉。',
+  'tableop.danger.truncate': '清空数据（保留表结构）',
+  'tableop.danger.truncateHint': 'SQLite 上是 DELETE FROM，行被逐条删除，且不会重置 AUTOINCREMENT 计数。',
+  'tableop.danger.drop': '删除表',
+  'tableop.danger.dropHint': '表、它的全部数据、索引和触发器都会被移除。',
+  'tableop.danger.viewTruncate': '「{table}」是视图，没有自己的数据可以清空。',
+
+  'tableop.unsupported.move': 'SQLite 的库就是一个文件，表不能移动到另一个库；如需迁移，请导出成 SQL 再导入。',
+  'tableop.unsupported.copy': 'SQLite 没有忠实的复制表语句：CREATE TABLE … AS SELECT 会丢掉主键、唯一约束与生成列。请用「导出」再「导入」。',
+  'tableop.unsupported.options': 'SQLite 没有可修改的表选项：没有存储引擎、没有表级排序规则、没有表注释的存放处。',
+  'tableop.supportFailed': '未能读取该引擎支持的表操作列表：{error}',
+
   'createTable.title': '新建表',
   'createTable.tableName': '表名',
   'createTable.columnName': '字段名',
@@ -346,6 +424,7 @@ export const zh = {
   'tab.sql': 'SQL',
   'tab.search': '搜索',
   'tab.insert': '插入',
+  'tab.operation': '操作',
 
   'browse.refresh': '刷新',
   'browse.pageSize': '每页',
@@ -510,6 +589,15 @@ export const zh = {
   'insert.submit': '插入',
   'insert.submitAndNew': '插入并再填一行',
   'insert.done': '已插入 {n} 行',
+  /*
+   * 单行插入会跳到浏览页，完成语因此要把这一步说出来。
+   *
+   * 不说的话，表单消失、表格出现，中间没有任何解释——切换本身是反馈，但只有把「已切到
+   * 浏览」写出来，这次切换才读作结果，而不是「表单没了」。批量那个按钮留在表单上，所以
+   * 它的话术不变。
+   */
+  'insert.doneAndBrowsing': '已插入 {n} 行，已切到「浏览」',
+  'insert.rowsDoneBrowsing': '已插入 {n} 行（{forms} 组），已切到「浏览」',
   'insert.required': '列「{column}」不允许为空',
   'insert.autoAssign': '留空则自动生成',
   'insert.blankHint': '（留空，用默认值）',
@@ -1050,6 +1138,73 @@ export const en: Record<DbKey, string> = {
   'tab.sql': 'SQL',
   'tab.search': 'Search',
   'tab.insert': 'Insert',
+  'tab.operation': 'Operations',
+
+  'tableop.title': 'Table operations',
+  'tableop.scope': '{schema} · {table}',
+  'tableop.viewHint': '“{table}” is a view; the blocks below apply to tables only.',
+
+  'tableop.move.title': 'Move table to',
+  'tableop.move.body': 'Move this table and all of its data to another database; it will no longer exist in this one.',
+  'tableop.move.target': 'Target (database.table)',
+  'tableop.move.submit': 'Move',
+  'tableop.move.busy': 'Moving…',
+  'tableop.move.done': 'Moved “{from}” to “{to}”',
+  'tableop.move.same': 'That is where it already is; pick another database or another table name',
+  'tableop.move.needsName': 'A target table name is required',
+
+  'tableop.options.title': 'Table options',
+  'tableop.options.body': 'Change this table’s own options. Only the fields you changed are submitted; the rest are left as the server has them.',
+  'tableop.options.loading': 'Reading the table options…',
+  'tableop.options.engine': 'Storage engine',
+  'tableop.options.collation': 'Collation',
+  'tableop.options.collationHint': 'The character set is derived from the collation and set along with it.',
+  'tableop.options.convert': 'Also convert the existing columns (CONVERT TO — rewrites the whole table)',
+  'tableop.options.convertHint': 'Unticked changes the table default only; ticked re-encodes every column, which costs time proportional to the table’s size.',
+  'tableop.options.comment': 'Table comment',
+  'tableop.options.autoIncrement': 'Next AUTO_INCREMENT value',
+  'tableop.options.autoIncrementHint': 'Shown only when this table has an auto-increment column. A value below the highest one already used is partly ignored by MySQL.',
+  'tableop.options.rowFormat': 'Row format',
+  'tableop.options.rowFormatDefault': '(unspecified)',
+  'tableop.options.submit': 'Save table options',
+  'tableop.options.busy': 'Saving…',
+  'tableop.options.done': 'Saved the options of “{table}”',
+  'tableop.options.unchanged': 'Nothing was changed',
+  'tableop.options.aiInvalid': 'AUTO_INCREMENT must be an integer of at least 1',
+  'tableop.options.commentBackslash': 'A table comment cannot contain a backslash: MySQL reads it as an escape, so what is stored differs from what is typed',
+
+  'tableop.copy.title': 'Copy table to',
+  'tableop.copy.body': 'Copy the structure and the data into a new table in another database; the original is left alone. Indexes and the primary key come along; triggers and foreign keys pointing out of the table do not.',
+  'tableop.copy.target': 'Target (database.table)',
+  'tableop.copy.data': 'Copy the data too',
+  'tableop.copy.dataHint': 'Unticked copies the structure only (phpMyAdmin’s 仅结构).',
+  'tableop.copy.submit': 'Copy',
+  'tableop.copy.busy': 'Copying…',
+  'tableop.copy.done': 'Copied to “{to}”',
+  'tableop.copy.needsName': 'A target table name is required',
+  'tableop.copy.same': 'The source and the target cannot be the same table',
+
+  'tableop.maint.title': 'Table maintenance',
+  'tableop.maint.body': 'Run the engine’s maintenance statements on this table. The result lists the engine’s own notes (for example that InnoDB tables do not support repair).',
+  'tableop.maint.check': 'Check table',
+  'tableop.maint.optimize': 'Optimize table',
+  'tableop.maint.repair': 'Repair table',
+  'tableop.maint.analyze': 'Analyze table',
+  'tableop.maint.unsupported': 'This engine does not support it',
+  'tableop.maint.repairMissing': 'SQLite has no REPAIR statement; recover from a backup or export and rebuild, and use 检查表 first to see how far the damage goes.',
+
+  'tableop.danger.title': 'Delete data or table',
+  'tableop.danger.body': 'Neither can be undone: emptying removes the rows only, dropping takes the structure with them.',
+  'tableop.danger.truncate': 'Empty the data (keep the table)',
+  'tableop.danger.truncateHint': 'On SQLite this is DELETE FROM: rows go one at a time and the AUTOINCREMENT counter is not reset.',
+  'tableop.danger.drop': 'Drop the table',
+  'tableop.danger.dropHint': 'The table, all of its data, its indexes and its triggers are removed.',
+  'tableop.danger.viewTruncate': '“{table}” is a view and has no rows of its own to empty.',
+
+  'tableop.unsupported.move': 'A SQLite database is one file, so a table cannot be moved into another one; export to SQL and import it there instead.',
+  'tableop.unsupported.copy': 'SQLite has no faithful table copy: CREATE TABLE … AS SELECT drops the primary key, the UNIQUE constraints and every generated column. Export and import instead.',
+  'tableop.unsupported.options': 'SQLite has no table options to change: no storage engine, no table-level collation and nowhere to store a table comment.',
+  'tableop.supportFailed': 'Could not read the table operations this engine supports: {error}',
 
   'browse.refresh': 'Refresh',
   'browse.pageSize': 'Per page',
@@ -1214,6 +1369,8 @@ export const en: Record<DbKey, string> = {
   'insert.submit': 'Insert',
   'insert.submitAndNew': 'Insert and add another',
   'insert.done': '{n} row(s) inserted',
+  'insert.doneAndBrowsing': '{n} row(s) inserted — switched to Browse',
+  'insert.rowsDoneBrowsing': '{n} row(s) inserted ({forms} form(s)) — switched to Browse',
   'insert.required': 'Column “{column}” cannot be empty',
   'insert.autoAssign': 'Leave blank to assign automatically',
   'insert.blankHint': '(blank — use the default)',

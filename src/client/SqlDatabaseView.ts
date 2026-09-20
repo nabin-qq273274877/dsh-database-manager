@@ -14,10 +14,11 @@ import * as React from 'react'
  * be read in isolation.
  */
 
-import type { ColumnInfo, DataSourceSummary, IndexInfo, MaintenanceOpView, MaintenanceOutcome, RowFilter, TableInfo, TablePage } from '../protocol.ts'
+import type { ColumnInfo, DataSourceSummary, IndexInfo, MaintenanceOpView, MaintenanceOutcome, RowFilter, TableActionOp, TableInfo, TablePage } from '../protocol.ts'
 import type { DbApi } from './api.ts'
 import { SqlBrowseTab, type BrowseQuery } from './SqlBrowseTab.ts'
 import { SqlInsertTab } from './SqlInsertTab.ts'
+import { SqlOperationsTab } from './SqlOperationsTab.ts'
 import { SqlSearchTab } from './SqlSearchTab.ts'
 import { SqlStructureTab } from './SqlStructureTab.ts'
 import { DatabaseActionDialog, MaintenanceReportDialog, TableBatchBar } from './SqlTableActions.ts'
@@ -26,7 +27,7 @@ import { ExportDialog, ImportDialog } from './SqlTransferDialogs.ts'
 import { BackButton, ErrorBanner, Empty, Modal, TabStrip, formatBytes, isNull, renderCell, t } from './ui.ts'
 
 /** The right-hand tabs of a SQL database panel. */
-type SqlTab = 'browse' | 'structure' | 'sql' | 'search' | 'insert'
+type SqlTab = 'browse' | 'structure' | 'sql' | 'search' | 'insert' | 'operation'
 
 /** Props for {@link SqlDatabaseView}. */
 export interface SqlDatabaseViewProps {
@@ -137,6 +138,16 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
   const [selectedTables, setSelectedTables] = React.useState<Set<string>>(new Set())
   /** Which maintenance operations this engine supports, read once per source. */
   const [maintenanceSupport, setMaintenanceSupport] = React.useState<MaintenanceOpView[]>([])
+  /**
+   * Which of the 操作 tab's three blocks this engine supports.
+   *
+   * `undefined` while the read is in flight, which is deliberately different from an
+   * empty list: "not known yet" must not be rendered as "this engine can do none of
+   * them", or every block would flash a disabled-with-reason state on open.
+   */
+  const [tableActionSupport, setTableActionSupport] = React.useState<TableActionOp[] | undefined>(undefined)
+  /** Set when the support read failed, so the 操作 tab can say so rather than guess. */
+  const [tableActionSupportError, setTableActionSupportError] = React.useState<string | undefined>(undefined)
   /** The maintenance report dialog's state. */
   const [maintenance, setMaintenance] = React.useState<{ op?: MaintenanceOpView; outcomes: MaintenanceOutcome[]; running: boolean } | undefined>(undefined)
   /** Which database-level action dialog is open, if any. */
@@ -226,6 +237,25 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     void api.maintenanceSupport(source.id)
       .then(support => { if (live) setMaintenanceSupport(support) })
       .catch(() => { if (live) setMaintenanceSupport([]) })
+    return () => { live = false }
+  }, [api, source.id])
+  /**
+   * Read the 操作 tab's support, once per source.
+   *
+   * A failure is KEPT rather than turned into an empty list: the two mean different
+   * things to the page — an engine that supports nothing shows a disabled block with
+   * the reason, whereas a read that failed must say the list could not be read rather
+   * than claim the engine is incapable.
+   */
+  React.useEffect(() => {
+    let live = true
+    void api.tableActionSupport(source.id)
+      .then(support => { if (live) { setTableActionSupport(support); setTableActionSupportError(undefined) } })
+      .catch((failure: unknown) => {
+        if (!live) return
+        setTableActionSupport([])
+        setTableActionSupportError(failure instanceof Error ? failure.message : String(failure))
+      })
     return () => { live = false }
   }, [api, source.id])
   // Single-schema engines (SQLite) have nothing to expand: open and load their
@@ -591,7 +621,12 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     if (nextTab === 'browse') void loadRows({ schema, table, page: 1, pageSize: browse.pageSize, mode: 'browse', withIndexes: true })
   }
 
-  /** Switch tabs, loading whatever the target tab needs. */
+  /**
+   * Switch tabs, loading whatever the target tab needs.
+   *
+   * 操作 loads the structure too: its 表选项 block needs to know whether the object is
+   * a view, and the tab strip only knows the name.
+   */
   const changeTab = (next: SqlTab): void => {
     setTab(next)
     setError(undefined)
@@ -600,7 +635,7 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     // The 搜索 tab needs the column list too, not only 结构 and 插入: its form is a
     // list of columns with per-type operators, so without them it renders an empty
     // condition row and offers nothing to search by.
-    if (next === 'structure' || next === 'insert' || next === 'search') {
+    if (next === 'structure' || next === 'insert' || next === 'search' || next === 'operation') {
       void loadStructure(activeSchema, activeTable)
     }
     if (next === 'browse') void loadRows({
@@ -616,6 +651,36 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
       orderDir: browse.orderDir,
       withIndexes: true,
     })
+  }
+
+  /**
+   * Follow a table that the 操作 tab moved.
+   *
+   * A same-database move is a RENAME: the tree's cached list for that database holds
+   * the old name, so it is re-read and the pane stays open on the new name. A
+   * cross-database move takes the table out of the open database altogether, so the
+   * pane returns to that database's TABLE LIST rather than following it into a
+   * database the user was not looking at — and whose tree node may not even be loaded.
+   * phpMyAdmin does the same: a move lands you on the target database's structure
+   * page, not inside the moved table.
+   */
+  const followMovedTable = (from: { schema: string; table: string }, to: { schema: string; table: string }): void => {
+    setSelectedTables(new Set())
+    if (from.schema === to.schema) {
+      // A rename: same database, new name. Nothing else about the pane changes.
+      setActiveTable(to.table)
+      setOpenSchemas(current => (current[to.schema] === true ? current : { ...current, [to.schema]: true }))
+      void loadTables(to.schema, true)
+      void loadStats(to.schema, true)
+      return
+    }
+    // The table left this database: both databases' cached lists are stale.
+    setActiveTable(undefined)
+    setActiveSchema(to.schema)
+    setOpenSchemas(current => (current[to.schema] === true ? current : { ...current, [to.schema]: true }))
+    void loadTables(from.schema, true)
+    void loadStats(from.schema, true)
+    void loadTables(to.schema)
   }
 
   /** Whether a table name matches the filter (empty filter matches all). */
@@ -913,6 +978,10 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
           { id: 'sql' as SqlTab, label: t('tab.sql') },
           { id: 'search' as SqlTab, label: t('tab.search') },
           { id: 'insert' as SqlTab, label: t('tab.insert') },
+          // 操作 (phpMyAdmin's own name for this page) goes LAST, after 插入: it is where
+          // the table-level operations live, and a tab that can drop the table should
+          // not sit between the ones that only read or write rows.
+          { id: 'operation' as SqlTab, label: t('tab.operation') },
         ],
         onChange: (next: SqlTab) => changeTab(next),
       }),
@@ -1083,15 +1152,82 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
           table: selection.table,
           columns,
           loading: columns.length === 0,
-          onDone: (message) => {
-            setNotice(message)
+          /*
+           * A single-row insert lands on 浏览; a batch stays on the form.
+           *
+           * This is what was reported: 插入后还停留在插入 tab. The two submit buttons
+           * mean different things and so deserve different outcomes — 插入完成了一次
+           * 写入，用户接着要看的是写进去的那一行；而「插入并再填一行」的存在理由就是
+           * 继续填同批数据，跳走会让这个按钮失去意义（phpMyAdmin 同样是这个行为）。
+           */
+          onDone: (message, outcome) => {
             setError(undefined)
             // An INSERT can change the row count the tree shows, so refresh it,
             // and the grid's total is now wrong too.
             void loadTables(selection.schema, true)
             void loadStats(selection.schema, true)
+            if (outcome === 'inserted') {
+              /*
+               * The switch comes FIRST, and the notice after it.
+               *
+               * `changeTab` clears the notice — a manual tab switch must not leave a
+               * stale message from the previous tab on screen — and that wiped the
+               * insert's own confirmation when the two were written the other way
+               * round. Measured: the form vanished, the grid appeared, and there was
+               * nothing at all saying the row had been written. Writing the notice last
+               * keeps both behaviours: a manual switch still clears, while the message
+               * belonging to the operation that CAUSED the switch survives it.
+               */
+              changeTab('browse')
+              setNotice(message)
+            } else {
+              setNotice(message)
+            }
           },
           onError: (message) => { setError(message); if (message !== undefined) setNotice(undefined) },
+        }),
+      )
+    }
+
+    if (tab === 'operation') {
+      /*
+       * The open table, as the tree's cached list knows it.
+       *
+       * `TableInfo` carries the object's kind (table vs view), which the destructive
+       * and copy blocks need — but the cached list is not guaranteed to hold this
+       * table: the pane can be opened from a list that has since been re-read, or from
+       * a database whose node was never expanded. The fallback is a plain table, and
+       * the 操作 tab reads the real kind from the server anyway; this value is only what
+       * the confirmation dialog names.
+       */
+      const info = (tablesBySchema[selection.schema] ?? []).find(candidate => candidate.name === selection.table)
+        ?? { name: selection.table, type: 'table' } satisfies TableInfo
+      body.push(
+        React.createElement(SqlOperationsTab, {
+          key: 'operation-body',
+          api,
+          sourceId: source.id,
+          engineKind: source.kind,
+          schema: selection.schema,
+          table: selection.table,
+          schemas,
+          // Passed through UNSET rather than defaulted to an empty list: the tab tells
+          // "this engine supports none of them" from "not read yet" by it, and an empty
+          // list would make every block flash a disabled-with-reason state on open.
+          support: tableActionSupport,
+          ...(tableActionSupportError === undefined ? {} : { supportError: tableActionSupportError }),
+          maintenanceSupport,
+          busy: batchBusy,
+          onBusy: setBatchBusy,
+          onNotice: message => { setNotice(message); if (message !== undefined) setError(undefined) },
+          onError: message => { setError(message); if (message !== undefined) setNotice(undefined) },
+          onMaintain: op => { void runMaintenance(selection.schema, [selection.table], op) },
+          onAskDanger: op => setConfirming({ kind: 'single', table: info, schema: selection.schema, op }),
+          onMoved: next => followMovedTable({ schema: selection.schema, table: selection.table }, next),
+          onTablesChanged: () => {
+            void loadTables(selection.schema, true)
+            void loadStats(selection.schema, true)
+          },
         }),
       )
     }

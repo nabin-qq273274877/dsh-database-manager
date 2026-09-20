@@ -564,6 +564,150 @@ describe.skipIf(!available)('built host half', () => {
     })
   })
 
+  /**
+   * The 操作 tab's route family.
+   *
+   * Driven against SQLite — the only engine a test can create on the spot — which also
+   * makes the SUPPORT contract the thing being pinned: every one of the three blocks
+   * must be reported unsupported, and every attempt must come back as a 400 with the
+   * reason rather than as an engine error. The MySQL half of the same contract is in
+   * `test/table-actions.test.ts`, against a real server.
+   */
+  describe('the 操作 tab routes', () => {
+    /** The routes are driven through the suite's own SQLite source. */
+    const run = async (sql: string): Promise<Response> => fetch(`${base}/sources/app/query`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sql, allowWrite: true }),
+    })
+
+    beforeAll(async () => {
+      await run('DROP TABLE IF EXISTS op_t')
+      await run('CREATE TABLE op_t (id INTEGER PRIMARY KEY, v TEXT)')
+    })
+
+    it('reports which table actions this engine supports', async () => {
+      const body = (await (await fetch(`${base}/sources/app/table-actions`)).json()) as { support: string[] }
+      // A SQLite "database" is a file: nothing can be moved or copied into another one,
+      // and there are no table options to change.
+      expect(body.support).toEqual([])
+    })
+
+    it('refuses a move with the engine reason, not with a syntax error', async () => {
+      const response = await fetch(`${base}/sources/app/table/move`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ schema: 'main', table: 'op_t', target: { schema: 'other', table: 'op_t' } }),
+      })
+      expect(response.status).toBe(400)
+      expect(((await response.json()) as { error: string }).error).toMatch(/不支持移动表/)
+      // Nothing was attempted, so nothing moved.
+      const tables = (await (await fetch(`${base}/sources/app/tables?schema=main`)).json()) as { tables: Array<{ name: string }> }
+      expect(tables.tables.map(table => table.name)).toContain('op_t')
+    })
+
+    it('refuses a copy and an option change the same way', async () => {
+      const copy = await fetch(`${base}/sources/app/table/copy`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ schema: 'main', table: 'op_t', target: { schema: 'main', table: 'op_t_copy' } }),
+      })
+      expect(copy.status).toBe(400)
+      expect(((await copy.json()) as { error: string }).error).toMatch(/不支持复制表/)
+
+      const options = await fetch(`${base}/sources/app/table/options?schema=main&table=op_t`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ comment: 'x' }),
+      })
+      expect(options.status).toBe(400)
+      expect(((await options.json()) as { error: string }).error).toMatch(/不支持修改表选项/)
+    })
+
+    it('still reads the object kind, which the destructive block needs on every engine', async () => {
+      // The 表选项 block is unsupported on SQLite, but the READ behind it is not: the
+      // 操作 tab uses it to learn whether the open object is a view, and 清空 must be
+      // refused for one there too.
+      const table = (await (await fetch(`${base}/sources/app/table/options?schema=main&table=op_t`)).json()) as {
+        options: { isView?: boolean }
+      }
+      expect(table.options.isView).toBe(false)
+
+      await run('DROP VIEW IF EXISTS op_v')
+      await run('CREATE VIEW op_v AS SELECT 1 AS one')
+      const view = (await (await fetch(`${base}/sources/app/table/options?schema=main&table=op_v`)).json()) as {
+        options: { isView?: boolean }
+      }
+      expect(view.options.isView).toBe(true)
+    })
+
+    it('validates the fields each route needs, naming the one that is missing', async () => {
+      const noTable = await fetch(`${base}/sources/app/table/move`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ target: { schema: 'main', table: 'x' } }),
+      })
+      expect(noTable.status).toBe(400)
+      expect(((await noTable.json()) as { error: string }).error).toMatch(/table is required/)
+
+      const noTarget = await fetch(`${base}/sources/app/table/move`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ schema: 'main', table: 'op_t' }),
+      })
+      expect(noTarget.status).toBe(400)
+      expect(((await noTarget.json()) as { error: string }).error).toMatch(/target must be an object/)
+
+      const noTargetTable = await fetch(`${base}/sources/app/table/copy`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ schema: 'main', table: 'op_t', target: { schema: 'main' } }),
+      })
+      expect(noTargetTable.status).toBe(400)
+      expect(((await noTargetTable.json()) as { error: string }).error).toMatch(/target\.table is required/)
+
+      const optionsNoTable = await fetch(`${base}/sources/app/table/options?schema=main`)
+      expect(optionsNoTable.status).toBe(400)
+      expect(((await optionsNoTable.json()) as { error: string }).error).toMatch(/table is required/)
+
+      // A mistyped patch field is a 400 naming it, not a silently dropped value. It is
+      // rejected before the support check, so the message names the field either way.
+      const badPatch = await fetch(`${base}/sources/app/table/options?schema=main&table=op_t`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ autoIncrement: 'ten' }),
+      })
+      expect(badPatch.status).toBe(400)
+      expect(((await badPatch.json()) as { error: string }).error).toMatch(/autoIncrement must be an integer/)
+    })
+
+    it('refuses the whole family on a Redis source', async () => {
+      // Created here rather than borrowed from the Redis describe: that one owns its
+      // source and deletes it, and a test that depended on its lifetime would pass or
+      // fail according to execution order.
+      const id = 'op-routes-redis'
+      const created = await fetch(`${base}/sources`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ kind: 'redis', name: 'op-routes-redis', id, host: '127.0.0.1', port: 1, db: 0 }),
+      })
+      expect(created.status).toBe(201)
+      try {
+        for (const path of ['table-actions', 'table/move', 'table/copy']) {
+          const response = await fetch(`${base}/sources/${id}/${path}`, {
+            method: path === 'table-actions' ? 'GET' : 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: path === 'table-actions' ? undefined : JSON.stringify({ table: 't', target: { schema: 'a', table: 'b' } }),
+          })
+          expect(response.status).toBe(400)
+          expect(((await response.json()) as { error: string }).error).toMatch(/SQL data sources/)
+        }
+      } finally {
+        await fetch(`${base}/sources/${id}`, { method: 'DELETE' })
+      }
+    })
+  })
+
   it('serves the write posture and persists a change', async () => {
     const patched = await fetch(`${base}/settings`, {
       method: 'PATCH',

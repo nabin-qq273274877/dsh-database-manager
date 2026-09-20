@@ -39,9 +39,13 @@ import type {
   RowQuery,
   RowValue,
   SqlDriver,
+  TableActionOp,
   TableIndexSpec,
   TableListOptions,
+  TableOptionInfo,
+  TableOptionPatch,
   TableOptions,
+  TableTarget,
 } from './types.ts'
 
 /** Suffix of the temporary table a rebuild builds alongside the original. */
@@ -199,6 +203,36 @@ export class SqliteDriver implements SqlDriver {
    */
   maintenanceSupport(): MaintenanceOp[] {
     return ['check', 'optimize', 'analyze']
+  }
+
+  /**
+   * None of the three, and each for its own reason — all measured.
+   *
+   * SQLite's "database" is a file, so the two cross-database operations have nothing
+   * to act on:
+   *
+   * - **`move`** — `ALTER TABLE … RENAME TO other.t` is a syntax error, and there is
+   *   no other statement that relocates a table between attached schemas. So a table
+   *   cannot be moved out of the file it lives in, and the only same-file "move" is a
+   *   rename, which the outline below explains was deliberately NOT folded in here.
+   * - **`copy`** — a copy inside the same file would have to reproduce the table with
+   *   a new name, and SQLite has no statement for that either: `CREATE TABLE … AS
+   *   SELECT` DROPS every constraint (measured: the copy came back with `id INT` and
+   *   no primary key, no UNIQUE, no COLLATE, no generated column). A faithful copy
+   *   would mean rebuilding from the parsed `CREATE` text and recreating every index
+   *   and trigger under a new name — a second implementation of the rebuild path, for
+   *   a copy the export dialog already provides.
+   * - **`options`** — there is nothing to change. SQLite's table-level PRAGMAs
+   *   (`auto_vacuum`, `page_size`) are FILE-level and must be set before the tables
+   *   exist, and the only CREATE TABLE tail keywords (`WITHOUT ROWID`, `STRICT`) are
+   *   part of the table's identity, not an option that can be altered afterwards.
+   *
+   * The 结构 tab still offers everything SQLite CAN do — add, alter, drop and rename
+   * columns, change the primary key, manage indexes — so nothing here is a gap in
+   * capability, only a gap in naming.
+   */
+  tableActionSupport(): TableActionOp[] {
+    return []
   }
 
   /**
@@ -1094,6 +1128,114 @@ export class SqliteDriver implements SqlDriver {
     const target = schema === undefined || schema === '' ? 'main' : schema
     requireIdentifier(name, 'index name', quoteSqlite)
     return this.exec(`DROP INDEX ${quoteSqlite(target)}.${quoteSqlite(name)}`, [], schema)
+  }
+
+  /**
+   * Rename a table inside its own schema.
+   *
+   * A SQLite database IS a file, so `move` here can only mean "the same file, a
+   * different name" — measured: `ALTER TABLE t RENAME TO aux.t` is a syntax error
+   * ("near \".\": syntax error"), and there is no statement that relocates a table
+   * between attached schemas, so a genuine cross-database move is refused with that
+   * reason rather than attempted.
+   *
+   * The rename itself is SQLite's native one, and its reference-rewriting is wanted
+   * here: since 3.25 `ALTER TABLE … RENAME TO` also updates the references in views,
+   * triggers and foreign keys, which is exactly what a rename should do. (The 结构
+   * tab's rebuild path has to work AROUND that behaviour — see {@link rebuildTable} —
+   * but a rename is the case it was designed for.)
+   *
+   * A VIEW is refused with the engine's own reason: `ALTER TABLE v RENAME TO w` on a
+   * view fails with "view v may not be altered", because a view's name is fixed by
+   * its `CREATE VIEW` statement and SQLite offers no rename for one.
+   */
+  async moveTable(schema: string | undefined, table: string, target: TableTarget): Promise<QueryResult> {
+    const from = schema === undefined || schema === '' ? 'main' : schema
+    requireIdentifier(from, 'schema name', quoteSqlite)
+    requireIdentifier(target.schema, 'schema name', quoteSqlite)
+    const next = requireIdentifier(target.table, 'table name', quoteSqlite)
+    if (from !== target.schema) {
+      throw new Error(
+        `SQLite 的库就是一个文件，表不能移动到另一个库：「${target.schema}」如果是另一个 .db 文件，` +
+        '需要把表导出成 SQL 再导入过去。此处只能在同一库内改名。',
+      )
+    }
+    if (table === target.table) throw new Error('the source and the target are the same table')
+    requireIdentifier(table, 'table name', quoteSqlite)
+    const objects = await this.tableNames(from)
+    const moving = objects.find(entry => entry.name === table)
+    if (moving === undefined) throw new Error(`no such table: ${table}`)
+    if (moving.type === 'view') {
+      throw new Error(`「${table}」是视图：SQLite 不允许重命名视图（引擎原文 "view ${table} may not be altered"）。请删除后按新的名字重建。`)
+    }
+    if (objects.some(entry => entry.name.toLowerCase() === target.table.toLowerCase())) {
+      throw new Error(`库里已存在「${target.table}」`)
+    }
+    return this.exec(`ALTER TABLE ${qualifySqlite(schema, table)} RENAME TO ${next}`, [], schema)
+  }
+
+  /**
+   * Refused, with the reason, rather than half-implemented.
+   *
+   * The two statements that could copy a table inside one file both lose something
+   * that matters, and neither can be papered over:
+   *
+   * - **`CREATE TABLE new AS SELECT * FROM old`** copies only the column VALUES'
+   *   shape. Measured: the copy came back with `id INT` — no PRIMARY KEY, no
+   *   UNIQUE, no COLLATE, no generated column, no DEFAULT — and no indexes at all.
+   *   A copy that silently drops a table's constraints is worse than no copy.
+   * - **Re-creating from the parsed `CREATE` text** would be faithful, but every
+   *   index and trigger would then have to be recreated under a new name, and
+   *   SQLite's index names are GLOBAL to the schema (measured: recreating
+   *   `ix_t_v` on the copy fails with "index ix_t_v already exists"), so each one
+   *   needs a generated name — a second implementation of the rebuild path whose
+   *   only difference from the export/import dialog is convenience.
+   *
+   * @throws always.
+   */
+  async copyTable(): Promise<QueryResult> {
+    throw new Error(
+      'SQLite 没有复制表的语句：CREATE TABLE … AS SELECT 会丢掉主键、唯一约束、默认值与生成列' +
+      '（实测复制品只有列名和类型），而按 CREATE 文本重建又要给每个索引和触发器另起名字（索引名在库内全局唯一）。' +
+      '请在「导出」里导出该表，再「导入」成新表。',
+    )
+  }
+
+  /**
+   * What SQLite reports as a table's options: an object kind, and nothing else.
+   *
+   * There is no storage engine (one is compiled in), no table-level collation (it is
+   * per column), no table comment (nowhere to store one) and no AUTO_INCREMENT
+   * counter separate from the rowid — so an "options" form on SQLite would be a form
+   * of empty fields. The 表选项 page says this instead of offering them; see
+   * {@link tableActionSupport}.
+   */
+  async tableOptionInfo(schema: string | undefined, table: string): Promise<TableOptionInfo> {
+    const target = schema === undefined || schema === '' ? 'main' : schema
+    requireIdentifier(table, 'table name', quoteSqlite)
+    const objects = await this.tableNames(target)
+    const found = objects.find(entry => entry.name === table)
+    if (found === undefined) throw new Error(`no such table: ${table}`)
+    return { isView: found.type === 'view' }
+  }
+
+  /**
+   * Refused: SQLite has no table option that can be changed after the fact.
+   *
+   * The two candidates are not options in this sense. `auto_vacuum`, `page_size` and
+   * friends are FILE-level PRAGMAs, and `page_size` must be set before the database
+   * has any tables; `WITHOUT ROWID` and `STRICT` are part of the table's identity —
+   * changing either means rebuilding the table, which the 结构 tab does for the
+   * column changes that need it.
+   *
+   * @throws always.
+   */
+  async alterTableOptions(): Promise<QueryResult> {
+    throw new Error(
+      'SQLite 没有可修改的表选项：没有存储引擎、没有表级排序规则、没有表注释的存放处；' +
+      'auto_vacuum / page_size 是整库的 PRAGMA（page_size 还必须在建表前设置），' +
+      'WITHOUT ROWID / STRICT 属于表本身的结构，改动等于重建表。',
+    )
   }
 
   /**

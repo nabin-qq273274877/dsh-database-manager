@@ -52,6 +52,8 @@ const files = [
   'scripts/e2e-sql-editing.mjs',
   'scripts/e2e-sql-search.mjs',
   'scripts/e2e-table-actions.mjs',
+  'scripts/e2e-operations.mjs',
+  'scripts/e2e-insert-jump.mjs',
   'scripts/probe-side-refresh.mjs',
   'scripts/probe-side-refresh-poll.mjs',
   'scripts/probe-collate-link.mjs',

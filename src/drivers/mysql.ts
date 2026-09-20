@@ -21,9 +21,13 @@ import type {
   RowQuery,
   RowValue,
   SqlDriver,
+  TableActionOp,
   TableIndexSpec,
   TableListOptions,
+  TableOptionInfo,
+  TableOptionPatch,
   TableOptions,
+  TableTarget,
 } from './types.ts'
 
 /** Structural view of the mysql2/promise surface this driver uses. */
@@ -174,6 +178,18 @@ export class MysqlDriver implements SqlDriver {
    */
   maintenanceSupport(): MaintenanceOp[] {
     return ['check', 'optimize', 'repair', 'analyze']
+  }
+
+  /**
+   * All three table actions, because MySQL can do all three.
+   *
+   * Unlike `repair` on InnoDB, none of these has an "accepted but does nothing"
+   * form: `RENAME TABLE … TO other_db.t` really moves the table, `CREATE TABLE …
+   * LIKE` really clones the structure, and every option the 表选项 page edits has a
+   * statement behind it. So there is nothing here to disable with a caveat.
+   */
+  tableActionSupport(): TableActionOp[] {
+    return ['move', 'options', 'copy']
   }
 
   /**
@@ -1295,6 +1311,359 @@ export class MysqlDriver implements SqlDriver {
         connection.destroy()
       }
     }
+  }
+
+  /**
+   * Move a table to another database.
+   *
+   * ONE `RENAME TABLE a.t TO b.t` statement, because that is what MySQL's move is:
+   * the server relocates the table's files and keeps its data, indexes, triggers and
+   * foreign keys, with no copy of the rows. `ALTER TABLE … RENAME TO b.t` would do
+   * the same thing, but `RENAME TABLE` is also the statement that can carry several
+   * moves at once, and it makes the "moving, not copying" nature of the operation
+   * unambiguous to a reader.
+   *
+   * Three refusals worth their own messages, all measured:
+   *
+   * - **A VIEW cannot change schema.** MySQL answers `RENAME TABLE a.v TO b.v` with
+   *   "Changing schema from 'a' to 'b' is not allowed", because a view's definition
+   *   is stored against an explicit schema. It is refused here with that reason
+   *   rather than passed through as a syntax-looking failure.
+   * - **A target that already exists** stops the statement with "Table 'b.t' already
+   *   exists" — checked here so the message can name the object the user has to deal
+   *   with, which the engine's own error does not distinguish from a rename of the
+   *   table being moved.
+   * - **The same database and the same name** is a no-op that would still be a
+   *   rename to itself; nothing is emitted.
+   */
+  async moveTable(schema: string | undefined, table: string, target: TableTarget): Promise<QueryResult> {
+    const from = this.requireSchema(schema)
+    const to = requireIdentifier(target.schema, 'database name', quoteMysql)
+    const targetTable = requireIdentifier(target.table, 'table name', quoteMysql)
+    const source = qualifyMysql(from, table)
+    if (from === target.schema && table === target.table) {
+      throw new Error('the source and the target are the same table')
+    }
+
+    const objects = await this.tableNames(from)
+    const moving = objects.find(entry => entry.name === table)
+    if (moving === undefined) throw new Error(`no such table: ${from}.${table}`)
+    if (moving.type === 'view') {
+      throw new Error(
+        `「${table}」是视图，MySQL 不允许视图换库（视图的定义绑定在创建它的库上，服务器会直接拒绝）。` +
+        '如果需要在另一个库里用同样的查询，请在那边新建一个视图。',
+      )
+    }
+    const existing = await this.tableNames(target.schema)
+    if (existing.some(entry => entry.name.toLowerCase() === target.table.toLowerCase())) {
+      throw new Error(`目标库「${target.schema}」里已存在「${target.table}」`)
+    }
+
+    return this.exec(`RENAME TABLE ${source} TO ${qualifyMysql(target.schema, target.table)}`, [], undefined)
+  }
+
+  /**
+   * Copy a table's structure, and optionally its rows, into another database.
+   *
+   * `CREATE TABLE new LIKE old` then `INSERT INTO new SELECT … FROM old`, which is
+   * phpMyAdmin's 复制表 and the only pair of statements that reproduces a table
+   * faithfully: `LIKE` copies the column definitions, the indexes, the primary key
+   * and the AUTO_INCREMENT attribute.
+   *
+   * What it does NOT copy, stated rather than silently dropped: triggers and
+   * foreign keys pointing OUT of the table. `LIKE` builds no triggers, and MySQL
+   * refuses a foreign key whose target is not in the same schema — the target
+   * database would have to have its own copy of the referenced table first, which is
+   * a decision this panel must not make silently.
+   *
+   * The row copy names the columns explicitly and omits GENERATED ones. `INSERT INTO
+   * new SELECT * FROM old` fails on a table with a stored generated column —
+   * measured: "The value specified for generated column 'b' in table 'gen2' is not
+   * allowed" — because `*` includes a column that cannot be inserted into. Naming
+   * the others makes the copy work and lets the engine recompute the generated one.
+   */
+  async copyTable(
+    schema: string | undefined,
+    table: string,
+    target: TableTarget,
+    options: { includeData?: boolean; isView?: boolean } = {},
+  ): Promise<QueryResult> {
+    const from = this.requireSchema(schema)
+    requireIdentifier(target.schema, 'database name', quoteMysql)
+    requireIdentifier(target.table, 'table name', quoteMysql)
+    if (from === target.schema && table === target.table) {
+      throw new Error('the source and the target are the same table')
+    }
+
+    /*
+     * The source's kind is READ, not taken from the caller.
+     *
+     * `options.isView` is only a hint the browser can supply; this layer is the one
+     * that decides what to do about it, and a request that omitted (or mis-stated) it
+     * must not turn into `CREATE TABLE … LIKE a_view` — measured, MySQL answers that
+     * with "'a.a_view' is not BASE TABLE", which names neither the view nor the fact
+     * that copying a view is not a thing this can do.
+     */
+    const objects = await this.tableNames(from)
+    const moving = objects.find(entry => entry.name === table)
+    if (moving === undefined) throw new Error(`no such table: ${from}.${table}`)
+    if (moving.type === 'view' || options.isView === true) {
+      throw new Error(
+        `「${table}」是视图，无法复制成另一个库里的视图：MySQL 没有复制视图的语句，` +
+        '而 CREATE TABLE … LIKE 对视图会直接报错（它不是 BASE TABLE）。请在新库里自行重建视图。',
+      )
+    }
+
+    const existing = await this.tableNames(target.schema)
+    if (existing.some(entry => entry.name.toLowerCase() === target.table.toLowerCase())) {
+      throw new Error(`目标库「${target.schema}」里已存在「${target.table}」`)
+    }
+
+    const source = qualifyMysql(from, table)
+    const destination = qualifyMysql(target.schema, target.table)
+    const started = Date.now()
+    await this.exec(`CREATE TABLE ${destination} LIKE ${source}`, [], undefined)
+    const created = { columns: [], rows: [], affected: 1, durationMs: Date.now() - started, write: true, truncated: false } satisfies QueryResult
+    if (options.includeData !== true) return created
+
+    const columns = await this.columns(from, table)
+    const writable = columns.filter(column => column.generated !== true)
+    if (writable.length === 0) return created
+    const names = writable.map(column => requireIdentifier(column.name, 'column name', quoteMysql)).join(', ')
+    // The table now exists and is empty, so a failed data copy leaves it behind —
+    // say that in the message rather than reporting a failure that reads as "nothing
+    // happened".
+    try {
+      const copied = await this.exec(
+        `INSERT INTO ${destination} (${names}) SELECT ${names} FROM ${source}`,
+        [],
+        undefined,
+      )
+      return { ...created, affected: copied.affected, rows: [], durationMs: Date.now() - started }
+    } catch (failure) {
+      throw new Error(
+        `表结构已复制到「${target.schema}.${target.table}」，但复制数据失败：` +
+        `${failure instanceof Error ? failure.message : String(failure)}`,
+      )
+    }
+  }
+
+  /**
+   * The option values MySQL reports for an existing table.
+   *
+   * Read from `information_schema.TABLES` rather than `SHOW TABLE STATUS`, then
+   * corrected for the one field that catalog gets wrong: see
+   * {@link TableOptionInfo.autoIncrement}. The character set is resolved through
+   * `information_schema.COLLATIONS` instead of being split off the collation's name,
+   * because a collation's name does not reliably start with its character set's
+   * (`utf8mb3_general_ci` belongs to `utf8mb3`).
+   */
+  async tableOptionInfo(schema: string | undefined, table: string): Promise<TableOptionInfo> {
+    const target = this.requireSchema(schema)
+    requireIdentifier(table, 'table name', quoteMysql)
+    const [rows] = await (await this.open()).query({
+      sql:
+        'SELECT TABLE_TYPE AS type, ENGINE AS engine, TABLE_COLLATION AS collation, TABLE_COMMENT AS comment, ' +
+        'ROW_FORMAT AS rowFormat FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?',
+      values: [target, table],
+    })
+    const record = Array.isArray(rows) ? (rows[0] as Record<string, unknown> | undefined) : undefined
+    if (record === undefined) throw new Error(`no such table: ${target}.${table}`)
+
+    const type = String(record['type'] ?? '')
+    const isView = type.toUpperCase().includes('VIEW')
+    const engine = asString(record['engine'])
+    const collation = asString(record['collation'])
+    const comment = typeof record['comment'] === 'string' ? record['comment'] : undefined
+    const rowFormat = asString(record['rowFormat'])
+
+    /*
+     * A view is reported as such and with NOTHING else, not even its comment.
+     *
+     * Measured: MySQL answers "VIEW" as a view's `TABLE_COMMENT` — a placeholder, not
+     * something anyone typed. Passing it through would show the 表选项 form a comment of
+     * 「VIEW」 that the user could then "edit", and the edit would be written to the
+     * view's metadata while the other three fields (engine, collation, row format — all
+     * NULL for a view) stayed meaningless. Saying `isView: true` and nothing more is
+     * what lets the page say "this is a view" instead of rendering four fields whose
+     * values mean nothing.
+     */
+    if (isView) return { isView: true }
+
+    const charset = collation === undefined ? undefined : await this.collationCharset(collation)
+    const autoIncrement = await this.autoIncrementFromCreate(target, table)
+    return {
+      ...(engine === undefined ? {} : { engine }),
+      ...(collation === undefined ? {} : { collation }),
+      ...(charset === undefined ? {} : { charset }),
+      ...(comment === undefined ? {} : { comment }),
+      ...(autoIncrement === undefined ? {} : { autoIncrement }),
+      ...(rowFormat === undefined ? {} : { rowFormat }),
+    }
+  }
+
+  /**
+   * The character set one collation belongs to, from the server's own list.
+   *
+   * ABSENT rather than guessed when the server does not know the collation: a
+   * collation added by a newer server than the cached list, or one belonging to a
+   * character set the connection cannot see, would otherwise be paired with a
+   * character set derived from its name — and a mismatched pair is a statement MySQL
+   * rejects. The caller then simply offers the collation without a character set,
+   * which the ALTER does not need.
+   */
+  private async collationCharset(collation: string): Promise<string | undefined> {
+    const [rows] = await (await this.open()).query({
+      sql: 'SELECT CHARACTER_SET_NAME AS charset FROM information_schema.COLLATIONS WHERE COLLATION_NAME = ?',
+      values: [collation],
+    })
+    const record = Array.isArray(rows) ? (rows[0] as Record<string, unknown> | undefined) : undefined
+    return record === undefined ? undefined : asString(record['charset'])
+  }
+
+  /**
+   * The next AUTO_INCREMENT value, read from `SHOW CREATE TABLE`.
+   *
+   * Not from `information_schema.TABLES.AUTO_INCREMENT`, and the difference was
+   * measured rather than assumed. After `ALTER TABLE t AUTO_INCREMENT=900` the next
+   * insert really did receive id 900, while `information_schema.TABLES`, a fresh
+   * `information_schema` connection and `SHOW TABLE STATUS` all still reported 4 —
+   * InnoDB keeps the counter in memory and those two read the data dictionary's
+   * stale copy. `SHOW CREATE TABLE` reported `AUTO_INCREMENT=900`, matching the id
+   * the server actually issued. (This applies to InnoDB; MyISAM was also observed
+   * reporting the stale 4.) A form that prefilled 4 would then "change" the value to
+   * something the server had already passed.
+   *
+   * ABSENT when the table has no auto-increment column at all — `SHOW CREATE TABLE`
+   * omits the clause — which is what lets the page hide the field instead of
+   * offering a box whose value is not a thing.
+   *
+   * Parsed from the statement TAIL rather than by searching the whole text: a table
+   * comment can contain the literal `AUTO_INCREMENT=` (measured: the option is
+   * echoed into the comment verbatim), and the real clause is always after the column
+   * list's closing bracket. The tail is found by the LAST `\n)` in the statement,
+   * which is the format `SHOW CREATE TABLE` always produces.
+   */
+  private async autoIncrementFromCreate(schema: string, table: string): Promise<number | undefined> {
+    const text = await this.createStatement(schema, table)
+    if (text === undefined) return undefined
+    const closing = text.lastIndexOf('\n)')
+    const tail = closing === -1 ? text : text.slice(closing)
+    const match = /(?:^|\s)AUTO_INCREMENT=(\d+)/.exec(tail)
+    if (match === null) return undefined
+    const value = Number(match[1])
+    return Number.isFinite(value) ? value : undefined
+  }
+
+  /**
+   * Change an existing table's options.
+   *
+   * ONE `ALTER TABLE` carrying only the clauses the caller actually set, for two
+   * reasons. MySQL applies several `ALTER` clauses in a single table rebuild, so
+   * separate statements would rewrite the table once per option; and emitting only
+   * what was asked for is what keeps an untouched field as the server has it, rather
+   * than reverting a change made elsewhere since the page was opened.
+   *
+   * Every value is validated before it reaches the statement, because none of these
+   * slots accepts a bound parameter: an engine name and a row format are keywords,
+   * and the comment is a literal this layer escapes.
+   */
+  async alterTableOptions(schema: string | undefined, table: string, patch: TableOptionPatch): Promise<QueryResult> {
+    const target = this.requireSchema(schema)
+    const qualified = qualifyMysql(target, table)
+    const clauses: string[] = []
+
+    if (patch.engine !== undefined) {
+      // A bare keyword in the statement, so it is checked against the grammar and
+      // against the engines the SERVER reports rather than a list kept here — a
+      // build without MyISAM must refuse it with a reason, not with a syntax error.
+      const engine = patch.engine.trim()
+      if (!/^[A-Za-z0-9_]{1,32}$/.test(engine)) throw new Error(`invalid storage engine: ${JSON.stringify(patch.engine)}`)
+      const available = await this.engines()
+      if (!available.includes(engine.toUpperCase())) {
+        throw new Error(`这台 MySQL 没有「${engine}」存储引擎（可用：${available.join(', ')}）`)
+      }
+      clauses.push(`ENGINE=${engine}`)
+    }
+
+    if (patch.collation !== undefined) {
+      const collation = requireCollate(patch.collation)
+      /*
+       * The character set is DERIVED from the collation when the caller did not
+       * supply one, rather than being demanded from the browser.
+       *
+       * A collation belongs to exactly one character set, and the server already
+       * knows which — so asking the form for both would be asking the user to repeat
+       * a fact the server can look up, and getting it wrong is a statement MySQL
+       * rejects ("COLLATION 'x' is not valid for CHARACTER SET 'y'"). The lookup is
+       * the same one the read path uses, so the two cannot disagree.
+       */
+      const explicit = patch.charset === undefined || patch.charset === '' ? undefined : requireCharset(patch.charset)
+      const charset = explicit ?? await this.collationCharset(collation)
+      /*
+       * `CONVERT TO` is the form that rewrites existing columns, and it is only
+       * emitted when asked for; `DEFAULT CHARACTER SET` alone changes new columns.
+       * `CONVERT TO CHARACTER SET` requires a character set, so an unresolvable one
+       * is refused with what is wrong instead of a syntax error the user cannot act
+       * on — which only happens for a collation this server does not know.
+       */
+      if (patch.convertColumns === true) {
+        if (charset === undefined) {
+          throw new Error(`服务器不认识排序规则「${collation}」，无法推断它属于哪个字符集，因此不能转换成它`)
+        }
+        clauses.push(`CONVERT TO CHARACTER SET ${charset} COLLATE ${collation}`)
+      } else if (charset === undefined) {
+        clauses.push(`COLLATE=${collation}`)
+      } else {
+        clauses.push(`DEFAULT CHARACTER SET ${charset} COLLATE ${collation}`)
+      }
+    }
+
+    if (patch.comment !== undefined) {
+      // The same rule as a column comment: the escaping relies on doubling the
+      // quote, and a backslash would change what the literal means. Measured: MySQL
+      // stores a doubled quote as one quote, so `it''s` round-trips as `it's`.
+      if (patch.comment.includes('\\')) throw new Error('表注释不能包含反斜杠（MySQL 会把反斜杠当转义符，写进去的和读出来的不一致）')
+      clauses.push(`COMMENT='${patch.comment.replace(/'/g, "''")}'`)
+    }
+
+    if (patch.autoIncrement !== undefined) {
+      if (!Number.isInteger(patch.autoIncrement) || patch.autoIncrement < 1) {
+        throw new Error(`AUTO_INCREMENT 需要是正整数：${JSON.stringify(patch.autoIncrement)}`)
+      }
+      clauses.push(`AUTO_INCREMENT=${patch.autoIncrement}`)
+    }
+
+    if (patch.rowFormat !== undefined) {
+      const format = patch.rowFormat.trim().toUpperCase()
+      /*
+       * The formats MySQL accepts as keywords. FIXED is included even though InnoDB
+       * refuses it (measured: "Table storage engine 'InnoDB' does not support the
+       * create option 'ROW_TYPE'") — MyISAM accepts it, and refusing it here would
+       * take the option away from the engine that has it. The server's own message
+       * names the engine, so it is passed through.
+       */
+      if (!['DEFAULT', 'DYNAMIC', 'FIXED', 'COMPRESSED', 'REDUNDANT', 'COMPACT', 'PAGE'].includes(format)) {
+        throw new Error(`无效的行格式：${JSON.stringify(patch.rowFormat)}`)
+      }
+      clauses.push(`ROW_FORMAT=${format}`)
+    }
+
+    if (clauses.length === 0) throw new Error('没有需要修改的表选项')
+    return this.exec(`ALTER TABLE ${qualified} ${clauses.join(', ')}`, [], target)
+  }
+
+  /** The storage engines this server can actually use, upper-cased. */
+  private async engines(): Promise<string[]> {
+    const [rows] = await (await this.open()).query({ sql: 'SHOW ENGINES' })
+    const list = Array.isArray(rows) ? rows : []
+    return list
+      .map(row => row as Record<string, unknown>)
+      // `Support` is DEFAULT for the default engine, YES for an available one, NO for
+      // a compiled-out one, and DISABLED for one turned off in the configuration.
+      .filter(row => ['DEFAULT', 'YES'].includes(String(row['Support'] ?? '').toUpperCase()))
+      .map(row => String(row['Engine'] ?? '').toUpperCase())
+      .filter(name => name !== '')
   }
 
   /**

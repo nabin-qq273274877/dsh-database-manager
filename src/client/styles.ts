@@ -1051,8 +1051,41 @@ textarea.dbm-cell-input {
   word-break: break-word;
 }
 
-/* A column that is part of the primary key, called out in the structure table. */
+/*
+ * A column that is part of the primary key, called out in the structure table.
+ */
 .dbm-key-note { color: var(--dsw-alias-label-secondary); font-size: 11px; }
+
+/*
+ * ---- the 操作 tab -------------------------------------------------------
+ *
+ * One block per operation, each with its own heading, its own explanation and its own
+ * submit button. Not one toolbar of buttons: every block names a target or a value
+ * before it does anything, and the two destructive ones state what they destroy —
+ * a single click that moves a table into another database is not a proportionate
+ * gesture for something with no undo.
+ *
+ * The blocks are separated by the same rule the 新建表 dialog uses between its
+ * table-level fields and its column list, so the two forms read as one family.
+ */
+.dbm-op-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /*
+   * Capped, not full width. A form stretched across a 1600px panel puts a table name
+   * field a screen away from its label; phpMyAdmin's own page is capped for the same
+   * reason. The cap is a max-width, so a narrow panel still shrinks with it.
+   */
+  max-width: 720px;
+}
+/* The block's heading reads as a heading, not as a field label. */
+.dbm-op-block > strong { font-size: 13px; }
+/* A disabled block's reason is prose, so it wraps instead of forcing a scrollbar. */
+.dbm-op-block > .dbm-hint { white-space: normal; word-break: break-word; }
+/* The target fields sit on one line and stay there: there are only ever two. */
+.dbm-op-block .dbm-field-inline > .dbm-select { width: 160px; }
+.dbm-op-block .dbm-field-inline > .dbm-input { width: 160px; }
 
 /*
  * The TTL countdown. Tabular figures so a ticking number does not make the row

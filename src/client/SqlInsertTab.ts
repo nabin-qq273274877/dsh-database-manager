@@ -47,8 +47,15 @@ export interface SqlInsertTabProps {
   table: string
   columns: ColumnInfo[]
   loading: boolean
-  /** Refresh counts and the grid after an insert. */
-  onDone(message: string): void
+  /**
+   * Refresh counts and the grid after an insert, and move on when the insert is done.
+   *
+   * `outcome` is `'inserted'` for 插入 and `'again'` for 插入并再填一行 — the two buttons
+   * mean different things, so the caller needs to tell them apart rather than infer from
+   * the message. 插入完成了一次写入，接着该看的是写进去的那一行，于是切到浏览；
+   * 「再填一行」的存在理由就是继续填同批数据，切走会让这个按钮失去意义。
+   */
+  onDone(message: string, outcome: 'inserted' | 'again'): void
   onError(message: string | undefined): void
 }
 
@@ -101,7 +108,8 @@ export function SqlInsertTab(props: SqlInsertTabProps): React.ReactElement {
    * `keepCount` is the whole difference between the two submit buttons: 插入
    * leaves the tab ready for a single row, while 插入并再填一行 leaves the SAME
    * number of blank forms, so a batch of ten can be entered again without
-   * pressing 应用 first.
+   * pressing 应用 first. The caller is told which one ran, because they also
+   * differ in what happens next: 插入 moves to 浏览, 再填一行 stays here.
    */
   const submit = async (keepCount: boolean): Promise<void> => {
     const payloads: Array<Array<{ column: string; value: string | null }>> = []
@@ -138,7 +146,18 @@ export function SqlInsertTab(props: SqlInsertTabProps): React.ReactElement {
         ? await api.insertRow(source.id, { schema, table, values: payloads[0]! })
         : await api.insertRows(source.id, { schema, table, rows: payloads })
       onError(undefined)
-      onDone(payloads.length > 1 ? t('insert.rowsDone', { n: result.affected, forms: payloads.length }) : t('insert.done', { n: result.affected }))
+      /*
+       * The completion notice names the tab switch, for the two buttons that cause it.
+       *
+       * Without that, the form vanished and a grid appeared with nothing connecting the
+       * two — the switch IS the feedback, and saying so is what makes it read as a
+       * result rather than as a lost form. The 插入并再填一行 notices keep their old
+       * wording, because that button stays here.
+       */
+      const inserted = payloads.length > 1
+        ? t(keepCount ? 'insert.rowsDone' : 'insert.rowsDoneBrowsing', { n: result.affected, forms: payloads.length })
+        : t(keepCount ? 'insert.done' : 'insert.doneAndBrowsing', { n: result.affected })
+      onDone(inserted, keepCount ? 'again' : 'inserted')
       // A batch keeps its size so the next set of rows can be typed straight in;
       // a single insert goes back to one form.
       const next = keepCount ? forms.length : 1
