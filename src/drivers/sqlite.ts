@@ -1028,9 +1028,29 @@ export class SqliteDriver implements SqlDriver {
     if (index === -1) throw new Error(`no such column: ${spec.name}`)
     const current = shape.columns[index]!
 
+    /*
+     * The "rename only" fast path compares the two definitions it cares about.
+     *
+     * The DEFAULT comparison cannot go through {@link normalizeDefault} when either side
+     * is an EXPRESSION: the validator refuses a parenthesised expression by design
+     * because it cannot verify an arbitrary one. So those are compared textually,
+     * allowing for the BRACKETS — the two sources disagree about them (measured:
+     * {@link columns} reports `lower('ABC')`, the parsed `CREATE TABLE` text gives
+     * `(lower('ABC'))`).
+     */
+    const next = toDefinition(spec)
+    const expressionForm = (value: string | undefined): string =>
+      (value ?? '').trim().replace(/^\(|\)$/g, '')
+    const isExpression = (value: string | undefined): boolean => {
+      const text = (value ?? '').trim()
+      return text !== '' && !text.startsWith("'") && /[(]/.test(text)
+    }
+    const sameDefault = isExpression(next.defaultValue) || isExpression(current.defaultValue)
+      ? expressionForm(next.defaultValue) === expressionForm(current.defaultValue)
+      : normalizeDefault(next.defaultValue, 'sqlite') === normalizeDefault(current.defaultValue, 'sqlite')
+
     // Validate the new definition BEFORE deciding the path, so a refusal names
     // the field rather than surfacing after a partial write.
-    const next = toDefinition(spec)
     renderColumn(next, 'sqlite')
 
     const newName = options.rename ?? spec.name
@@ -1038,9 +1058,9 @@ export class SqliteDriver implements SqlDriver {
       newName !== spec.name
       && normalizeType(next.type, 'sqlite') === normalizeType(current.type, 'sqlite')
       && next.nullable === current.nullable
-      && normalizeDefault(next.defaultValue, 'sqlite') === normalizeDefault(current.defaultValue, 'sqlite')
       && next.unique === current.unique
       && current.primaryKeyPosition === undefined
+      && sameDefault
 
     if (onlyRenamed) {
       const qualified = qualifySqlite(schema, table)
@@ -1051,15 +1071,28 @@ export class SqliteDriver implements SqlDriver {
       )
     }
 
+    /*
+     * The new definition comes from the SPEC, with only the clauses this plugin does not
+     * MODEL carried over from the original.
+     *
+     * `{ ...current, ...next }` looks equivalent and is not: a field ABSENT from `next`
+     * keeps the original's value, so a default could be changed but never REMOVED —
+     * measured, clearing `DEFAULT CURRENT_TIMESTAMP` left the clause in place. Only
+     * `extras` and `check` are genuinely unmodelled (a CHECK constraint, a generated
+     * column's expression) and have to survive verbatim.
+     *
+     * `generated` is one more field that has to survive: the 结构 tab marks a generated
+     * column and never sends the flag, and `rebuildTable` decides from it which columns
+     * to copy — so losing it made the rebuild try to `INSERT` into the generated column,
+     * which SQLite refuses with "cannot INSERT into generated column". The expression
+     * itself lives in `extras`, which is already carried over.
+     */
     const edited: ColumnDefinition = {
-      ...current,
       ...next,
       name: newName,
-      // `extras` and `check` belong to the ORIGINAL column, not to the new
-      // spec: they are clauses this plugin does not model, and dropping them
-      // because the type changed would silently delete a CHECK constraint.
       extras: current.extras,
       ...(current.check === undefined ? {} : { check: current.check }),
+      ...(current.generated === true ? { generated: true } : {}),
     }
     shape.columns[index] = edited
     return this.rebuildTable(target, table, shape)
@@ -1670,6 +1703,11 @@ function toDefinition(spec: ColumnSpec): ColumnDefinition {
     // A primary-key column is NOT NULL by definition; the caller's checkbox is
     // not allowed to say otherwise.
     nullable: spec.primaryKeyPosition === undefined ? spec.nullable : false,
+    // Passed through as given; `renderColumn` decides how to emit it, and it is the one
+    // place that knows an expression default must bypass the literal validator. See its
+    // comment — the short version is that SQLite rebuilds the whole table for every
+    // change, so one expression default would otherwise break edits of every OTHER
+    // column.
     ...(spec.defaultValue === undefined || spec.defaultValue === '' ? {} : { defaultValue: spec.defaultValue }),
     ...(spec.primaryKeyPosition === undefined ? {} : { primaryKeyPosition: spec.primaryKeyPosition }),
     ...(spec.autoIncrement === true ? { autoIncrement: true, sqliteAutoincrement: true } : {}),

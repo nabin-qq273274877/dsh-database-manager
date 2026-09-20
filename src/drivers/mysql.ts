@@ -442,7 +442,8 @@ export class MysqlDriver implements SqlDriver {
     const [rows] = await (await this.open()).query({
       sql:
         'SELECT COLUMN_NAME AS name, COLUMN_TYPE AS type, IS_NULLABLE AS nullable, COLUMN_DEFAULT AS dflt, ' +
-        'COLUMN_KEY AS col_key, COLUMN_COMMENT AS comment, EXTRA AS extra, COLLATION_NAME AS collation ' +
+        'COLUMN_KEY AS col_key, COLUMN_COMMENT AS comment, EXTRA AS extra, COLLATION_NAME AS collation, ' +
+        'GENERATION_EXPRESSION AS generation ' +
         'FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION',
       values: [target, table],
     })
@@ -507,6 +508,20 @@ export class MysqlDriver implements SqlDriver {
       const extra = toWireValue(record['extra'])
       // The declared collation, so the 结构 tab can show it and a rebuild can carry it.
       const columnCollation = toWireValue(record['collation'])
+      /*
+       * The generated-column EXPRESSION, which is a DIFFERENT column from `EXTRA`.
+       *
+       * `EXTRA` says a column IS generated (`STORED GENERATED`) but never what from,
+       * so this is the only place the expression exists. It is read here rather than
+       * re-queried when the 结构 tab builds a rewrite, because the same read already
+       * happens and a second query would be a second chance to disagree with it.
+       *
+       * It is also the RELIABLE test for "is this generated". `EXTRA` carries
+       * `DEFAULT_GENERATED` for an ordinary `DEFAULT CURRENT_TIMESTAMP`, so a
+       * substring match on GENERATED classifies a plain column with a default as a
+       * computed one — measured, and it made such a column refuse every edit.
+       */
+      const generation = toWireValue(record['generation'])
       const options = readEnumOptions(String(record['type'] ?? ''))
       const inKey = primaryColumns.has(name)
       const position = inKey ? (orderedFromStatistics.get(name) ?? declarationOrder.get(name)) : undefined
@@ -521,10 +536,20 @@ export class MysqlDriver implements SqlDriver {
         ...(typeof extra === 'string' && extra !== '' ? { extra } : {}),
         ...(position === undefined ? {} : { primaryKeyPosition: position }),
         ...(options === undefined ? {} : { options }),
-        // `EXTRA` is where MySQL says a column is computed. A generated column
-        // cannot be inserted into or updated, so the 插入 and 浏览 surfaces must
-        // not offer it as an editable input.
-        ...(typeof extra === 'string' && /GENERATED/i.test(extra) ? { generated: true } : {}),
+        /*
+         * A generated column cannot be inserted into or updated, so the 插入 and 浏览
+         * surfaces must not offer it as an editable input.
+         *
+         * The test is on the EXPRESSION, not on `EXTRA` containing "GENERATED":
+         * measured, `EXTRA` is `DEFAULT_GENERATED` for an ordinary
+         * `DEFAULT CURRENT_TIMESTAMP` column, so the substring test flagged such a
+         * column as computed — which both hid it from the edit form and made every
+         * edit of it fail with "this generated column cannot be modified". The
+         * expression is also what a rewrite needs, so the two now come from one read.
+         */
+        ...(typeof generation === 'string' && generation !== ''
+          ? { generated: true, generatedExpression: generation }
+          : {}),
       } satisfies ColumnInfo
     })
   }
@@ -1111,7 +1136,48 @@ export class MysqlDriver implements SqlDriver {
     const qualified = qualifyMysql(target, table)
     const existing = (await this.columns(target, table)).find(column => column.name === spec.name)
     if (existing === undefined) throw new Error(`no such column: ${spec.name}`)
-    const definition = renderMysqlDefinition(spec, { generated: existing.generated, extra: existing.extra })
+    /*
+     * A default that came back from the server needs translating; one the user TYPED
+     * does not.
+     *
+     * `information_schema` reports `DEFAULT 'x'` as an unquoted `x`, and that form is
+     * refused by {@link normalizeDefault} — so the 结构 tab, which round-trips whatever
+     * it read, could not edit a column with a string default at all.
+     *
+     * The two cases are told apart by matching the submission against the live value in
+     * EITHER form: the raw reported text (`x`), or the rendered literal the panel sends
+     * back for it (`'x'`). An untouched field matches one of them and is translated; a
+     * value the user changed matches neither and is left for the validator to judge.
+     * A single comparison is not enough — which of the two forms arrives depends on the
+     * type, and matching only the raw one would miss `'5'` on a VARCHAR (reported `5`,
+     * rendered `5`, and the raw comparison would then store a NUMBER default on a text
+     * column).
+     *
+     * AN EXPRESSION default takes a third path. The server reports
+     * `lower(_utf8mb4\'ABC\')` and its bracketed form `(lower(…))` is not a literal
+     * either, so `normalizeDefault` refuses it by design — it cannot verify an arbitrary
+     * expression, and the panel must not let a user type one. The engine's own text is
+     * the one case known to be valid, so it is re-emitted verbatim and only when the
+     * submission still matches the live column (i.e. the user did not replace it).
+     */
+    const live = existing.defaultValue
+    const liveLiteral = live === undefined ? undefined : defaultLiteralFor(live, spec.type)
+    const unchanged = liveLiteral !== undefined
+      && (spec.defaultValue === live || spec.defaultValue === liveLiteral)
+    const isExpression = unchanged && live !== undefined && live.includes('(')
+    const submitted = unchanged ? liveLiteral : spec.defaultValue
+    const definition = renderMysqlDefinition(
+      isExpression ? { ...spec, defaultValue: undefined } : { ...spec, ...(submitted === undefined ? {} : { defaultValue: submitted }) },
+      {
+        generated: existing.generated,
+        ...(existing.generatedExpression === undefined ? {} : { generatedExpression: existing.generatedExpression }),
+        extra: existing.extra,
+        // Read from the live column: the form has no field for it, and an omitted
+        // `ON UPDATE` clause is dropped by `MODIFY COLUMN`.
+        onUpdateCurrentTimestamp: /on update/i.test(existing.extra ?? ''),
+        ...(isExpression ? { verbatimDefault: liveLiteral! } : {}),
+      },
+    )
     const current = requireIdentifier(spec.name, 'column name', quoteMysql)
 
     const run = async (sql: string): Promise<QueryResult> => {
@@ -1936,7 +2002,27 @@ function readEnumOptions(type: string): string[] | undefined {
  * COLUMN` each place the name in a different position, and a renderer that
  * supplied it would duplicate it in every one of them.
  */
-function renderMysqlDefinition(spec: ColumnSpec, carry: { generated?: boolean; extra?: string } = {}): string {
+function renderMysqlDefinition(
+  spec: ColumnSpec,
+  carry: {
+    generated?: boolean
+    generatedExpression?: string
+    extra?: string
+    /** Whether the LIVE column carries `ON UPDATE CURRENT_TIMESTAMP`. */
+    onUpdateCurrentTimestamp?: boolean
+    /**
+     * A DEFAULT clause to emit VERBATIM, bypassing the literal validator.
+     *
+     * Only ever set from a value the SERVER reported, never from a request: an
+     * expression default (`DEFAULT (lower('ABC'))`) is not a literal and
+     * {@link normalizeDefault} refuses it by design — it cannot verify an arbitrary
+     * expression, and the panel must not let a user type one. Re-emitting the engine's
+     * own text is the one case where the text is known to be valid, and it is the only
+     * way an edit of some OTHER field can leave such a default intact.
+     */
+    verbatimDefault?: string
+  } = {},
+): string {
   const parts: string[] = []
   const base = spec.type.trim() === '' ? '' : normalizeType(spec.type, 'mysql')
   if (base === '') throw new Error('a MySQL column needs a type')
@@ -1961,15 +2047,37 @@ function renderMysqlDefinition(spec: ColumnSpec, carry: { generated?: boolean; e
     parts.push(base)
   }
 
-  // A generated column's expression lives in EXTRA, and MySQL rejects a
-  // definition that carries `DEFAULT` or `AUTO_INCREMENT` alongside it, so the
-  // generated form is the whole definition and nothing else is appended.
+  /*
+   * A generated column is rendered from the expression the SERVER reported, and as a
+   * complete definition on its own.
+   *
+   * `GENERATED ALWAYS AS (expr)` must be present: MySQL reads a generated column's
+   * `MODIFY` as a redefinition of the expression, and a statement that omits `AS (…)`
+   * would change the column rather than edit it — the panel refused instead, which is
+   * what a user saw as "编辑提交失败". The expression comes back from
+   * `GENERATION_EXPRESSION` already bracketed and already normalised by the server
+   * (`(`a` * 2)`, `concat(_utf8mb4\'x\',`a`)`), so it is emitted verbatim.
+   *
+   * `DEFAULT`, `AUTO_INCREMENT` and `ON UPDATE` are all refused alongside it
+   * (measured: "Incorrect usage of X and generated column"), so nothing else is
+   * appended except the comment and the nullability. Nullability IS emitted: a
+   * generated column may be either, and a rewrite that omitted it would silently
+   * flip the column to nullable.
+   */
   if (carry.generated === true) {
-    const extra = carry.extra?.replace(/DEFAULT_GENERATED\s*/i, '').trim() ?? ''
-    if (extra === '' || !/\bAS\s*\(/i.test(extra)) {
-      throw new Error('this generated column cannot be modified: its expression was not reported by the server')
+    const expression = carry.generatedExpression?.trim() ?? ''
+    if (expression === '') {
+      throw new Error(
+        `「${spec.name}」是生成列，但服务端没有报告它的表达式（information_schema.COLUMNS.GENERATION_EXPRESSION 为空），` +
+        '无法安全地重写这一列。',
+      )
     }
-    parts.push(extra)
+    // STORED vs VIRTUAL is part of the column's identity, and MySQL REFUSES a change
+    // of it ("Changing the STORED status is not supported"), so the original is
+    // carried over rather than chosen here.
+    const storage = /VIRTUAL/i.test(carry.extra ?? '') ? 'VIRTUAL' : 'STORED'
+    parts.push(`GENERATED ALWAYS AS ${expression} ${storage}`)
+    parts.push(spec.primaryKeyPosition === undefined && spec.nullable ? 'NULL' : 'NOT NULL')
     if (spec.comment !== undefined && spec.comment !== '') parts.push(renderComment(spec.comment))
     return parts.join(' ')
   }
@@ -1995,11 +2103,39 @@ function renderMysqlDefinition(spec: ColumnSpec, carry: { generated?: boolean; e
 
   // A primary-key column must be NOT NULL, and MySQL refuses the key otherwise.
   parts.push(spec.primaryKeyPosition === undefined && spec.nullable ? 'NULL' : 'NOT NULL')
-  if (spec.defaultValue !== undefined) {
+  /*
+   * An expression default is emitted VERBATIM, and each form is bracketed appropriately.
+   *
+   * `normalizeDefault` refuses a parenthesised expression by design: it cannot verify an
+   * arbitrary one, and nothing a user typed may reach this slot. But MySQL accepts
+   * `DEFAULT (expr)`, so a table may already carry one, and re-emitting it must not go
+   * through the validator — otherwise editing any OTHER field of that column would fail.
+   *
+   * MySQL reports the expression WITHOUT the outer brackets
+   * (`lower(_utf8mb4\'ABC\')`), so they are re-added; `DEFAULT` without them would store
+   * the expression's own text as the value. `carry.verbatimDefault` is the caller telling
+   * us it is re-emitting a live expression, which is when the escaping is undone too.
+   */
+  if (carry.verbatimDefault !== undefined) {
+    parts.push(`DEFAULT ${carry.verbatimDefault}`)
+  } else if (spec.defaultValue !== undefined) {
     const value = normalizeDefault(spec.defaultValue, 'mysql')
     if (value !== undefined) parts.push(`DEFAULT ${value}`)
   }
-  if (attributes.has('onUpdateCurrentTimestamp')) parts.push('ON UPDATE CURRENT_TIMESTAMP')
+  /*
+   * `ON UPDATE CURRENT_TIMESTAMP` is carried over from the column as the server
+   * reports it, NOT taken from the submitted spec.
+   *
+   * `MODIFY COLUMN` rewrites the whole definition, so a clause that is left out is
+   * DROPPED — measured: modifying only a comment on
+   * `TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP` removed the
+   * `ON UPDATE` and silently changed the column's behaviour. The 结构 tab's form has
+   * no field for it, so reading it from the live column is the only way an edit of
+   * anything else can leave it alone.
+   */
+  if (attributes.has('onUpdateCurrentTimestamp') || carry.onUpdateCurrentTimestamp === true) {
+    parts.push('ON UPDATE CURRENT_TIMESTAMP')
+  }
   if (spec.autoIncrement === true) parts.push('AUTO_INCREMENT')
   if (spec.unique === true) parts.push('UNIQUE')
   if (spec.comment !== undefined && spec.comment !== '') parts.push(renderComment(spec.comment))
@@ -2049,29 +2185,98 @@ function renderComment(text: string): string {
 /**
  * Project a {@link ColumnInfo} back onto a {@link ColumnSpec} for a rewrite.
  *
- * `SHOW CREATE TABLE` reports a numeric default as a QUOTED string (`DEFAULT
- * '3'` for an `int`), and `information_schema.COLUMNS.COLUMN_DEFAULT` does the
- * same. Feeding that back through {@link normalizeDefault} would store the
- * column's default as the string `3` on an `int` — MySQL accepts it and coerces,
- * so the rewrite succeeds with a subtly different definition. Unquoting a
- * numeric literal restores what the user would have written.
+ * `information_schema.COLUMNS.COLUMN_DEFAULT` is not always the literal
+ * {@link normalizeDefault} accepts, and each shape has to be translated back or the
+ * rewrite either fails or changes the column. See {@link defaultLiteralFor}.
  */
 function toSpec(column: ColumnInfo): ColumnSpec {
   return {
     name: column.name,
     type: column.type,
     nullable: column.nullable,
-    ...(column.defaultValue === undefined ? {} : { defaultValue: unquoteNumericDefault(column.defaultValue) }),
+    ...(column.defaultValue === undefined ? {} : { defaultValue: defaultLiteralFor(column.defaultValue, column.type) }),
     ...(column.primaryKeyPosition === undefined ? {} : { primaryKeyPosition: column.primaryKeyPosition }),
     ...(column.extra !== undefined && /auto_increment/i.test(column.extra) ? { autoIncrement: true } : {}),
     ...(column.comment === undefined ? {} : { comment: column.comment }),
   }
 }
 
-/** `'3'` → `3`, leaving any non-numeric default alone. */
-function unquoteNumericDefault(value: string): string {
-  const match = /^'(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)'$/.exec(value.trim())
-  return match === null ? value : match[1]!
+/** Whether a declared type's default is a NUMBER rather than text. */
+function isNumericColumnType(type: string): boolean {
+  return /^(tiny|small|medium|big)?(int|year)|^(decimal|numeric|float|double|real|bit)/i.test(type.trim())
+}
+
+/**
+ * Keywords whose reported form is written back bare, with an optional precision.
+ *
+ * The precision matters: `CURRENT_TIMESTAMP(6)` is a different default from
+ * `CURRENT_TIMESTAMP`, and wrapping it in brackets turns it into `now(6)` —
+ * measured. The value is equivalent but the schema text is not, and the panel would
+ * then show a default the user never wrote.
+ */
+const BARE_DEFAULT_KEYWORDS = /^(?:current_timestamp|current_date|current_time|localtimestamp|localtime|now|utc_timestamp)(?:\(\d*\))?$/i
+
+/**
+ * Undo the escaping MySQL applies to `COLUMN_DEFAULT` when re-emitting an expression.
+ *
+ * Measured: `CONCAT('a','b')` is reported as `concat(_utf8mb4\'a\',_utf8mb4\'b\')`, and a
+ * quote INSIDE the literal gets a second level (`\'it\\\'s\'`), so the server escapes
+ * each `\` and `'` of the inner text. The inverse is a single left-to-right pass:
+ * every `\X` becomes `X`. A `replaceAll("\\'", "'")` looks right on the first case and
+ * mangles the nested one.
+ */
+function unescapeDefaultExpression(text: string): string {
+  let out = ''
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '\\' && i + 1 < text.length) {
+      out += text[i + 1]
+      i++
+      continue
+    }
+    out += text[i]
+  }
+  return out
+}
+
+/**
+ * Rewrite a reported `COLUMN_DEFAULT` into the literal the renderer accepts.
+ *
+ * Five shapes arrive in one string field, and they are only distinguishable with the
+ * column's TYPE:
+ *
+ * | schema said | reported | written back as |
+ * | --- | --- | --- |
+ * | `DEFAULT 'x'` | `x`, unquoted | `'x'` — re-quoted |
+ * | `DEFAULT '5'` on a VARCHAR | `5` | `'5'` — quoted, because the TYPE is textual |
+ * | `DEFAULT 5` on an INT | `5` | `5` — bare, because the TYPE is numeric |
+ * | `DEFAULT CURRENT_TIMESTAMP(6)` | `CURRENT_TIMESTAMP(6)` | bare |
+ * | `DEFAULT (CONCAT('a','b'))` | `concat(_utf8mb4\'a\',…)` | unescaped, re-bracketed |
+ *
+ * The `'5'`/`5` pair is why the decision is made from the TYPE and not from the value:
+ * measured, both are reported as `5`, and writing the numeric form for a `VARCHAR`
+ * silently stores a numeric default — a round-trip comparison does not even show it,
+ * because the reported text is identical either way.
+ */
+export function defaultLiteralFor(reported: string, type: string): string {
+  const text = reported.trim()
+  if (text === '') return text
+  // `NULL` / `TRUE` / `FALSE` and the timestamp keywords are already literals.
+  if (/^(?:null|true|false)$/i.test(text)) return text
+  if (BARE_DEFAULT_KEYWORDS.test(text)) return text
+  if (/^-?\d+(\.\d+)?([eE][-+]?\d+)?$/.test(text)) {
+    // A number, which is already the literal form — unless the column is textual,
+    // where a bare number can only mean the server dropped the quotes.
+    return isNumericColumnType(type) ? text : `'${text}'`
+  }
+  // An EXPRESSION default. It has to go back inside brackets, or MySQL stores the
+  // expression's own text as the default instead of evaluating it.
+  if (text.includes('(')) {
+    const expression = unescapeDefaultExpression(text)
+    return /^\([\s\S]*\)$/.test(expression) ? expression : `(${expression})`
+  }
+  // Anything left is a string the server reported without its quotes.
+  if (isNumericColumnType(type)) return text
+  return `'${text.replace(/'/g, "''")}'`
 }
 
 /**

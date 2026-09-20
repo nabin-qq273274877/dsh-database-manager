@@ -24,6 +24,7 @@ import {
   autoIncrementBlocker,
   defaultToWire,
   DEFAULT_MODES,
+  inferDefault,
   nullDefaultNeedsNullable,
   quoteDefaultLiteral,
   requiresLengthOrValues,
@@ -74,6 +75,62 @@ describe('defaultToWire: the four modes are three different values', () => {
 
   it('lists the modes in the order the dropdown shows them', () => {
     expect([...DEFAULT_MODES]).toEqual(['none', 'custom', 'null', 'currentTimestamp'])
+  })
+})
+
+/**
+ * `inferDefault` reads back what the server REPORTED, so the 结构 tab's column editor can
+ * offer the same four-state control the 新建表 form uses.
+ *
+ * The two engines report the same value differently, and the difference is what makes a
+ * single rule wrong: MySQL strips a string's quotes and reports `DEFAULT NULL` as no
+ * value at all, while SQLite keeps the quotes and reports `NULL` explicitly.
+ */
+describe('inferDefault: what the server reported, in the form the editor shows', () => {
+  it('MySQL: an empty reported value is the empty-string default, not "no default"', () => {
+    /*
+     * The one that matters most. MySQL reports `DEFAULT ''` as an empty string, and the
+     * editor used to render that as an empty box, so submitting it dropped the default to
+     * NULL — a silent data-definition change. It has to come back as 自定义 with a blank
+     * box, which is the value the empty string needs.
+     */
+    expect(inferDefault('mysql', '')).toEqual({ mode: 'custom', text: '' })
+    // And an ABSENT value really is no default. MySQL reports `DEFAULT NULL` this way
+    // too, which is honest: NULL and "no DEFAULT clause" are the same state there.
+    expect(inferDefault('mysql', undefined)).toEqual({ mode: 'none', text: '' })
+  })
+
+  it('MySQL: a string default comes back unquoted', () => {
+    expect(inferDefault('mysql', 'x')).toEqual({ mode: 'custom', text: 'x' })
+    // A number is shown as the number it is, not as a string.
+    expect(inferDefault('mysql', '5')).toEqual({ mode: 'custom', text: '5' })
+    // So is a keyword or an expression, which are shown verbatim.
+    expect(inferDefault('mysql', 'CURRENT_TIMESTAMP')).toEqual({ mode: 'currentTimestamp', text: '' })
+    expect(inferDefault('mysql', "lower(_utf8mb4\\'ABC\\')")).toEqual({ mode: 'custom', text: "lower(_utf8mb4\\'ABC\\')" })
+  })
+
+  it('SQLite: a string default keeps its quotes, so they are stripped for display', () => {
+    // SQLite reports `''` as the two-character text `''`, NOT as an empty value — reading
+    // it as MySQL's empty string would show an empty box for a default that is one.
+    expect(inferDefault('sqlite', "''")).toEqual({ mode: 'custom', text: '' })
+    expect(inferDefault('sqlite', "'x'")).toEqual({ mode: 'custom', text: 'x' })
+    // A doubled quote is one quote.
+    expect(inferDefault('sqlite', "'it''s'")).toEqual({ mode: 'custom', text: "it's" })
+    expect(inferDefault('sqlite', '5')).toEqual({ mode: 'custom', text: '5' })
+    expect(inferDefault('sqlite', 'NULL')).toEqual({ mode: 'null', text: '' })
+  })
+
+  it('round-trips through defaultToWire', () => {
+    /*
+     * The pairing has to be consistent, or an untouched control would change the column.
+     * Checked for the shapes both formats share; MySQL's unquoted string is excluded
+     * because `defaultToWire` quotes it, which is the intended difference (it turns the
+     * reported `x` back into the literal `'x'`).
+     */
+    for (const [kind, raw] of [['sqlite', "'x'"], ['sqlite', "''"], ['sqlite', '5'], ['mysql', '5']] as const) {
+      const seed = inferDefault(kind, raw)
+      expect(defaultToWire(seed.mode, seed.text), `${kind} ${raw}`).toBe(raw)
+    }
   })
 })
 

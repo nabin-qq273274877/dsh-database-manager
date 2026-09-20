@@ -99,9 +99,181 @@ describe.skipIf(!reachable)('MySQL schema editing', () => {
     // The members come from the declared type, so the browser does not have to
     // re-implement MySQL's member quoting.
     expect(columns.find(column => column.name === 'k')!.options).toEqual(['a', 'b,c'])
-    expect(columns.find(column => column.name === 'doubled')!.generated).toBe(true)
-    expect(columns.find(column => column.name === 'base')!.generated).toBeUndefined()
+    const doubled = columns.find(column => column.name === 'doubled')!
+    expect(doubled.generated).toBe(true)
+    /*
+     * The EXPRESSION comes back too, and it is the only reliable test for "generated".
+     *
+     * `EXTRA` is measured to be `DEFAULT_GENERATED` for a plain
+     * `DEFAULT CURRENT_TIMESTAMP` column, so a substring test on GENERATED classifies an
+     * ordinary column as computed — which is what made such a column refuse every edit
+     * AND disappear from the insert form. The expression is non-empty only for a real
+     * generated column.
+     */
+    expect(doubled.generatedExpression).toContain('base')
+    const base = columns.find(column => column.name === 'base')!
+    expect(base.generated).toBeUndefined()
+    expect(base.generatedExpression).toBeUndefined()
     await driver!.exec('DROP TABLE kinds', [], DB)
+  })
+
+  /**
+   * An ordinary column with a default must stay editable.
+   *
+   * The regression this pins: `EXTRA` carries `DEFAULT_GENERATED` for a plain
+   * `TIMESTAMP DEFAULT CURRENT_TIMESTAMP` (measured), and the generated-column test was
+   * a substring match on `GENERATED`. So a perfectly ordinary column was classified as
+   * computed and every edit of it failed with "this generated column cannot be
+   * modified" — the message the user reported.
+   */
+  it('treats DEFAULT_GENERATED as a default, not as a computed column', async () => {
+    await driver!.exec(
+      'CREATE TABLE dflt_ts (a TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP, b INT DEFAULT 5)',
+      [],
+      DB,
+    )
+    const columns = await driver!.columns(DB, 'dflt_ts')
+    for (const name of ['a', 'b']) {
+      const column = columns.find(candidate => candidate.name === name)!
+      expect(column.generated, name).toBeUndefined()
+      expect(column.generatedExpression, name).toBeUndefined()
+    }
+
+    // And both really are editable, which is what the misclassification prevented.
+    await driver!.alterColumn(DB, 'dflt_ts', {
+      name: 'a',
+      type: 'timestamp',
+      nullable: true,
+      defaultValue: 'CURRENT_TIMESTAMP',
+      comment: 'touched',
+    })
+    const after = (await driver!.columns(DB, 'dflt_ts')).find(column => column.name === 'a')!
+    expect(after.comment).toBe('touched')
+    // The default survived, and the clause is still there.
+    expect(String(after.defaultValue)).toMatch(/CURRENT_TIMESTAMP/i)
+    await driver!.exec('DROP TABLE dflt_ts', [], DB)
+  })
+
+  /**
+   * A generated column can be edited: its comment, and nothing else about it.
+   *
+   * The panel marks a generated column and refuses to change its expression, but a
+   * comment is not the expression. Before the fix the driver had no expression to
+   * re-emit (it was never selected) and refused EVERY edit, so the comment could not be
+   * changed at all.
+   */
+  it('edits a generated column by re-emitting the expression the server reported', async () => {
+    await driver!.exec(
+      'CREATE TABLE gen_edit (a INT, s INT GENERATED ALWAYS AS (a * 2) STORED, v INT GENERATED ALWAYS AS (a + 1) VIRTUAL)',
+      [],
+      DB,
+    )
+    for (const [name, storage] of [['s', 'STORED'], ['v', 'VIRTUAL']]) {
+      await driver!.alterColumn(DB, 'gen_edit', {
+        name,
+        type: 'int',
+        nullable: true,
+        comment: `touched-${name}`,
+      })
+      const column = (await driver!.columns(DB, 'gen_edit')).find(candidate => candidate.name === name)!
+      expect(column.comment, name).toBe(`touched-${name}`)
+      expect(column.generated, name).toBe(true)
+      // STORED vs VIRTUAL is part of the column's identity and MySQL refuses to change
+      // it, so it must have been carried over rather than defaulted.
+      expect(column.extra, name).toContain(storage)
+    }
+    // The table still computes the values, i.e. the expression was not replaced by
+    // something else.
+    await driver!.exec('INSERT INTO gen_edit (a) VALUES (3)', [], DB)
+    const read = await driver!.exec('SELECT s, v FROM gen_edit', [], DB)
+    expect(read.rows[0]).toEqual([6, 4])
+    await driver!.exec('DROP TABLE gen_edit', [], DB)
+  })
+
+  /**
+   * Every reported default shape survives a round trip through the editor.
+   *
+   * The editor sends back what it read, so the driver has to translate each shape:
+   * `information_schema` reports a string without quotes, an expression without its
+   * brackets and with doubled escaping, and a bare number whose meaning depends on the
+   * column's TYPE.
+   */
+  it('round-trips every default shape the server reports', async () => {
+    const shapes: Array<[string, string]> = [
+      ['d_str', "VARCHAR(10) DEFAULT 'x'"],
+      // The reported value for this is `5` — identical to the INT case below — so only
+      // the TYPE can tell the two apart.
+      ['d_str_num', "VARCHAR(10) DEFAULT '5'"],
+      ['d_empty', "VARCHAR(10) DEFAULT ''"],
+      ['d_int', 'INT DEFAULT 5'],
+      ['d_dec', 'DECIMAL(10,2) DEFAULT 9.90'],
+      ['d_null', 'INT DEFAULT NULL'],
+      ['d_ts_prec', 'TIMESTAMP(6) NULL DEFAULT CURRENT_TIMESTAMP(6)'],
+      ['d_expr', "VARCHAR(10) DEFAULT (LOWER('ABC'))"],
+      ['d_nonum', 'INT'],
+    ]
+    for (const [name, def] of shapes) {
+      await driver!.exec(`CREATE TABLE ${name} (id INT PRIMARY KEY, v ${def})`, [], DB)
+    }
+
+    for (const [name] of shapes) {
+      const before = (await driver!.columns(DB, name)).find(column => column.name === 'v')!
+      /*
+       * Exactly what the 结构 tab's editor submits.
+       *
+       * An EMPTY-STRING default is the one shape the editor cannot pass through: MySQL
+       * reports it as an empty string, which the driver correctly reads as "no value" and
+       * drops the clause. The editor renders it from its 自定义 mode instead, producing
+       * the literal `''` — the same rendering the 新建表 form uses. Every other shape is
+       * passed through as read.
+       */
+      const sent = before.defaultValue === '' ? "''" : before.defaultValue
+      await driver!.alterColumn(DB, name, {
+        name: 'v',
+        type: before.type,
+        nullable: before.nullable,
+        ...(sent === undefined ? {} : { defaultValue: sent }),
+        comment: 'x',
+      })
+      const after = (await driver!.columns(DB, name)).find(column => column.name === 'v')!
+      // JSON comparison, so a NULL default is not confused with the empty string —
+      // the two are different values and `'' → NULL` is exactly the silent loss this
+      // test exists to catch.
+      expect(JSON.stringify(after.defaultValue ?? null), `${name} default`).toBe(JSON.stringify(before.defaultValue ?? null))
+      expect(after.comment, `${name} comment`).toBe('x')
+    }
+
+    for (const [name] of shapes) await driver!.exec(`DROP TABLE ${name}`, [], DB)
+  })
+
+  /**
+   * `ON UPDATE CURRENT_TIMESTAMP` survives an edit of something else.
+   *
+   * `MODIFY COLUMN` rewrites the whole definition, so a clause that is not re-emitted is
+   * DROPPED — measured: changing only a comment removed the `ON UPDATE` and silently
+   * changed when the column is written. The form has no field for it, so the driver
+   * reads it off the live column.
+   */
+  it('keeps ON UPDATE CURRENT_TIMESTAMP when only the comment changes', async () => {
+    await driver!.exec(
+      'CREATE TABLE onupd (a TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)',
+      [],
+      DB,
+    )
+    const before = (await driver!.columns(DB, 'onupd')).find(column => column.name === 'a')!
+    expect(before.extra).toMatch(/on update/i)
+
+    await driver!.alterColumn(DB, 'onupd', {
+      name: 'a',
+      type: before.type,
+      nullable: before.nullable,
+      ...(before.defaultValue === undefined ? {} : { defaultValue: before.defaultValue }),
+      comment: 'touched',
+    })
+    const after = (await driver!.columns(DB, 'onupd')).find(column => column.name === 'a')!
+    expect(after.comment).toBe('touched')
+    expect(after.extra).toMatch(/on update/i)
+    await driver!.exec('DROP TABLE onupd', [], DB)
   })
 
   it('adds, alters and drops a column', async () => {

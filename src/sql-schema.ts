@@ -765,8 +765,30 @@ export function renderColumn(column: ColumnDefinition, dialect: SqlDialect): str
   if (column.generated !== true) {
     parts.push(column.nullable ? 'NULL' : 'NOT NULL')
     if (column.defaultValue !== undefined) {
-      const value = normalizeDefault(column.defaultValue, dialect)
-      if (value !== undefined) parts.push(`DEFAULT ${value}`)
+      /*
+       * An expression default is emitted verbatim, and this is a REBUILD concern rather
+       * than an editing one.
+       *
+       * SQLite has no `ALTER COLUMN`, so every change rebuilds the whole table and
+       * re-renders EVERY column. A column whose default is an expression
+       * (`DEFAULT (lower('ABC'))`) therefore breaks edits of unrelated columns: the
+       * rebuild re-emits its clause, and `normalizeDefault` refuses a parenthesised
+       * expression by design because it cannot verify an arbitrary one. Measured — the
+       * user saw "a parenthesised default expression is not accepted" naming a default
+       * they had not touched.
+       *
+       * Both engine forms are recognised: `columns()` reports `lower('ABC')` and the
+       * parsed `CREATE TABLE` text gives `(lower('ABC'))`. A quoted literal is never an
+       * expression, so `'x'` and `''` still go through the validator.
+       */
+      const raw = column.defaultValue.trim()
+      const isExpression = raw !== '' && !raw.startsWith("'") && /[(]/.test(raw)
+      if (isExpression) {
+        parts.push(`DEFAULT ${raw.startsWith('(') && raw.endsWith(')') ? raw : `(${raw})`}`)
+      } else {
+        const value = normalizeDefault(column.defaultValue, dialect)
+        if (value !== undefined) parts.push(`DEFAULT ${value}`)
+      }
     }
     if (column.unique === true) parts.push('UNIQUE')
     if (column.autoIncrement === true && dialect === 'mysql') parts.push('AUTO_INCREMENT')

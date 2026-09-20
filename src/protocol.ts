@@ -213,6 +213,20 @@ export interface ColumnInfo {
    */
   generated?: boolean
   /**
+   * The expression a generated column is computed from, as the engine reports it.
+   *
+   * MySQL: `information_schema.COLUMNS.GENERATION_EXPRESSION`, brackets included
+   * (`(`a` * 2)`). Needed because `EXTRA` reports only that the column IS generated
+   * (`STORED GENERATED` / `VIRTUAL GENERATED`) and never what from — and a `MODIFY`
+   * that omits the expression would change the column instead of editing it.
+   *
+   * ABSENT for every ordinary column. It is also the RELIABLE test for "is this a
+   * generated column": `EXTRA` carries `DEFAULT_GENERATED` for a plain
+   * `DEFAULT CURRENT_TIMESTAMP`, so a substring match on `GENERATED` classifies an
+   * ordinary column with a default as a computed one (measured).
+   */
+  generatedExpression?: string
+  /**
    * The collation this column was declared with.
    *
    * MySQL: `information_schema.COLUMNS.COLLATION_NAME`. SQLite has no such catalog

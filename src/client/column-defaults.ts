@@ -138,6 +138,49 @@ export function defaultToWire(mode: DefaultMode, text: string): string | undefin
   return quoteDefaultLiteral(text)
 }
 
+/**
+ * Which mode and text an EXISTING column's reported default corresponds to.
+ *
+ * Exists so the 结构 tab's column editor can offer the same four-state control the
+ * 新建表 form does (不设置 / 自定义 / NULL / CURRENT_TIMESTAMP) while editing a column
+ * that already has one. Without it the editor has only a text box, and a column whose
+ * default IS the empty string is indistinguishable from one with no default at all —
+ * measured: `DEFAULT ''` renders as an empty box, and submitting that box drops the
+ * default to NULL.
+ *
+ * The two engines report the same value in DIFFERENT forms, which is why this takes
+ * the engine:
+ *
+ *   MySQL     `''` → `''` as a value   `'x'` → `x`      `NULL` → (absent)
+ *   SQLite    `''` → `''` (quoted)     `'x'` → `'x'`    `NULL` → `NULL`
+ *
+ * MySQL strips the quotes and reports `DEFAULT NULL` as no value at all; SQLite keeps
+ * the literal text and reports `NULL` explicitly. A single rule would misread one of
+ * them — SQLite's `''` is a two-character string that must not be shown as an empty box
+ * meaning "no default", and MySQL's `NULL`-as-absent must not be shown as the empty
+ * string.
+ *
+ * `text` is returned in the form the user should see and edit, which for a string is
+ * unquoted: the quoting is `defaultToWire`'s job, and showing `'x'` in a box labelled
+ * 自定义 invites the user to type the quotes themselves.
+ */
+export function inferDefault(kind: string, raw: string | undefined): { mode: DefaultMode; text: string } {
+  if (raw === undefined) return { mode: 'none', text: '' }
+  const text = raw.trim()
+  if (text === '') {
+    // MySQL's way of reporting `DEFAULT ''`: present, and an empty string.
+    return kind === 'mysql' ? { mode: 'custom', text: '' } : { mode: 'none', text: '' }
+  }
+  if (/^null$/i.test(text)) return { mode: 'null', text: '' }
+  if (/^current_timestamp(\(\d*\))?$/i.test(text)) return { mode: 'currentTimestamp', text: '' }
+  // SQLite keeps a string's quotes; MySQL has already stripped them.
+  if (text.length >= 2 && text.startsWith("'") && text.endsWith("'")) {
+    return { mode: 'custom', text: text.slice(1, -1).replace(/''/g, "'") }
+  }
+  // A number, keyword or expression: shown verbatim, and re-emitted verbatim.
+  return { mode: 'custom', text }
+}
+
 /** Why an auto-increment column is not possible, or undefined when it is. */
 export type AutoIncrementBlocker = 'notKey' | 'notInteger' | 'notNumeric'
 

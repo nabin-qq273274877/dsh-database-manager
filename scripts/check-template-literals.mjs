@@ -56,6 +56,7 @@ const files = [
   'scripts/e2e-insert-jump.mjs',
   'scripts/e2e-insert-tinyint.mjs',
   'scripts/e2e-sqlite-boolean.mjs',
+  'scripts/e2e-structure-edit.mjs',
   'scripts/probe-side-refresh.mjs',
   'scripts/probe-side-refresh-poll.mjs',
   'scripts/probe-collate-link.mjs',
@@ -97,9 +98,15 @@ for (const relative of files) {
   // Leading whitespace is required before the marker, which keeps a BACKTICK
   // DELIMITER at the start of a line (`\`` alone, or `  \`,`) from being read as
   // a comment — otherwise the guard would flag its own subject.
+  //
+  // A ONE-LINE doc comment counts too (`/** text `x` */`). It was missed by the
+  // `^\s*(\*|\/\/)` test because the line starts with `/**`, and the miss is not
+  // harmless: the backtick inside closes the enclosing template literal early, so the
+  // parse error points at the generated page code rather than at the comment. That cost
+  // a round of debugging on two separate scripts.
   const commentHits = source.split('\n')
     .map((line, index) => ({ line, number: index + 1 }))
-    .filter(entry => /^\s*(\*|\/\/)/.test(entry.line) && entry.line.includes('`'))
+    .filter(entry => /^\s*(\*|\/\/|\/\*\*?)/.test(entry.line) && entry.line.includes('`'))
 
   // The parse check catches an odd number of backticks and any other syntax
   // error. `npm run typecheck` covers the .ts file too, but running it here

@@ -18,7 +18,29 @@ import * as React from 'react'
 
 import type { ColumnInfo, ColumnSpecPayload, IndexInfo } from '../protocol.ts'
 import type { DbApi } from './api.ts'
+import {
+  DEFAULT_MODES,
+  defaultToWire,
+  inferDefault,
+  supportsCurrentTimestamp,
+  type DefaultMode,
+} from './column-defaults.ts'
 import { ErrorBanner, Modal, t } from './ui.ts'
+
+/**
+ * The 默认值 control's state, mirroring the 新建表 form's four modes.
+ *
+ * `opened` records what the control was seeded with, so "the user left it alone" is
+ * distinguishable from "the user picked the same thing". That matters because an
+ * untouched default is sent back VERBATIM: the raw value the server reported may be
+ * an expression this form cannot re-render, and re-emitting it from the mode would
+ * turn `lower('ABC')` into the string literal `'lower(''ABC'')'`.
+ */
+interface DefaultDraft {
+  mode: DefaultMode
+  text: string
+  opened: { mode: DefaultMode; text: string }
+}
 
 /** Props for {@link SqlStructureTab}. */
 export interface SqlStructureTabProps {
@@ -78,7 +100,7 @@ export function needsRebuild(kind: string, change: 'add' | 'alter' | 'drop' | 'k
 export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement {
   const { api, sourceId, schema, table, kind, columns, indexes, loading, error, onReload, onReloadRows, onNotice, onError } = props
   /** The column editor: a new column, or an existing one being changed. */
-  const [editor, setEditor] = React.useState<{ mode: 'add' | 'edit'; spec: ColumnSpecPayload; original: string } | undefined>(undefined)
+  const [editor, setEditor] = React.useState<{ mode: 'add' | 'edit'; spec: ColumnSpecPayload; original: string; default: DefaultDraft } | undefined>(undefined)
   const [confirming, setConfirming] = React.useState<
     | { op: 'dropColumn'; column: string; rebuild: boolean }
     | { op: 'dropColumns'; columns: string[]; rebuild: boolean }
@@ -134,13 +156,31 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
   }
 
   const startEdit = (column: ColumnInfo): void => {
+    /*
+     * The default is converted into the same four-state control 新建表 uses.
+     *
+     * Before this the editor had a bare text box, and two things went wrong with it.
+     * A column whose default IS the empty string showed as an empty box, so submitting
+     * it dropped the default to NULL — measured. And a MySQL column with
+     * `DEFAULT CURRENT_TIMESTAMP` could not be touched at all, because the reported
+     * text was not a literal the validator accepts.
+     *
+     * `inferDefault` reads the ENGINE's own reporting shape, so the seeding is right on
+     * both: SQLite keeps a string's quotes and reports `NULL` explicitly, MySQL strips
+     * the quotes and reports `DEFAULT NULL` as nothing.
+     */
+    const seeded = inferDefault(kind, column.defaultValue)
     setEditor({
       mode: 'edit',
       original: column.name,
+      default: { ...seeded, opened: seeded },
       spec: {
         name: column.name,
         type: column.type,
         nullable: column.nullable,
+        // Kept VERBATIM and used only when the user leaves the control alone: the raw
+        // text round-trips exactly, whereas re-rendering it from the mode would turn
+        // an expression default into a string literal. See `submitEditor`.
         ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
         ...(column.comment === undefined ? {} : { comment: column.comment }),
         ...(column.extra !== undefined && /auto_increment/i.test(column.extra) ? { autoIncrement: true } : {}),
@@ -152,9 +192,10 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
     setEditor({
       mode: 'add',
       original: '',
-      // A new column starts nullable with no default: those are the settings that
+      // A new column starts with no default and nullable: those are the settings that
       // cannot fail on a table that already holds rows. A NOT NULL column without
       // a default is refused by both engines when the table is not empty.
+      default: { mode: 'none', text: '', opened: { mode: 'none', text: '' } },
       spec: { name: '', type: kind === 'sqlite' ? 'TEXT' : 'varchar(191)', nullable: true },
     })
   }
@@ -167,11 +208,38 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
     if (name === '') { onError(t('structure.colNameRequired')); return }
     const taken = columns.some(column => column.name.toLowerCase() === name.toLowerCase() && column.name !== editor.original)
     if (taken) { onError(t('structure.colNameTaken', { name })); return }
+    /*
+     * An untouched control sends the RAW reported default; a changed one sends the
+     * mode's rendering.
+     *
+     * The exception that makes this necessary is an EXPRESSION default. The server
+     * reports `lower('ABC')` and neither engine's modes can rebuild it: rendering it as
+     * 自定义 would quote the whole expression and store its TEXT as the default. So an
+     * expression is passed through exactly as read, and only the four modes' own values
+     * are re-rendered.
+     *
+     * The empty-string default must NOT take that path. MySQL reports `DEFAULT ''` as an
+     * empty string, so passing it through raw means the driver sees `''` as "no value"
+     * and drops the clause — which is how the default was being lost. It is
+     * representable (自定义 with a blank box), so it goes through the mode.
+     */
+    const untouched = editor.default.mode === editor.default.opened.mode
+      && editor.default.text === editor.default.opened.text
+    const raw = spec.defaultValue
+    const isExpression = raw !== undefined && /[(]/.test(raw) && !/^'/.test(raw)
+    const defaultValue = untouched && isExpression
+      ? raw
+      : defaultToWire(editor.default.mode, editor.default.text)
+    const column = {
+      ...spec,
+      name,
+      ...(defaultValue === undefined ? { defaultValue: undefined } : { defaultValue }),
+    }
     const body = editor.mode === 'add'
-      ? { action: 'addColumn', column: { ...spec, name } }
+      ? { action: 'addColumn', column }
       : {
           action: 'alterColumn',
-          column: { ...spec, name: editor.original },
+          column: { ...column, name: editor.original },
           ...(name === editor.original ? {} : { rename: name }),
         }
     await run(body)
@@ -390,7 +458,7 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
             kind,
             columns,
             busy,
-            onChange: next => setEditor({ ...editor, spec: next }),
+            onChange: next => setEditor({ ...editor, spec: next.spec, default: next.default }),
             onSubmit: () => { void submitEditor() },
             onCancel: () => setEditor(undefined),
             onError,
@@ -568,22 +636,96 @@ function ConfirmChange(props: {
  * column against.
  */
 function ColumnEditor(props: {
-  editor: { mode: 'add' | 'edit'; spec: ColumnSpecPayload; original: string }
+  editor: { mode: 'add' | 'edit'; spec: ColumnSpecPayload; original: string; default: DefaultDraft }
   kind: string
   columns: ColumnInfo[]
   busy: boolean
-  onChange(next: ColumnSpecPayload): void
+  onChange(next: { spec: ColumnSpecPayload; default: DefaultDraft }): void
   onSubmit(): void
   onCancel(): void
   onError(message: string | undefined): void
 }): React.ReactElement {
   const { editor, kind, columns, busy, onChange, onSubmit, onCancel } = props
   const spec = editor.spec
+  const draft = editor.default
   const options = typeOptions(kind)
   // An enum's members are what the user has to supply, so the type list is a set of
   // starting points and the text field is the authority.
   const inList = options.includes(spec.type)
   const existing = editor.mode === 'edit' ? columns.find(column => column.name === editor.original) : undefined
+  /** Patch the spec alone. */
+  const patchSpec = (next: Partial<ColumnSpecPayload>): void => onChange({ spec: { ...spec, ...next }, default: draft })
+  /** Patch the default control alone. */
+  const patchDefault = (next: Partial<DefaultDraft>): void => onChange({ spec, default: { ...draft, ...next } })
+
+  /**
+   * The 默认值 control — the SAME four-state one the 新建表 form uses.
+   *
+   * Asked for by name ("默认值要和建表一样，可选，定义时可以输入"), and the four states
+   * are load-bearing rather than decorative: 不设置 and 自定义-with-an-empty-box are
+   * different values in the database (`no DEFAULT` versus `DEFAULT ''`), and a single
+   * text box cannot express both — which is exactly how the empty-string default was
+   * being lost.
+   *
+   * The mode swaps the cell to a single text box, the same shape 新建表 already uses,
+   * so the dropdown and the box never squeeze each other at this dialog's width.
+   */
+  const defaultControl = (): React.ReactElement => {
+    if (draft.mode === 'custom') {
+      return React.createElement(
+        'div',
+        { className: 'dbm-type-cell' },
+        React.createElement('input', {
+          className: 'dbm-input dbm-mono',
+          value: draft.text,
+          // Empty IS a real answer in this mode — it means the empty string — so the
+          // placeholder says so rather than showing a "nothing" hint.
+          placeholder: t('createTable.default.emptyString'),
+          'aria-label': t('createTable.default.text'),
+          'data-dbm-column-default-text': '',
+          spellcheck: false,
+          autoFocus: true,
+          onChange: (event: { target: { value: string } }) => patchDefault({ text: event.target.value }),
+        }),
+        React.createElement(
+          'button',
+          {
+            type: 'button',
+            className: 'dbm-btn dbm-btn-sm',
+            title: t('createTable.default.backToList'),
+            'data-dbm-column-default-list': '',
+            onClick: () => patchDefault({ mode: 'none' }),
+          },
+          '↺',
+        ),
+      )
+    }
+    return React.createElement(
+      'select',
+      {
+        className: 'dbm-select',
+        value: draft.mode,
+        'aria-label': t('structure.col.default'),
+        'data-dbm-column-default-mode': '',
+        onChange: (event: { target: { value: string } }) => patchDefault({ mode: event.target.value as DefaultMode }),
+      },
+      ...DEFAULT_MODES.map(mode => {
+        const label = mode === 'none'
+          ? t('common.none')
+          : mode === 'custom'
+            ? t('createTable.default.custom')
+            : mode === 'null' ? 'NULL' : 'CURRENT_TIMESTAMP'
+        // CURRENT_TIMESTAMP is only offered for a type that accepts it; MySQL refuses
+        // it elsewhere with "Invalid default value", measured on VARCHAR and INT.
+        const disabled = mode === 'currentTimestamp' && !supportsCurrentTimestamp(spec.type)
+        return React.createElement(
+          'option',
+          { key: mode, value: mode, disabled },
+          disabled ? `${label}（${t('createTable.default.needsTemporal')}）` : label,
+        )
+      }),
+    )
+  }
 
   /** One labelled field, stacked, with an optional hint under its control. */
   const field = (key: string, label: string, control: unknown, hint?: string): React.ReactElement =>
@@ -621,7 +763,7 @@ function ColumnEditor(props: {
         value: spec.name,
         'aria-label': t('structure.colName'),
         'data-dbm-column-name': '',
-        onChange: (event: { target: { value: string } }) => onChange({ ...spec, name: event.target.value }),
+        onChange: (event: { target: { value: string } }) => patchSpec({ name: event.target.value }),
       })),
       /*
        * The type is a LIST plus a text field, not one or the other.
@@ -637,7 +779,7 @@ function ColumnEditor(props: {
           'aria-label': t('structure.col.type'),
           onChange: (event: { target: { value: string } }) => {
             const value = event.target.value
-            onChange({ ...spec, type: value === '__other__' ? spec.type : value })
+            patchSpec({ type: value === '__other__' ? spec.type : value })
           },
         },
         [
@@ -652,7 +794,7 @@ function ColumnEditor(props: {
         'aria-label': t('structure.typeText'),
         spellcheck: false,
         'data-dbm-column-type': '',
-        onChange: (event: { target: { value: string } }) => onChange({ ...spec, type: event.target.value }),
+        onChange: (event: { target: { value: string } }) => patchSpec({ type: event.target.value }),
       })),
       field('nullable', t('structure.col.nullable'),
         React.createElement('label', { className: 'dbm-check' },
@@ -662,25 +804,18 @@ function ColumnEditor(props: {
             // A primary-key column cannot be nullable in either engine, so the
             // checkbox is disabled where it would mean nothing.
             disabled: existing?.primaryKeyPosition !== undefined,
-            onChange: (event: { target: { checked: boolean } }) => onChange({ ...spec, nullable: event.target.checked }),
+            onChange: (event: { target: { checked: boolean } }) => patchSpec({ nullable: event.target.checked }),
           }),
           t('structure.col.nullable')),
         existing?.primaryKeyPosition === undefined ? undefined : t('structure.nullableKeyHint'),
       ),
-      field('default', t('structure.col.default'), React.createElement('input', {
-        className: 'dbm-input dbm-mono',
-        value: spec.defaultValue ?? '',
-        placeholder: t('structure.defaultPlaceholder'),
-        'aria-label': t('structure.col.default'),
-        spellcheck: false,
-        onChange: (event: { target: { value: string } }) => onChange({ ...spec, defaultValue: event.target.value }),
-      })),
+      field('default', t('structure.col.default'), defaultControl(), t('structure.defaultHint')),
       field('comment', t('structure.col.comment'), React.createElement('input', {
         className: 'dbm-input',
         value: spec.comment ?? '',
         placeholder: t('structure.commentPlaceholder'),
         'aria-label': t('structure.col.comment'),
-        onChange: (event: { target: { value: string } }) => onChange({ ...spec, comment: event.target.value }),
+        onChange: (event: { target: { value: string } }) => patchSpec({ comment: event.target.value }),
       })),
       editor.mode === 'edit' && existing?.generated === true
         ? React.createElement('div', { className: 'dbm-hint' }, t('structure.generatedHint'))
@@ -836,3 +971,4 @@ function KeyEditor(props: {
     ),
   })
 }
+

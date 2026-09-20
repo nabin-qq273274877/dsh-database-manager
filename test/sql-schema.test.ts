@@ -285,6 +285,150 @@ describe('SqliteDriver schema editing', () => {
     expect(page.rows[0]).toEqual({ a: 1, b: 'x' })
   })
 
+  /**
+   * Every default shape SQLite reports survives a round trip through the editor.
+   *
+   * SQLite keeps a default's LITERAL TEXT, so unlike MySQL the value passes through
+   * unchanged — but the empty string and "no default" are still different states
+   * (`''` versus NULL), and the rebuild path compares them with `normalizeDefault`,
+   * which must not conflate the two either.
+   */
+  it('round-trips every default shape the editor can submit', async () => {
+    const shapes: Array<[string, string]> = [
+      ['d_str', "TEXT DEFAULT 'x'"],
+      ['d_empty', "TEXT DEFAULT ''"],
+      ['d_num', 'INT DEFAULT 5'],
+      ['d_null', 'TEXT DEFAULT NULL'],
+      ['d_expr', "TEXT DEFAULT (lower('ABC'))"],
+    ]
+    for (const [name, def] of shapes) {
+      const driver = driverFor(`${name}.db`)
+      await driver.exec(`CREATE TABLE t(id INTEGER PRIMARY KEY, v ${def})`, [])
+      const before = (await driver.columns('main', 't')).find(column => column.name === 'v')!
+      await driver.alterColumn('main', 't', { ...before, nullable: true })
+      const after = (await driver.columns('main', 't')).find(column => column.name === 'v')!
+      /*
+       * Compared case-insensitively for the KEYWORD forms only.
+       *
+       * The rebuild re-emits the default through `normalizeDefault`, which lowercases a
+       * keyword, so `DEFAULT NULL` comes back as `null`. That is the same default written
+       * differently, and a case-sensitive comparison would report it as a change — while
+       * the difference this test exists to catch (a default DISAPPEARING, or `''` becoming
+       * absent) is unaffected by case.
+       */
+      const normalize = (value: string | undefined): string | undefined =>
+        value === undefined ? undefined : (/^[A-Za-z_]+\(?\)?$/.test(value.trim()) ? value.trim().toLowerCase() : value)
+      expect(JSON.stringify(normalize(after.defaultValue) ?? null), `${name} reported`)
+        .toBe(JSON.stringify(normalize(before.defaultValue) ?? null))
+    }
+  })
+
+  it('applies a NEW default through the rebuild, including the empty string', async () => {
+    const driver = driverFor('newdefault.db')
+    await driver.exec('CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)', [])
+    await driver.exec('INSERT INTO t (id) VALUES (1)', [])
+
+    // The empty string, which is a real default and must not be read as "none".
+    const v = (await driver.columns('main', 't')).find(column => column.name === 'v')!
+    await driver.alterColumn('main', 't', { ...v, defaultValue: "''" })
+    let after = (await driver.columns('main', 't')).find(column => column.name === 'v')!
+    expect(after.defaultValue).toBe("''")
+    // And it really applies: an insert that omits the column stores the empty string,
+    // not NULL. That is the difference the four-state control exists to preserve.
+    await driver.exec('INSERT INTO t (id) VALUES (2)', [])
+    const rows = await driver.rows({ schema: 'main', table: 't', page: 1, pageSize: 10, mode: 'browse' })
+    expect(rows.rows.find(row => row['id'] === 2)?.['v']).toBe('')
+
+    // Replacing it with a keyword works too.
+    await driver.alterColumn('main', 't', { ...v, defaultValue: 'CURRENT_TIMESTAMP' })
+    after = (await driver.columns('main', 't')).find(column => column.name === 'v')!
+    expect(String(after.defaultValue)).toMatch(/CURRENT_TIMESTAMP/i)
+
+    // And removing it: no DEFAULT clause at all.
+    await driver.alterColumn('main', 't', { ...v, defaultValue: undefined })
+    after = (await driver.columns('main', 't')).find(column => column.name === 'v')!
+    expect(after.defaultValue).toBeUndefined()
+  })
+
+  /**
+   * One expression default must not block edits of OTHER columns.
+   *
+   * SQLite has no `ALTER COLUMN`: every change rebuilds the whole table and re-renders
+   * EVERY column. So a column whose default is an expression (`DEFAULT (lower('ABC'))`)
+   * is re-emitted on each rebuild, and `normalizeDefault` refuses a parenthesised
+   * expression by design — it cannot verify an arbitrary one. Measured before the fix:
+   * editing the comment of an unrelated `INT DEFAULT 5` column failed with
+   * "a parenthesised default expression is not accepted", naming a default the user had
+   * not touched. A test that only edited the expression column itself would have passed.
+   */
+  it('lets other columns be edited while one has an expression default', async () => {
+    const driver = driverFor('exprbreaks.db')
+    await driver.exec(
+      "CREATE TABLE t(id INTEGER PRIMARY KEY, plain INT DEFAULT 5, empty_s TEXT DEFAULT '', expr TEXT DEFAULT (lower('ABC')))",
+      [],
+    )
+
+    /*
+     * The unrelated column, which is what the user actually tried to edit.
+     *
+     * The change is a TYPE rather than a comment: SQLite has no column comments at all
+     * (`renderColumn` emits `COMMENT` for MySQL only), so a comment would be silently
+     * dropped and the test would be asserting something the engine cannot do.
+     */
+    const plain = (await driver.columns('main', 't')).find(column => column.name === 'plain')!
+    await driver.alterColumn('main', 't', { ...plain, type: 'BIGINT' })
+    const afterPlain = (await driver.columns('main', 't')).find(column => column.name === 'plain')!
+    expect(afterPlain.type).toBe('BIGINT')
+    // And nothing else moved with it.
+    expect(String(afterPlain.defaultValue)).toBe('5')
+
+    // The expression column can be edited too, and keeps working.
+    const expr = (await driver.columns('main', 't')).find(column => column.name === 'expr')!
+    await driver.alterColumn('main', 't', { ...expr, type: 'VARCHAR(10)' })
+    const afterExpr = (await driver.columns('main', 't')).find(column => column.name === 'expr')!
+    expect(afterExpr.type).toBe('VARCHAR(10)')
+    expect(String(afterExpr.defaultValue)).toMatch(/lower/i)
+
+    // The default still EVALUATES rather than being the expression's text.
+    await driver.exec('INSERT INTO t (id) VALUES (1)', [])
+    const rows = await driver.rows({ schema: 'main', table: 't', page: 1, pageSize: 10, mode: 'browse' })
+    expect(rows.rows[0]?.['expr']).toBe('abc')
+    expect(String(rows.rows[0]?.['plain'])).toBe('5')
+    expect(rows.rows[0]?.['empty_s']).toBe('')
+  })
+
+  /**
+   * A generated column stays generated across a rebuild.
+   *
+   * The rebuild decides which columns to copy from the `generated` flag, and the 结构 tab
+   * never sends it (it marks the column and refuses to change the expression). Losing the
+   * flag made the rebuild `INSERT` into the generated column, which SQLite refuses with
+   * "cannot INSERT into generated column" — so editing a generated column's TYPE failed
+   * while editing an ordinary column's worked.
+   */
+  it('keeps a generated column generated when its type changes', async () => {
+    const driver = driverFor('genrebuild.db')
+    await driver.exec(
+      'CREATE TABLE t(id INTEGER PRIMARY KEY, plain INT DEFAULT 5, gen_v INT GENERATED ALWAYS AS (plain + 1) VIRTUAL, gen_s INT GENERATED ALWAYS AS (plain * 2) STORED)',
+      [],
+    )
+    await driver.exec('INSERT INTO t (id, plain) VALUES (1, 3)', [])
+
+    for (const name of ['gen_v', 'gen_s']) {
+      const before = (await driver.columns('main', 't')).find(column => column.name === name)!
+      await driver.alterColumn('main', 't', { ...before, type: 'BIGINT' })
+      const after = (await driver.columns('main', 't')).find(column => column.name === name)!
+      expect(after.type, name).toBe('BIGINT')
+      expect(after.generated, name).toBe(true)
+    }
+
+    // The expressions still compute, and the ordinary data survived the rebuild.
+    const rows = await driver.rows({ schema: 'main', table: 't', page: 1, pageSize: 10, mode: 'browse' })
+    expect(rows.rows[0]?.['gen_v']).toBe(4)
+    expect(rows.rows[0]?.['gen_s']).toBe(6)
+    expect(String(rows.rows[0]?.['plain'])).toBe('3')
+  })
+
   it('keeps a foreign key pointing at the rebuilt table', async () => {
     // The regression this guards: SQLite's default RENAME rewrites references
     // to follow the rename, so a rebuild that renamed the OLD table aside would

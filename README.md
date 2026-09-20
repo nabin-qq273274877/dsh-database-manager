@@ -35,8 +35,35 @@ DSH（DeepSeek Harness）数据库管理插件：侧边栏「数据库管理」�
 **结构页**
 - 改列 / 删列 / 新增列 / 多选批量删列；主键编辑（勾选顺序即主键顺序）；唯一约束开关；索引新建与删除；每列非重复值计数。
 - 需要整表重建的操作（SQLite 的改类型/删列/改主键）在确认框里写明「会新建表、搬数据、删旧表、改名，全程一个事务，大表需要时间」。用户知道自己的表有多大，面板不知道，所以要在按下去之前说。
-- 生成列标出且不可改：它的表达式不在面板手上，改掉就等于丢掉。
+- 生成列标出；它的表达式不可改（那等于换一列），但列的其它属性可以改——注释、类型都行，重写时会带上服务端报告的表达式。
 - 主键索引不提供单独删除（那等于删主键），指向主键编辑器。
+
+**编辑列的「默认值」与建表页同一个四态控件**（不设置 / 自定义… / NULL / CURRENT_TIMESTAMP），自定义态可直接输入定义。
+
+四态不是装饰，是四种不同的库内状态。「不设置」与「自定义 + 留空」在库里就是两回事（`DEFAULT` 子句有没有），一个裸文本框表达不了这种区别——而正是这一点让空字符串默认值在编辑时被悄悄丢成 NULL。
+
+关于「生成列」判据与默认值回写，两处引擎行为需要记录：
+
+- **判据是 `GENERATION_EXPRESSION` 非空，不是 `EXTRA` 里含 `GENERATED`。** 实测 MySQL 对普通的 `TIMESTAMP DEFAULT CURRENT_TIMESTAMP` 列也返回 `EXTRA=DEFAULT_GENERATED`，用子串匹配会把这种普通列误判成生成列——后果是它既进不了插入表单，每次编辑还报「this generated column cannot be modified」。表达式同时是重写生成列的必要参数，所以两者从同一次读取里取。
+- **改写生成列必须重新写全 `GENERATED ALWAYS AS (expr) STORED|VIRTUAL`。** 省略 `AS` 子句 MySQL 会**静默成功**并把生成性丢掉；`STORED`/`VIRTUAL` 是列身份的一部分且引擎拒绝改它，只能原样带回。生成列不能同时带 `DEFAULT`、`AUTO_INCREMENT`、`ON UPDATE`（引擎报 `Incorrect usage`），所以渲染时它们都不写。
+
+**`information_schema` 报的默认值与 `normalizeDefault` 接受的输入不是同一种形态**，回写要逐种翻译，而判据只能来自列类型：
+
+| 建表时写的 | 服务端读回 | 回写成 |
+| --- | --- | --- |
+| `DEFAULT 'x'` | `x`（无引号） | `'x'` |
+| `VARCHAR` 上 `DEFAULT '5'` | `5` | `'5'`（靠类型判断） |
+| `INT` 上 `DEFAULT 5` | `5` | `5` |
+| `DEFAULT CURRENT_TIMESTAMP(6)` | `CURRENT_TIMESTAMP(6)` | 裸写（加括号会变成 `now(6)`） |
+| `DEFAULT (CONCAT('a','b'))` | `concat(_utf8mb4\'a\',…)` | 反转义并重新加括号 |
+
+`'5'` 与 `5` 这一对说明为何判据必须是类型而不是值：实测两者读回都是 `5`，把数字形态写给 `VARCHAR` 会静默存成数字默认值，往返比对也看不出来。
+
+**`MODIFY COLUMN` 会重写整个定义，没写出来的子句就丢了。** 实测只改注释会把 `ON UPDATE CURRENT_TIMESTAMP` 抹掉，所以它从实时列上读回来而不是取自提交的 spec。
+
+**SQLite 上「一个表达式默认值会挡住其它列的所有编辑」。** SQLite 没有 `ALTER COLUMN`，每次改动都重建整张表并重新渲染**每一列**，于是某列的表达式默认值（`DEFAULT (lower('ABC'))`）会在重建时撞上 `normalizeDefault`——它按设计拒绝括号表达式，因为无法验证任意表达式。用户看到的是「编辑另一列时，报了一个自己没碰过的默认值不合法」。所以表达式默认值在渲染层原样输出，且两种形态都要认：`columns()` 报 `lower('ABC')`，解析 `CREATE TABLE` 文本得到 `(lower('ABC'))`。
+
+同一次排查还暴露两个相关缺陷，均已修：`{ ...current, ...next }` 拼新定义会让 `next` 里缺的键保留旧值，于是**默认值改得掉却删不掉**；生成列编辑时 `generated` 标记丢失，重建就会去 `INSERT` 生成列，引擎报 `cannot INSERT into generated column`。
 
 **插入页**（照 phpMyAdmin 的插入页做）
 
@@ -322,6 +349,7 @@ npm run build       # lib/index.js（host）+ lib/client.js（browser）
 | `scripts/e2e-insert-jump.mjs` | 插入表单两个按钮的落点（8 项）：提交前确认当前 tab 是「插入」，**插入**提交后 active 的 tab 必须变成「浏览」且表格真的渲染、写进去的行真的在服务端、完成语说到了这次跳转；**插入并再填一行**必须留在插入页且表单还在（只测第一个按钮发现不了这个区别） |
 | `scripts/e2e-insert-tinyint.mjs` | 插入页的控件形态（MySQL 12 项）：`BOOL` / `BOOLEAN` / `TINYINT(1)` / `TINYINT` 四列都必须是**输入框而不是下拉**，并实测真的能存下 `2`；同时逐项确认没改到别的列（enum 仍是下拉、date/datetime 仍是选择器、整数弹 numeric 键盘、小数弹 decimal 键盘、varchar 是普通框、text 是多行框）。判据用 `inputMode` 而非 `type`：数值框在 DOM 里就是 `INPUT:text`，比 `type` 区分不出它和文本框 |
 | `scripts/e2e-sqlite-boolean.mjs` | 反向回归（4 项）：SQLite 的 `BOOLEAN` **仍是**是/否下拉，`TINYINT` 是输入框。守住「改一个引擎不能顺手改掉另一个」这条分界 |
+| `scripts/e2e-structure-edit.mjs` | 结构页「修改列」端到端（SQLite 29 项 / MySQL 38 项）：复现用户报的那条报错，并逐类列（普通列、字符串默认值、空字符串默认值、表达式默认值、`TIMESTAMP DEFAULT CURRENT_TIMESTAMP`、`ON UPDATE`、真生成列）提交后回读服务端。默认值控件按**行为**断言：已有值直接进入可输入态并预填、`↺` 回到四态下拉、改成 `42` / 空字符串 / 不设置各自落库正确——**空字符串必须仍是空字符串而不是 NULL**。只看「页面上有默认值字段」发现不了问题：改动前那个字段也在，只是变成空框就会把默认值丢掉 |
 | `scripts/verify-db-ops.mjs` | 对真实 MySQL 逐项核对**破坏性操作的效果**（清空是否真的清了、复制是否带数据、改名是否删掉原库、改编码是否落库），19 项 |
 | `scripts/probe-collate-link.mjs` | 排序规则随字符集联动：拿服务端 `information_schema` 真实列表逐项比对，含切换字符集后旧值不残留 |
 | `scripts/probe-table-stats.mjs` | 表列表的**行数与大小**端到端（9 项）：`TABLE_ROWS` / `DATA_LENGTH` / `INDEX_LENGTH` 在 information_schema 里是 `bigint unsigned`，而连接池开着 `supportBigNumbers` + `bigNumberStrings`（防止 BIGINT 精度丢失），mysql2 因此把这些列一律返回**字符串**——驱动曾用 `typeof === 'number'` 判断，于是每张表的行数都显示「未知」、大小都空白。探针直接读**渲染后的单元格**（而非只看驱动），并和服务端返回逐项对账，同时断言数值是 number 而非数字字符串 |
