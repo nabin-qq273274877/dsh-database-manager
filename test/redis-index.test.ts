@@ -18,7 +18,9 @@
 import { describe, expect, it } from 'vitest'
 import {
   INDEX_KEYS_PER_LEVEL,
+  INDEX_MAX_FOLDERS,
   addKey,
+  advanceIndex,
   ancestorPaths,
   createIndex,
   foldNames,
@@ -166,13 +168,17 @@ describe('incremental merging', () => {
     expect(indexProgress(index).done).toBe(true)
   })
 
-  it('carries the coverage numbers a partial level needs to state its basis', () => {
+  it('carries the progress numbers a still-building level needs for its notice', () => {
     /*
-     * The UI's notice says "该库共 N 个键，此处仅扫描了 M 个：计数是下限". For an
-     * unfinished walk it read the scan path's fields, which the index reply did not
-     * carry, so both numbers rendered as 0 — a confidently wrong database size on
-     * the one screen whose job is to warn that the numbers are short. The index
-     * knows both counts; they must travel with the level.
+     * The UI's notice says "索引构建中：已扫描 M / N，此层的目录与计数会随进度补齐".
+     * A mid-walk level must therefore report BOTH numbers; leaving them unset made
+     * the renderer fall back to zeroes, so the notice announced a database size of 0
+     * — a confidently wrong number on the one screen whose job is to say the walk is
+     * still running. The index knows both counts; they must travel with the level.
+     *
+     * This is the notice that REPLACED "该库共 N 个键，此处仅扫描了 M 个：目录可能不全，
+     * 计数是下限", which described a defect (the scan's 200k-key budget) rather than a
+     * normal state. A still-building index is the only temporary case left.
      */
     const index = createIndex(0, 100)
     mergeBatch(index, foldNames(['a:1', 'b:2', 'b:3']))
@@ -213,6 +219,38 @@ describe('bounded memory', () => {
     expect(level.keysAtLevel).toBe(INDEX_KEYS_PER_LEVEL + 250)
     // The folder count is unaffected by the row cap.
     expect(levelFromIndex(index, '', compare).folders[0]!.keys).toBe(INDEX_KEYS_PER_LEVEL + 250)
+  })
+
+  it('reports the folder ceiling as an error instead of quietly dropping folders', () => {
+    /*
+     * The defect this pins: `mergeBatch` used to `continue` past the folder ceiling,
+     * so the index came back missing entries with nothing saying so — a folder list
+     * that is short and looks complete, on the screen a user reads to decide whether
+     * a folder is safe to delete. A ceiling that is reached is a FAILURE, and the
+     * honest answer is to say the index could not be built.
+     *
+     * One batch carrying more folders than the ceiling is the cheapest way to reach
+     * it: the limit is checked per new folder, so it trips as the batch is folded.
+     */
+    const manyFolders = Array.from({ length: INDEX_MAX_FOLDERS + 1 }, (_, i) => `f${i}:k`)
+    const index = createIndex(0, manyFolders.length)
+    mergeBatch(index, foldNames(manyFolders))
+
+    expect(index.error).toBeDefined()
+    expect(index.error).toMatch(/distinct folders/)
+    // NOT `done`: a failed walk must never read as a completed — and therefore
+    // complete — result, or the panel would present a short tree as the whole one.
+    expect(index.done).toBe(false)
+  })
+
+  it('does not stop a walk that stays under the folder ceiling', () => {
+    // The guard must not fire on an ordinary database, or every index would report a
+    // failure. A handful of folders is the normal case.
+    const index = createIndex(0, 3)
+    mergeBatch(index, foldNames(['a:1', 'b:2', 'c:3']))
+
+    expect(index.error).toBeUndefined()
+    expect(levelFromIndex(index, '', compare).folders).toHaveLength(3)
   })
 })
 
@@ -337,5 +375,38 @@ describe('incremental updates', () => {
     // Both the `a:b` key and its one descendant.
     expect(removed).toBe(2)
     expect(index.dbSize).toBe(0)
+  })
+})
+
+describe('advanceIndex', () => {
+  /** A source that hands back one pre-built batch, then claims to be finished. */
+  function oneBatch(batch: ReturnType<typeof foldNames>) {
+    let served = false
+    return {
+      async aggregateBatch() {
+        if (served) return { cursor: '0', visited: 0, folderDeltas: new Map(), directCounts: new Map(), leaves: new Map() }
+        served = true
+        return { cursor: '0', ...batch }
+      },
+    }
+  }
+
+  it('stops the walk when the folder ceiling refuses a batch', async () => {
+    /*
+     * A refused merge leaves the index unusable, so the walk must NOT keep going:
+     * carrying on would keep loading the server to build a tree nobody can trust.
+     * The reason is already on the index; what this pins is that `advanceIndex`
+     * reports `done: false` rather than reading the aborted walk as a finished —
+     * and therefore complete — result.
+     */
+    const manyFolders = Array.from({ length: INDEX_MAX_FOLDERS + 1 }, (_, i) => `f${i}:k`)
+    const index = createIndex(0, manyFolders.length)
+
+    const advance = await advanceIndex(oneBatch(foldNames(manyFolders)), index)
+
+    expect(index.error).toBeDefined()
+    expect(advance.done).toBe(false)
+    expect(advance.progress.done).toBe(false)
+    expect(advance.progress.error).toMatch(/distinct folders/)
   })
 })

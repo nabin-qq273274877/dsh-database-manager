@@ -89,9 +89,9 @@ describe('level scan batching', () => {
   })
 
   it('a full traversal still completes, so counts remain exact', async () => {
-    // A level under the key budget must be walked completely: a partial pass
-    // produces a WRONG folder count, which is worse than a slow one. This is the
-    // invariant that made the earlier 151142-vs-200000 bug possible.
+    // A level must be walked completely: a partial pass produces a WRONG folder
+    // count and can omit a folder entirely, which is worse than a slow answer. This
+    // is the invariant that made the earlier 151142-vs-200000 bug possible.
     const { client } = stubClient(25_000)
     const driver = driverWith(client)
 
@@ -100,33 +100,44 @@ describe('level scan batching', () => {
     expect(page.dbSize).toBe(25_000)
     expect(page.folders).toHaveLength(1)
     expect(page.folders[0]!.keys).toBe(25_000)
-    expect(page.countsApproximate).toBe(false)
-    // The whole level was visited, so the sample size is the level's size.
-    expect(page.scannedKeys).toBe(25_000)
+    expect(page.truncated).toBe(false)
   })
 
-  it('stops at the key budget on a huge level, and SAYS the counts are lower bounds', async () => {
-    // The production case: db1 holds 19.5M keys, which a complete walk reaches in
-    // ~4 minutes and ~600 MiB of transferred names. The scan must stop early — and
-    // the result must not present the partial list as complete, because the folder
-    // counts are what a user checks before deleting.
-    const { client, scanCounts } = stubClient(2_000_000)
+  it('walks a level of any size to the END, with no key budget', async () => {
+    // The regression this pins: a 200k-key budget stopped the scan early, so a
+    // 485k-key database reported "此处仅扫描了 200,012 个：目录可能不全，计数是下限"
+    // — a correct warning about a defect, on the number a user reads before
+    // deleting a folder. No size may now cut the walk short; the database size that
+    // makes a complete pass too slow is served by the cached index instead.
+    for (const total of [200_000, 485_073]) {
+      const { client } = stubClient(total)
+      const driver = driverWith(client)
+
+      const page = await driver.level({ db: 0, prefix: '', withTypes: false })
+
+      // Every key was visited, so the folder count is the level's true size.
+      expect(page.folders).toHaveLength(1)
+      expect(page.folders[0]!.keys).toBe(total)
+      expect(page.truncated).toBe(false)
+      expect(page.dbSize).toBe(total)
+    }
+  })
+
+  it('never reports a capped level as a truncated directory listing', async () => {
+    // `truncated` now means ONE thing: the row list was capped. It must not be set
+    // by the scan's coverage, because the scan covers everything — conflating the
+    // two is what let an incomplete folder list read as a display limit.
+    const { client } = stubClient(300_000)
     const driver = driverWith(client)
 
     const page = await driver.level({ db: 0, prefix: '', withTypes: false })
 
-    // Stopped early, and reported as such.
-    expect(page.countsApproximate).toBe(true)
-    expect(page.truncated).toBe(true)
-    expect(page.scannedKeys).toBeGreaterThanOrEqual(200_000)
-    // The cap is what bounds the work: a couple of dozen batches, not two hundred.
-    expect(scanCounts.length).toBeLessThanOrEqual(30)
-    // Counts are a LOWER BOUND, never above the level's true size.
-    const reported = page.folders.reduce((sum, folder) => sum + folder.keys, 0)
-    expect(reported).toBeLessThanOrEqual(page.dbSize)
-    // And the sample is not absurdly small: it found the one folder the stub has,
-    // since every key sits under the same prefix.
-    expect(page.folders).toHaveLength(1)
+    expect(page.keys.length).toBe(0)
+    expect(page.keysAtLevel).toBe(0)
+    // No keys at this level, so nothing was withheld — and the single folder holds
+    // all 300k of them.
+    expect(page.truncated).toBe(false)
+    expect(page.folders[0]!.keys).toBe(300_000)
   })
 
   it('the dedup guard survives, so an at-least-once duplicate is not double-counted', async () => {

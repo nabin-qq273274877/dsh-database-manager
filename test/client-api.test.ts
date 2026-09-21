@@ -109,7 +109,7 @@ describe('DbApi redis calls', () => {
   })
 
   it('unwraps a level page', async () => {
-    stubFetch({ page: { folders: [], keys: [], truncated: false, keysAtLevel: 0, dbSize: 0, countsApproximate: false } })
+    stubFetch({ page: { folders: [], keys: [], truncated: false, keysAtLevel: 0, dbSize: 0 } })
     const page = await new DbApi().redisLevel('src', { db: 0, prefix: 'a:b', withTypes: true })
     expect(page.keysAtLevel).toBe(0)
     expect(calls[0]!.url).toContain('withTypes=1')

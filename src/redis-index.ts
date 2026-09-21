@@ -38,7 +38,13 @@ import { SEPARATOR } from './redis-util.ts'
  */
 export const INDEX_KEYS_PER_LEVEL = 5000
 
-/** Ceiling on total folders held, as a guard against a pathological keyspace. */
+/**
+ * Ceiling on total folders held, as a guard against a pathological keyspace.
+ *
+ * Exceeding it is a FAILURE, not a truncation — see {@link mergeBatch}. A keyspace
+ * with more folders than this is not a tree anyone can read, but the answer to that
+ * is a mode that says so, never a folder list that is quietly missing entries.
+ */
 export const INDEX_MAX_FOLDERS = 200_000
 
 /** One folder in the index. */
@@ -329,7 +335,26 @@ export function mergeBatch(index: KeyspaceIndex, batch: IndexBatch): KeyspaceInd
   for (const [path, delta] of batch.folderDeltas) {
     const existing = index.folders.get(path)
     if (existing === undefined) {
-      if (index.folders.size >= INDEX_MAX_FOLDERS) continue
+      /**
+       * Hitting the folder ceiling ABORTS the index instead of skipping folders.
+       *
+       * Skipping was the earlier behaviour and it produced exactly the defect this
+       * file exists to prevent: a folder list that is short with nothing saying so,
+       * which is what a user reads to decide whether a database holds something and
+       * whether a folder is safe to delete. A ceiling that is reached is therefore
+       * reported as an error — the walk stops, `indexProgress` carries the reason,
+       * and the panel shows it. "Could not build an index for this keyspace" is a
+       * worse EXPERIENCE than a short list but a far better ANSWER, because it is
+       * true.
+       */
+      if (index.folders.size >= INDEX_MAX_FOLDERS) {
+        index.error =
+          `this database has more than ${INDEX_MAX_FOLDERS.toLocaleString()} distinct folders, ` +
+          'which is beyond what the keyspace index is built to hold. Browse it with a filter, ' +
+          'or use the per-level scan on a narrower folder.'
+        index.done = false
+        return index
+      }
       const at = path.lastIndexOf(SEPARATOR)
       index.folders.set(path, {
         name: at === -1 ? path : path.slice(at + 1),
@@ -379,16 +404,22 @@ export interface IndexLevel {
   keys: string[]
   /** How many direct keys this level holds, which may exceed `keys.length`. */
   keysAtLevel: number
-  /** True when the walk has not finished, so this level may be incomplete. */
+  /**
+   * True while the walk is unfinished, so this level is TEMPORARILY incomplete.
+   *
+   * The walk covers the whole keyspace, so `partial` is the only reason a level can
+   * be missing rows or folders — and it resolves on its own. There is no "finished
+   * but approximate" state: that would describe a truncation, which is the defect
+   * this index exists to avoid.
+   */
   partial: boolean
   /**
-   * Keys walked so far, and the database's total, for a partial level's notice.
+   * Keys walked so far, and the database's total, for a still-building level's notice.
    *
-   * Present ONLY when `partial` is true. The notice states how much of the level
-   * was covered, and these are the honest numbers for an unfinished walk — the
-   * scan path supplies its own equivalents (`scannedKeys`/`dbSize`). Without
-   * them the UI fell back to zeroes and read "该库共 0 个键，此处仅扫描了 0 个",
-   * which is worse than saying nothing: it states a wrong database size.
+   * Present ONLY when `partial` is true. The notice says how much of the walk is
+   * done, and these are the honest numbers for an unfinished walk. Without them the
+   * UI fell back to zeroes and read "该库共 0 个键，此处仅扫描了 0 个", which is worse
+   * than saying nothing: it states a wrong database size.
    */
   visited?: number
   dbSize?: number
@@ -562,6 +593,16 @@ export async function advanceIndex(
     leaves: batch.leaves,
     visited: batch.visited,
   })
+
+  /**
+   * A merge that refused the batch (the folder ceiling) leaves the index UNUSABLE,
+   * so the walk stops here rather than advancing the cursor: carrying on would keep
+   * the traversal loading the server to build a tree nobody can trust. The reason is
+   * already on the index, and `done` stays false so callers do not read it as a
+   * finished — and therefore complete — result.
+   */
+  if (index.error !== undefined) return { progress: indexProgress(index), done: false }
+
   index.cursor = batch.cursor
   index.done = batch.cursor === '0'
   return { progress: indexProgress(index), done: index.done }

@@ -234,12 +234,9 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
       keysAtLevel: number
       truncated?: boolean
       partial?: boolean
-      countsApproximate?: boolean
-      scannedKeys?: number
-      dbSize?: number
       visited?: number
+      dbSize?: number
     }): void => {
-      const partial = level.countsApproximate ?? level.partial === true
       setLevels(current => ({
         ...current,
         [key]: {
@@ -247,22 +244,26 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
           keys: level.keys,
           truncated: level.truncated ?? false,
           keysAtLevel: level.keysAtLevel,
-          // An index still being built is the same situation the scan reports with
-          // `countsApproximate`: the level may gain rows, and saying so is what stops
-          // a partial tree from looking complete.
-          countsApproximate: partial,
           /*
-           * The notice's two numbers, from whichever path answered.
+           * An index still being built is the only remaining source of an
+           * incomplete level, and it is temporary — the walk covers the whole
+           * keyspace, so the rows fill in and the notice disappears at `done`.
            *
-           * The scan reports `scannedKeys`/`dbSize`; an unfinished index reports
-           * `visited`/`dbSize`. Both mean "this much of the database was covered",
-           * and the notice reads one pair. Leaving the index's pair unset made the
-           * renderer fall back to zeroes, so a mid-walk level announced
+           * The per-level scan has no equivalent flag any more: it reads its level
+           * to the end, so a finished answer is exact. The `countsApproximate`
+           * field that used to carry "the folder list may be short" is gone with
+           * the key budget that produced it.
+           */
+          partial: level.partial === true,
+          /*
+           * The building notice's progress numbers. The index reports
+           * `visited`/`dbSize` and the notice reads one pair; leaving them unset
+           * made the renderer fall back to zeroes, so a mid-walk level announced
            * "该库共 0 个键，此处仅扫描了 0 个" — a wrong database size, stated
            * confidently, on the very screen whose purpose is to say the numbers
            * may be short.
            */
-          scannedKeys: level.scannedKeys ?? level.visited,
+          visited: level.visited,
           dbSize: level.dbSize,
         },
       }))

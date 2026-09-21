@@ -43,23 +43,26 @@ export interface RedisLevel {
   folders: RedisFolderRow[]
   keys: RedisKeyInfo[]
   /**
-   * True when this level is not fully represented — either the row list was
-   * capped or the scan stopped at its key budget. What exactly is short is
-   * conveyed by `keysAtLevel` and `countsApproximate`, which the notice reads.
+   * True when this level holds more key ROWS than were returned. The folder
+   * counts are exact regardless — `keysAtLevel` says how many rows exist — so
+   * this reports a display cap, never an incomplete directory listing.
    */
   truncated: boolean
   /** How many keys live at this level, whether or not all were returned. */
   keysAtLevel: number
   /**
-   * True when the folder counts are LOWER BOUNDS, because the scan stopped at its
-   * budget before covering the whole level. Only reachable on a database far too
-   * large to walk during a click, so the UI states the basis of the numbers
-   * instead of presenting them as exact.
+   * True while the database's keyspace index is still being built.
+   *
+   * The only source of an incomplete level left, and it is TEMPORARY: the walk
+   * covers the whole keyspace, so the rows and counts fill in as it proceeds and
+   * the notice disappears when it finishes. There is deliberately no "counts are
+   * lower bounds" state for a finished level — the per-level scan runs to the end
+   * of its level, so a completed answer is exact and says nothing.
    */
-  countsApproximate?: boolean
-  /** How many keys the scan visited, i.e. the sample size when partial. */
-  scannedKeys?: number
-  /** The database's total keys, so a partial-scan notice can give a basis. */
+  partial?: boolean
+  /** Keys walked so far, for the building notice's progress. */
+  visited?: number
+  /** The database's total keys, so the building notice can give a basis. */
   dbSize?: number
   /**
    * True while a fetch for this level is in flight.
@@ -368,22 +371,25 @@ export function RedisKeyTree(props: RedisKeyTreeProps): React.ReactElement {
     /**
      * How much of this level is missing, and WHY.
      *
-     * The two causes need different wording, because they mean different things to
-     * the number the user is looking at:
+     * Two causes now, and they mean different things to the number the user is
+     * looking at:
      *
-     * - an early stop → the counts are lower bounds, so a folder reading 300000 is
-     *   "at least" that, and a folder could be missing entirely;
+     * - an index still being BUILT → the level will gain rows on its own, and the
+     *   notice says so with the walk's progress. This is the only remaining source
+     *   of an incomplete listing, and it resolves without the user doing anything;
      * - a capped row list → the counts are exact and only the rows were withheld.
      *
-     * Reporting one message for both made an incomplete list look like a display
-     * limit, which is the kind of thing someone deletes on.
+     * There is deliberately no third message for "the folder counts are lower
+     * bounds": the per-level scan runs to the end of its level, so a finished
+     * answer is complete. The budget that used to cut it short was removed because
+     * a silently short folder list is exactly what someone deletes on.
      */
-    if (level.countsApproximate === true) {
+    if (level.partial === true) {
       rows.push(React.createElement('div', {
-        key: `approx-${db}-${prefix}`,
+        key: `building-${db}-${prefix}`,
         className: `dbm-tree-hint dbm-tree-depth-${Math.min(depth, 8)} dbm-hint`,
-      }, t('redisdb.levelApproximate', {
-        scanned: (level.scannedKeys ?? 0).toLocaleString(),
+      }, t('redisdb.indexBuilding', {
+        scanned: (level.visited ?? 0).toLocaleString(),
         total: (level.dbSize ?? 0).toLocaleString(),
       })))
     } else if (level.truncated) {

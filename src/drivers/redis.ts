@@ -289,31 +289,36 @@ export interface AggregateBatch {
 const TREE_SCAN_COUNT = 10000
 
 /**
- * How many keys one level scan may visit before it stops early.
+ * A level scan has NO key budget: it runs until the level is covered.
  *
- * A level scan is inherently O(keys under that prefix) — Redis has no prefix
- * index, so discovering sub-folders means walking them. On most databases that is
- * trivial, but the production db1 measured 19.5M keys (19.4M of them under a
- * single folder), where a complete walk transfers roughly 600 MiB of key names;
- * measured at ~5.9 s per 500k keys over a 19 ms link, a full pass needs ~4
- * minutes. No deadline can make that fit a UI click.
+ * There used to be one (200k keys), and it was wrong for the only thing the number
+ * is used for. A level's folder counts are what a user reads to decide what a
+ * database holds and whether a folder is safe to delete, so an early stop makes
+ * them LOWER BOUNDS and can omit a folder entirely. Measured on a production db1
+ * of 19.5M keys: a 500k-key sample found all four top-level folders but missed one
+ * holding 12 keys — and a folder list that is silently short is the failure mode
+ * this whole file exists to avoid. A 485k-key database reported "该库共 485,073 个
+ * 键，此处仅扫描了 200,012 个：目录可能不全，计数是下限", which is a correct
+ * warning about a defect, not a useful feature.
  *
- * So the scan is BOUNDED, and the result says so. The keys it does visit are a
- * random sample, because SCAN walks hash-table order — which is why a bounded pass
- * finds the folders holding most of the keys. Measured on db1: 50k keys already
- * found both major folders, 500k found all four, missing only a folder holding 12
- * keys out of 19.5M.
+ * What bounds the work instead is the DATABASE SIZE, not a constant: databases
+ * below `LARGE_DB_KEYS` (see the client) are scanned per level, and one of those
+ * is small enough that a complete pass is a few seconds — 485k keys measured
+ * ~10 s over a 19 ms link, and a level with 200k keys under it measured 1.0 s
+ * locally. A database big enough for a complete pass to be intolerable is served
+ * by the cached keyspace index instead, which pays one traversal for every level
+ * rather than one per click.
  *
- * 200000 is a deliberate compromise: ~2 s over a 19 ms link, comfortable for a
- * click, and it saw 3 of db1's 4 folders. This is NOT the knob for very large
- * databases — `countsApproximate` is, by telling the user the list may be short.
+ * Memory follows the same reasoning: exact deduplication needs the visited names
+ * retained (SCAN is at-least-once), so a complete pass of a <1M-key database holds
+ * tens of MB of names rather than the ~1.2 GB a 19.5M-key pass would — and that
+ * size never reaches this path.
  *
- * It also bounds MEMORY, which is the second reason for the cap: exact
- * deduplication needs the visited names retained (SCAN is at-least-once), so
- * visiting at most this many keeps that set near 12 MB instead of the ~1.2 GB a
- * complete db1 walk would need — to draw a handful of rows.
+ * A genuinely huge level under an unusual `databases` configuration still
+ * terminates: {@link RedisDriver.level} races the walk against the tree deadline
+ * and reports a TIMEOUT naming the cause, which is honest about the failure
+ * instead of returning a short list that looks complete.
  */
-const LEVEL_SCAN_KEY_BUDGET = 200_000
 
 /**
  * How many keys one TYPE/TTL pipeline batch covers.
@@ -742,14 +747,19 @@ export class RedisDriver implements RedisDriverContract {
    * capped, incomplete tree, and fetching TYPE and TTL with one round trip per
    * key meant ~1M round trips before anything rendered.
    *
-   * A level scan reads exactly one level. Its cost is one pass over the keys
-   * under `prefix`, and only that level's immediate children cross the wire, so
-   * a folder nobody opens is never read.
+   * A level scan reads exactly one level, and reads it COMPLETELY. Its cost is one
+   * pass over the keys under `prefix`, and only that level's immediate children
+   * cross the wire, so a folder nobody opens is never read.
    *
    * The pass is inherently O(keys under the prefix) — Redis has no "list
    * distinct prefixes" command, so SCAN is the only way to discover sub-folders.
    * What is avoided is paying it per folder: the same pass yields both the
    * sub-folder set and each sub-folder's key count.
+   *
+   * Completeness is the point, not an accident: a partial pass reports lower-bound
+   * counts and can miss a folder, which is what the deleted key budget used to do.
+   * The size where a complete pass is too slow is where the cached keyspace index
+   * takes over (see the module comment where the budget was removed).
    *
    * @param prefix - folder path to list, '' for the database root.
    * @param withTypes - whether to fetch TYPE/TTL for this level's keys. The root
@@ -783,17 +793,18 @@ export class RedisDriver implements RedisDriverContract {
      *   The earlier version collected all names into a Set and grouped afterwards;
      *   on db1 that is ~1.2 GB of strings to draw a handful of rows.
      *
-     * - The scan stops after {@link LEVEL_SCAN_KEY_BUDGET} keys. A complete walk of
-     *   db1 needs ~4 minutes and ~600 MiB of transferred names, so a click cannot
-     *   wait for it. Stopping early makes the counts LOWER BOUNDS, which is what
-     *   `countsApproximate` reports.
+     * - The scan runs to the END of the level — there is no key budget. An early
+     *   stop makes the counts LOWER BOUNDS and can omit a folder entirely, and the
+     *   folder list is the number a user reads to decide what a database holds and
+     *   whether a folder is safe to delete. What keeps that affordable is the
+     *   database size rather than a constant: this path is only taken below
+     *   `LARGE_DB_KEYS`, and a database big enough for a complete pass to hurt is
+     *   served by the cached index instead (see the module comment above the
+     *   deleted budget for the measurements).
      *
-     * - Deduplication is still exact WITHIN the budget, because the visited names
-     *   are retained in a Set. SCAN is at-least-once (a key can come back twice
-     *   while the hash table rehashes), so counting occurrences as they stream
-     *   would over-report — the guard the original code had, and it is kept. The
-     *   budget is what makes it affordable: ~200k names is roughly 12 MB, against
-     *   ~1.2 GB for an unbounded walk.
+     * - Deduplication stays exact, because the visited names are retained in a Set.
+     *   SCAN is at-least-once (a key can come back twice while the hash table
+     *   rehashes), so counting occurrences as they stream would over-report.
      */
     const names = new Set<string>()
     let cursor = '0'
@@ -807,25 +818,12 @@ export class RedisDriver implements RedisDriverContract {
         if (name.slice(prefix.length) === '') continue
         names.add(name)
       }
-      // The budget is checked after a whole batch so the sample is not cut mid
-      // reply, and the cursor is left non-zero to record that the walk was partial.
-    } while (cursor !== '0' && names.size < LEVEL_SCAN_KEY_BUDGET)
+    } while (cursor !== '0')
 
     /**
-     * Whether the walk covered the level completely.
-     *
-     * A non-zero cursor means Redis still had slots to visit, so the folders and
-     * counts below are a lower bound. This is surfaced rather than hidden: the
-     * counts are the number a user checks before deleting a folder, and a silently
-     * short list is exactly the failure mode the earlier `goods` bug produced
-     * (151142 shown for 200000 keys).
+     * One pass over the deduped names yields both this level's keys and the
+     * sub-folder counts, so no folder is scanned twice.
      */
-    const scannedKeys = names.size
-    const complete = cursor === '0'
-    const countsApproximate = !complete
-
-    // One pass over the deduped names yields both this level's keys and the
-    // sub-folder counts, so no folder is scanned twice.
     const counts = new Map<string, number>()
     const keysHere: string[] = []
     for (const name of names) {
@@ -899,15 +897,12 @@ export class RedisDriver implements RedisDriverContract {
     return {
       folders: childFolders,
       keys,
-      // Two different ways this level can be short, and they are reported
-      // separately so the UI can say which: the ROW list may be capped (rows were
-      // withheld, `keysAtLevel` is exact), or the SCAN may have stopped early
-      // (counts are lower bounds, `countsApproximate` is true).
-      truncated: keysAtLevel > shown.length || countsApproximate,
+      // The only way a level can now be short is the ROW list being capped: the
+      // scan covers the whole level, so the counts are exact and `keysAtLevel`
+      // states what was withheld from the rows.
+      truncated: keysAtLevel > shown.length,
       keysAtLevel,
       dbSize,
-      countsApproximate,
-      scannedKeys,
     }
   }
 

@@ -36,7 +36,7 @@ try {
     console.log(
       `level prefix=${JSON.stringify(prefix)} withTypes=${withTypes}: ` +
       `${elapsed} ms, ${page.folders.length} folders, ${page.keys.length} keys, ` +
-      `${(bytes / 1024).toFixed(1)} KiB, truncated=${page.truncated}, countsApproximate=${page.countsApproximate}`,
+      `${(bytes / 1024).toFixed(1)} KiB, truncated=${page.truncated}`,
     )
     if (page.folders.length > 0) {
       const top = [...page.folders].sort((a, b) => b.keys - a.keys).slice(0, 5)

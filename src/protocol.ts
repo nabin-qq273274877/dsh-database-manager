@@ -638,9 +638,14 @@ export interface RedisTreePage {
  *
  * A whole-keyspace scan cannot serve a large database: 480k keys is tens of
  * megabytes of JSON and a per-key TYPE/TTL round trip each. Instead the tree
- * asks for one level at a time, so expanding a folder costs one bounded scan of
- * that folder's prefix and only its immediate children cross the wire. A folder
- * that is never opened is never scanned.
+ * asks for one level at a time, so expanding a folder costs one scan of that
+ * folder's prefix and only its immediate children cross the wire. A folder that
+ * is never opened is never scanned.
+ *
+ * The scan covers the level COMPLETELY, so `folders` and their counts are exact;
+ * the only thing that can be short is `keys`, capped at the row display limit.
+ * The size at which a complete pass becomes too slow is served by the cached
+ * keyspace index rather than by truncating this one.
  */
 export interface RedisLevelPage {
   /**
@@ -655,9 +660,9 @@ export interface RedisLevelPage {
    */
   keys: RedisKeyInfo[]
   /**
-   * True when this level was cut short — either the scan hit its work ceiling,
-   * or the level holds more key rows than were sent. `keysAtLevel` is the true
-   * count either way, so the UI can state what was withheld.
+   * True when this level holds more key ROWS than were sent. The counts are exact
+   * either way — `keysAtLevel` states how many rows exist, so the UI can say what
+   * was withheld instead of presenting a partial list as the whole answer.
    */
   truncated: boolean
   /**
@@ -668,24 +673,6 @@ export interface RedisLevelPage {
   keysAtLevel: number
   /** Total keys the database holds (DBSIZE), independent of this level. */
   dbSize: number
-  /**
-   * True when the folder counts below are LOWER BOUNDS rather than exact.
-   *
-   * Set when the level's scan stopped at its key budget. A complete walk of a
-   * huge database is not possible within a click: the production db1 holds 19.5M
-   * keys, needing ~4 minutes and ~600 MiB of transferred key names. The folders
-   * found are the ones holding most of the keys (a bounded pass visits keys in
-   * hash-table order, effectively a sample), but a rare folder can be absent — so
-   * the UI must not present the list as complete.
-   */
-  countsApproximate: boolean
-  /**
-   * How many keys the scan actually visited (the sample size, when partial).
-   *
-   * Reported so the UI can state the basis of an approximate count — "counted
-   * from N scanned keys" is checkable, whereas a bare estimate is not.
-   */
-  scannedKeys?: number
 }
 
 /** One element edit to apply to a collection key. */

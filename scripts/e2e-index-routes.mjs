@@ -105,13 +105,13 @@ const FLOW = `(async () => {
   const indexed = (await indexedRes.json()).level;
   const scanned = (await (await fetch(base + '/sources/' + sourceId + '/redis/level?db=${db}&prefix=&withTypes=0')).json()).page;
 
-  report.indexedRoot = { folders: indexed.folders, keys: indexed.keys.map(k => k.key), keysAtLevel: indexed.keysAtLevel, partial: indexed.partial };
+  report.indexedRoot = { folders: indexed.folders, keys: indexed.keys.map(k => k.key), keysAtLevel: indexed.keysAtLevel };
   report.scannedRoot = { folders: scanned.folders, keys: scanned.keys.map(k => k.key), keysAtLevel: scanned.keysAtLevel };
 
   const norm = (list) => JSON.stringify(list.map(f => f.name + '=' + f.keys).sort());
   step('root folders match the direct scan', norm(indexed.folders) === norm(scanned.folders));
   step('root keys match the direct scan', JSON.stringify(indexed.keys.map(k => k.key).sort()) === JSON.stringify(scanned.keys.map(k => k.key).sort()));
-  step('a finished index is not partial', indexed.partial === false);
+  step('the finished index is not flagged as still building', indexed.partial === false);
 
   // 5. A nested level must work from the cache, with no further scanning.
   const nestedRes = await fetch(base + '/sources/' + sourceId + '/redis/index/level?db=${db}&prefix=jd:order&withTypes=0');
