@@ -607,21 +607,3 @@ export async function advanceIndex(
   index.done = batch.cursor === '0'
   return { progress: indexProgress(index), done: index.done }
 }
-
-/**
- * Whether a walk is worth starting, and what it will cost.
- *
- * Reported before any work happens so the caller can warn instead of surprising the
- * user with a long, server-loading operation. The traversal rate is measured
- * (~370k keys/s on a remote link), so this is an informed estimate rather than a
- * guess, and it is what a confirmation prompt should show.
- */
-export function estimateIndexCost(dbSize: number): {
-  keys: number
-  estimatedSeconds: number
-  isLarge: boolean
-} {
-  const KEYS_PER_SECOND = 370_000
-  const estimatedSeconds = Math.ceil(dbSize / KEYS_PER_SECOND)
-  return { keys: dbSize, estimatedSeconds, isLarge: estimatedSeconds >= 15 }
-}

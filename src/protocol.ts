@@ -579,13 +579,6 @@ export interface RedisIndexLevel {
   dbSize?: number
 }
 
-/** What a keyspace walk is expected to cost, so a caller can warn before starting. */
-export interface RedisIndexEstimate {
-  keys: number
-  estimatedSeconds: number
-  isLarge: boolean
-}
-
 /** A page of Redis keys (SCAN cursor based). */
 export interface RedisKeyPage {
   keys: RedisKeyInfo[]
@@ -881,8 +874,6 @@ export const DB_API = {
   redisIndex: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/index?${params}`,
   /** One indexed level: `/redis/index/level`. */
   redisIndexLevel: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/index/level?${params}`,
-  /** What a walk would cost, before anything is scanned: `/redis/index/estimate`. */
-  redisIndexEstimate: (id: string, params: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/index/estimate?${params}`,
   /** Replace a string key's value. */
   redisString: (id: string) => `${DB_API_BASE}/sources/${encodeURIComponent(id)}/redis/string`,
   /** Set or clear a key's TTL. */

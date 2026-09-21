@@ -60,28 +60,20 @@ const FLOW = `(async () => {
     return JSON.stringify({ ...report, fatal: 'could not create the source: HTTP ' + created.status + ' ' + (await created.text()).slice(0, 200) });
   }
 
-  // 1. The estimate must come back WITHOUT walking anything (it uses DBSIZE).
-  const estimateStarted = Date.now();
-  const estimateRes = await fetch(base + '/sources/' + sourceId + '/redis/index/estimate?db=${db}');
-  const estimateMs = Date.now() - estimateStarted;
-  if (!estimateRes.ok) {
-    return JSON.stringify({ ...report, fatal: 'estimate failed: HTTP ' + estimateRes.status + ' ' + (await estimateRes.text()).slice(0, 200) });
-  }
-  const estimate = (await estimateRes.json()).estimate;
-  report.estimate = { ...estimate, ms: estimateMs };
-  step('estimate returns a key count', estimate.keys > 0);
-  step('estimate does not walk the keyspace (fast)', estimateMs < 1000);
-
-  // 2. Starting the walk returns progress, and repeating it must not restart it.
+  // 1. Starting the walk returns progress, and repeating it must not restart it.
+  //
+  //    There is no separate cost-estimate request: the panel starts the walk as
+  //    soon as a large database is opened, and reports progress while it runs. The
+  //    walk's own status carries the database size the progress is measured against.
   const startRes = await fetch(base + '/sources/' + sourceId + '/redis/index?db=${db}');
   if (!startRes.ok) {
     return JSON.stringify({ ...report, fatal: 'start failed: HTTP ' + startRes.status + ' ' + (await startRes.text()).slice(0, 200) });
   }
   const first = (await startRes.json()).status;
   report.firstStatus = first;
-  step('start reports a database size to walk against', first.dbSize === estimate.keys);
+  step('start reports a database size to walk against', first.dbSize > 0);
 
-  // 3. Poll until done, bounded so a hang fails rather than spins.
+  // 2. Poll until done, bounded so a hang fails rather than spins.
   let status = first;
   const deadline = Date.now() + 60000;
   const samples = [];
@@ -96,7 +88,7 @@ const FLOW = `(async () => {
   step('the walk visited every key', status.visited === status.dbSize);
   step('no error was recorded', status.error === undefined);
 
-  // 4. Read the root level from the index and compare with the direct scan, which
+  // 3. Read the root level from the index and compare with the direct scan, which
   //    is the implementation already pinned by the other suites.
   const indexedRes = await fetch(base + '/sources/' + sourceId + '/redis/index/level?db=${db}&prefix=&withTypes=0');
   if (!indexedRes.ok) {
@@ -113,7 +105,7 @@ const FLOW = `(async () => {
   step('root keys match the direct scan', JSON.stringify(indexed.keys.map(k => k.key).sort()) === JSON.stringify(scanned.keys.map(k => k.key).sort()));
   step('the finished index is not flagged as still building', indexed.partial === false);
 
-  // 5. A nested level must work from the cache, with no further scanning.
+  // 4. A nested level must work from the cache, with no further scanning.
   const nestedRes = await fetch(base + '/sources/' + sourceId + '/redis/index/level?db=${db}&prefix=jd:order&withTypes=0');
   const nested = (await nestedRes.json()).level;
   const nestedScan = (await (await fetch(base + '/sources/' + sourceId + '/redis/level?db=${db}&prefix=jd:order&withTypes=0')).json()).page;
@@ -121,14 +113,14 @@ const FLOW = `(async () => {
   step('a nested level matches the direct scan',
     JSON.stringify(nested.keys.map(k => k.key).sort()) === JSON.stringify(nestedScan.keys.map(k => k.key).sort()));
 
-  // 6. The index caches: reading the same level twice must not re-walk.
+  // 5. The index caches: reading the same level twice must not re-walk.
   const before = (await (await fetch(base + '/sources/' + sourceId + '/redis/index?db=${db}')).json()).status;
   await fetch(base + '/sources/' + sourceId + '/redis/index/level?db=${db}&prefix=&withTypes=0');
   const after = (await (await fetch(base + '/sources/' + sourceId + '/redis/index?db=${db}')).json()).status;
   step('reading a level does not restart the walk',
     after.visited === before.visited && after.done === true);
 
-  // 7. Invalidate drops it, so the next read says "not indexed" rather than serving
+  // 6. Invalidate drops it, so the next read says "not indexed" rather than serving
   //    a tree that may no longer be true.
   await fetch(base + '/sources/' + sourceId + '/redis/index?db=${db}', { method: 'DELETE' });
   const afterDelete = await fetch(base + '/sources/' + sourceId + '/redis/index/level?db=${db}&prefix=');

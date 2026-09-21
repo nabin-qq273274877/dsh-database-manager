@@ -39,7 +39,7 @@ import type { DatabaseOperationOptions, MaintenanceOp, TableIndexSpec, TableOpti
 import { isRedisDriver, isSqlDriver, type Driver, type SqlDriver } from './drivers/types.ts'
 import { isRedisReadCommand } from './drivers/redis.ts'
 import type { IndexRegistry } from './index-registry.ts'
-import { estimateIndexCost, indexProgress, levelFromIndex } from './redis-index.ts'
+import { indexProgress, levelFromIndex } from './redis-index.ts'
 import { compareKeyNames } from './redis-util.ts'
 import { looksReadOnly } from './sql-util.ts'
 import { EXPORT_ROW_CAP, IMPORT_BYTE_CAP, exportSql, importSql, type ExportRequest } from './sql-transfer.ts'
@@ -1629,21 +1629,8 @@ export function makeRoutes(deps: RoutesDeps): { routes: WebRoute[]; upgrade: Web
       // A cached tree for one database, built by ONE walk of the keyspace. It
       // exists because Redis has no prefix index and `SCAN MATCH p:*` still
       // traverses everything, so listing each level separately would cost a full
-      // traversal per level opened. Three endpoints: estimate the cost, start or
-      // poll the walk, read one level.
-      if (action === 'redis/index/estimate' && method === 'GET') {
-        if (!isRedisDriver(driver)) {
-          writeError(res, 400, 'redis/index/estimate is only available for Redis data sources')
-          return
-        }
-        const db = queryInt(url, 'db', entry.db ?? 0)
-        // DBSIZE is O(1), so asking what a walk would cost does not itself load the
-        // server — which is the point of offering an estimate at all.
-        const dbSize = await driver.keyCount(db)
-        writeJson(res, 200, { estimate: estimateIndexCost(dbSize) })
-        return
-      }
-
+      // traversal per level opened. Two endpoints: start or poll the walk, read one
+      // level.
       if (action === 'redis/index/level' && method === 'GET') {
         if (!isRedisDriver(driver)) {
           writeError(res, 400, 'redis/index/level is only available for Redis data sources')

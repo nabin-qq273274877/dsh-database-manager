@@ -951,9 +951,9 @@ describe.skipIf(!available)('built host half', () => {
     })
 
     it('refuses the index routes on a SQL source', async () => {
-      // All three index endpoints must name the engine mismatch rather than
-      // reaching a SQL driver with a Redis request.
-      for (const action of ['redis/index', 'redis/index/level', 'redis/index/estimate']) {
+      // Both index endpoints must name the engine mismatch rather than reaching a
+      // SQL driver with a Redis request.
+      for (const action of ['redis/index', 'redis/index/level']) {
         const response = await fetch(`${base}/sources/app/${action}?db=0&prefix=`)
         expect(response.status, action).toBe(400)
         expect(((await response.json()) as { error: string }).error, action).toMatch(/Redis/)
@@ -967,17 +967,6 @@ describe.skipIf(!available)('built host half', () => {
       const response = await fetch(`${base}/sources/${redisId}/redis/index/level?db=0&prefix=`)
       expect(response.status).toBe(409)
       expect(((await response.json()) as { error: string }).error).toMatch(/no index/)
-    })
-
-    it('estimates the cost of an index without starting one', async () => {
-      // The estimate exists so a caller can warn BEFORE loading the server, which
-      // only works if asking does not itself walk anything: this uses DBSIZE only.
-      // The source points at a closed port, so a response proves no scan ran.
-      const response = await fetch(`${base}/sources/${redisId}/redis/index/estimate?db=0`)
-      // DBSIZE needs a connection, which is refused here — so either the estimate
-      // comes back (a live server) or the failure names the connection. What must
-      // NOT happen is a keyspace walk.
-      expect([200, 500]).toContain(response.status)
     })
 
     it('requires a pattern to search, and refuses search on a SQL source', async () => {

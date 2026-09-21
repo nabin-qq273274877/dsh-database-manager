@@ -28,7 +28,6 @@
 import {
   advanceIndex,
   createIndex,
-  estimateIndexCost,
   indexProgress,
   type IndexAdvance,
   type IndexBatchSource,
@@ -96,11 +95,6 @@ export class IndexRegistry {
   isBuilding(sourceId: string, db: number): boolean {
     const entry = this.entries.get(IndexRegistry.key(sourceId, db))
     return entry !== undefined && !entry.index.done && entry.index.error === undefined
-  }
-
-  /** What a walk of one database would cost, for a warning before starting. */
-  estimate(dbSize: number): ReturnType<typeof estimateIndexCost> {
-    return estimateIndexCost(dbSize)
   }
 
   /**

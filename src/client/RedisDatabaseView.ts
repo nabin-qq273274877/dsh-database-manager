@@ -14,7 +14,6 @@ import * as React from 'react'
 
 import type {
   DataSourceSummary,
-  RedisIndexEstimate,
   RedisIndexStatus,
   RedisInfo,
   RedisKeyInfo,
@@ -192,14 +191,6 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
   const [indexProgress, setIndexProgress] = React.useState<Record<number, RedisIndexStatus | undefined>>({})
 
   /**
-   * The database whose walk is awaiting confirmation, if any.
-   *
-   * The index loads the server, so a large one is confirmed rather than started
-   * silently: `estimate` reports the cost first, and this holds the pending choice.
-   */
-  const [indexPrompt, setIndexPrompt] = React.useState<{ db: number; estimate: RedisIndexEstimate } | undefined>(undefined)
-
-  /**
    * Load one level.
    *
    * Two sources, and the choice matters on a large database:
@@ -358,7 +349,6 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
    */
   const buildIndex = React.useCallback(async (db: number): Promise<void> => {
     addIndexDb(db)
-    setIndexPrompt(undefined)
     try {
       const first = await api.redisIndexStart(source.id, { db })
       setIndexProgress(current => ({ ...current, [db]: first }))
@@ -398,12 +388,18 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
   }, [api, source.id, refreshAll, loadLevel, addIndexDb, dropIndexDb])
 
   /**
-   * Expand one database, deciding whether to index it first.
+   * Expand one database, indexing it first when it is large enough to need it.
    *
    * A small database needs no index: the per-level scan is one bounded request and
    * imposes no upfront cost. A large one cannot be scanned per level at all (each
-   * level is a full traversal), so it is indexed — but only after the user confirms,
-   * because the walk loads their server for about a minute.
+   * level is a full traversal), so the walk starts immediately.
+   *
+   * There is no confirmation prompt. There used to be one, explaining the cost in
+   * seconds before the walk began — and it asked the user to weigh a number the
+   * panel had measured on their behalf, for an operation that is read-only, runs in
+   * bounded steps, and whose only real alternative is not browsing the database at
+   * all. Progress is reported while it runs, which is what the user actually needs;
+   * a dialog before it was a gate in front of the one thing they asked for.
    */
   const toggleDb = (db: number): void => {
     const next = openDbs[db] !== true
@@ -418,21 +414,15 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
 
     const size = databases.find(node => node.db === db)?.keys ?? 0
     // Below the threshold, scanning a level is cheap and an index would be a
-    // pointless upfront cost. Above it, per-level scanning cannot work at all.
+    // pointless upfront cost. At or above it, per-level scanning cannot work at all.
     if (size < LARGE_DB_KEYS) {
       if (levels[levelKey(db, '')] === undefined) void loadLevel(db, '')
       return
     }
 
-    // Large: state the cost and let the user choose. The estimate comes from DBSIZE,
-    // so asking does not itself load the server.
-    void api.redisIndexEstimate(source.id, { db })
-      .then(estimate => setIndexPrompt({ db, estimate }))
-      .catch(() => {
-        // If the cost cannot be determined, do not block browsing: fall back to the
-        // scan, which works on any database small enough to reach this path at all.
-        if (levels[levelKey(db, '')] === undefined) void loadLevel(db, '')
-      })
+    // Large: start the walk. `buildIndex` marks the database as index-served first,
+    // so the tree fills in from the index as it is built rather than waiting.
+    void buildIndex(db)
   }
 
   /** Expand or collapse one folder, loading its level on first open. */
@@ -844,26 +834,6 @@ export function RedisDatabaseView(props: RedisDatabaseViewProps): React.ReactEle
       onConfirm: () => { void confirmDelete() },
       onClose: () => setDeleteFor(undefined),
     }),
-    /**
-     * The confirmation for indexing a large database.
-     *
-     * Deliberately a prompt rather than an automatic decision: the walk is read-only
-     * but it holds the server's CPU for about a minute, and on a production server
-     * that is the user's call to make, not the panel's.
-     */
-    indexPrompt === undefined ? null : React.createElement(IndexPromptDialog, {
-      db: indexPrompt.db,
-      estimate: indexPrompt.estimate,
-      onConfirm: () => { void buildIndex(indexPrompt.db) },
-      onCancel: () => {
-        const db = indexPrompt.db
-        setIndexPrompt(undefined)
-        // Declining still lets the user browse: a per-level scan is attempted, which
-        // is exactly the slow path they were warned about — so the warning said what
-        // would happen, not that it was impossible.
-        if (levels[levelKey(db, '')] === undefined) void loadLevel(db, '')
-      },
-    }),
   )
 }
 
@@ -898,40 +868,6 @@ function IndexProgressBanner(props: { db: number; status: RedisIndexStatus }): R
       'span',
       { className: 'dbm-index-bar', 'aria-hidden': 'true' },
       React.createElement('span', { className: 'dbm-index-fill', style: { width: `${pct}%` } }),
-    ),
-  )
-}
-
-/** The dialog that warns what indexing a large database costs, before it starts. */
-function IndexPromptDialog(props: {
-  db: number
-  estimate: RedisIndexEstimate
-  onConfirm(): void
-  onCancel(): void
-}): React.ReactElement {
-  const { db, estimate, onConfirm, onCancel } = props
-  return React.createElement(
-    'div',
-    { className: 'dbm-modal-backdrop' },
-    React.createElement(
-      'div',
-      { className: 'dbm-modal', role: 'dialog', 'aria-modal': true },
-      React.createElement('div', { className: 'dbm-modal-head' }, t('redis.index.title', { n: db })),
-      React.createElement(
-        'div',
-        { className: 'dbm-modal-body' },
-        React.createElement('p', null, t('redis.index.why', {
-          keys: estimate.keys.toLocaleString(),
-          seconds: estimate.estimatedSeconds,
-        })),
-        React.createElement('p', { className: 'dbm-hint' }, t('redis.index.warning')),
-      ),
-      React.createElement(
-        'div',
-        { className: 'dbm-modal-foot' },
-        React.createElement('button', { type: 'button', className: 'dbm-btn', onClick: onCancel }, t('redis.index.skip')),
-        React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-primary', onClick: onConfirm }, t('redis.index.confirm')),
-      ),
     ),
   )
 }

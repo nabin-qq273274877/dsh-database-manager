@@ -206,17 +206,4 @@ describe('IndexRegistry', () => {
     expect(calls()).toBeLessThanOrEqual(after + 1)
     expect(registry.get('src', 0)).toBeUndefined()
   })
-
-  it('estimates cost from DBSIZE, flagging the sizes worth warning about', () => {
-    const registry = new IndexRegistry(async () => { throw new Error('not used') })
-
-    // A small database is not worth a confirmation prompt.
-    expect(registry.estimate(1_000).isLarge).toBe(false)
-    // 19.5M keys is the measured production case: about a minute, so a caller should
-    // warn before starting it.
-    const big = registry.estimate(19_500_000)
-    expect(big.isLarge).toBe(true)
-    expect(big.estimatedSeconds).toBeGreaterThan(30)
-    expect(big.keys).toBe(19_500_000)
-  })
 })

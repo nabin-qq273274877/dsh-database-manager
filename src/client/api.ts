@@ -17,7 +17,6 @@ import {
   type RedisDeleteResult,
   type RedisElementEdit,
   type RedisInfo,
-  type RedisIndexEstimate,
   type RedisIndexLevel,
   type RedisIndexStatus,
   type RedisKeyPage,
@@ -408,19 +407,6 @@ export class DbApi {
     return (await readJson<{ page: RedisSearchPage }>(
       await fetch(DB_API.redisSearch(id, query({ db: options.db, pattern: options.pattern }))),
     )).page
-  }
-
-  /**
-   * What a keyspace walk would cost, before anything is scanned.
-   *
-   * Exists so the panel can warn before loading the server: a walk of a huge
-   * database takes tens of seconds and holds the server's CPU, and the user should
-   * decide that consciously rather than discover it.
-   */
-  async redisIndexEstimate(id: string, options: { db: number }): Promise<RedisIndexEstimate> {
-    return (await readJson<{ estimate: RedisIndexEstimate }>(
-      await fetch(DB_API.redisIndexEstimate(id, query({ db: options.db }))),
-    )).estimate
   }
 
   /**
