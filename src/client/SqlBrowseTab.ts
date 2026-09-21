@@ -17,17 +17,23 @@ import * as React from 'react'
  *   duplicate row the user never selected.
  * - **Go to a page by number.** The page count is unbounded on a large table, so
  *   a field is what a user with a specific page in mind actually wants.
+ * - **复制 one row into the 插入 form.** phpMyAdmin's row 复制, and the gesture the
+ *   buttons beside it used to stand in for. It is deliberately NOT a clipboard
+ *   copy of the row: a pasted row has to be split into fields by hand, while the
+ *   insert form is where a row is actually written — so the row goes straight
+ *   there, with the auto-assigned columns left blank. See `prefillForm` in
+ *   `insert-values.ts` for what is carried over and what cannot be.
  */
 
 import type { ColumnInfo, IndexInfo, RowFilter, TablePage } from '../protocol.ts'
 import type { DbApi } from './api.ts'
+import { prefillForm, type PrefillResult } from './insert-values.ts'
 import {
   Empty,
   ErrorBanner,
   Modal,
   PageJump,
   SortMark,
-  copyText,
   isNull,
   renderCell,
   t,
@@ -54,6 +60,8 @@ export interface BrowseQuery {
 export interface SqlBrowseTabProps {
   api: DbApi
   sourceId: string
+  /** The engine, needed to tell which columns the engine assigns itself. */
+  engineKind: string
   schema: string
   table: string
   /** The page as loaded last, or undefined while the first read is in flight. */
@@ -68,6 +76,16 @@ export interface SqlBrowseTabProps {
   onExport(options?: { rowsOnly?: boolean; selectedKeys?: RowKey[] }): void
   /** Open the import dialog. */
   onImport(): void
+  /**
+   * Hand one row over to the 插入 form, already filled in.
+   *
+   * The values are built HERE (by `prefillForm`) rather than by the caller,
+   * because this is the component that has the row and the column definitions in
+   * one place; the caller only has to switch tabs and pass them down. `skipped`
+   * rides along so the destination can say which columns could not be carried
+   * over — a silently blank column is one the user would submit as-is.
+   */
+  onCopyRow(prefill: PrefillResult): void
   /** Structure changes elsewhere may have changed the table; reported upward. */
   onNotice(message: string | undefined): void
   onError(message: string | undefined): void
@@ -90,11 +108,6 @@ export function rowKeyOf(columns: ColumnInfo[], primaryKey: string[], row: Recor
   return primaryKey.map(column => ({ column, value: row[column] ?? null }))
 }
 
-/** The SQL text of one value, as phpMyAdmin's 复制 provides it. */
-function cellText(value: KeyValue): string {
-  return value === null ? '' : String(value)
-}
-
 /**
  * The type classifiers, re-exported so call sites keep one import.
  *
@@ -106,7 +119,7 @@ export { isNumericType, isDateType, isBooleanType, fieldKind, operatorsFor } fro
 
 /** The 浏览 tab. */
 export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
-  const { api, sourceId, schema, table, rows, query, onQuery, onReload, onExport, onImport, onNotice, onError } = props
+  const { api, sourceId, engineKind, schema, table, rows, query, onQuery, onReload, onExport, onImport, onCopyRow, onNotice, onError } = props
   /** The cell being edited, by row index and column name. */
   const [editing, setEditing] = React.useState<{ row: number; column: string; value: string } | undefined>(undefined)
   /** Keys of the rows selected for a batch action, serialized for set membership. */
@@ -207,15 +220,17 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
     }
   }
 
-  /** Ask the host how many distinct values one column holds. */
-  const copyValue = async (value: KeyValue): Promise<void> => {
-    const failure = await copyText(cellText(value))
-    if (failure === null) {
-      onNotice(t('browse.copied'))
-      onError(undefined)
-    } else {
-      onError(t('browse.copyFailed', { error: failure }))
-    }
+  /**
+   * Send one row to the 插入 tab, filled in.
+   *
+   * The columns come from the PAGE (not from `props.knownColumns`): the page's
+   * list is what the grid is actually showing, so a copy cannot fill a control
+   * for a column the user was never shown.
+   */
+  const copyRowToInsert = (index: number): void => {
+    const row = page?.rows[index]
+    if (row === undefined) return
+    onCopyRow(prefillForm(engineKind, page?.columns ?? [], row))
   }
 
   /**
@@ -455,16 +470,7 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
             if (first === undefined) return
             setEditing({ row: index, column: first.name, value: row[first.name] === null ? '' : String(row[first.name] ?? '') })
           }, false, canActOnRows ? undefined : t('browse.noPk')),
-          rowAction('copy', t('browse.copyCell'), () => { void copyValue(row[page?.columns[0]?.name ?? ''] ?? null) }),
-          rowAction('copyRow', t('browse.copyRow'), () => {
-            // The whole row as one tab-separated line, which is what pastes into
-            // a spreadsheet as a row rather than as a single cell.
-            const line = (page?.columns ?? []).map(column => cellText(row[column.name] ?? null)).join('\t')
-            void copyText(line).then(failure => {
-              if (failure === null) { onNotice(t('browse.copied')); onError(undefined) }
-              else onError(t('browse.copyFailed', { error: failure }))
-            })
-          }, false, t('browse.copyRow')),
+          rowAction('copy', t('browse.copy'), () => copyRowToInsert(index), false, t('browse.copyHint')),
           rowAction('delete', t('browse.deleteRow'), () => {
             if (keys === undefined) { onError(t('browse.noPk')); return }
             setConfirming({ kind: 'row', keys: [keys] })

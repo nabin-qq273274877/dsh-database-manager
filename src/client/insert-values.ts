@@ -149,6 +149,130 @@ export function buildRow(
 }
 
 /**
+ * What one grid row turned into: the values to fill in, and what could not be
+ * carried over.
+ *
+ * `skipped` is reported rather than left implicit because a column that silently
+ * arrives blank is indistinguishable from one whose value WAS blank — and the
+ * user is about to submit a row believing it matches the one they copied. Only
+ * columns whose value is actually lost are listed; an auto-assigned column is
+ * deliberately blank and is therefore NOT in this list.
+ */
+export interface PrefillResult {
+  values: Record<string, FieldValue>
+  /** Columns whose value could not be carried over, in table order. */
+  skipped: string[]
+}
+
+/**
+ * One row from the 浏览 grid, turned into a filled-in insert form.
+ *
+ * This is phpMyAdmin's row 复制: the grid hands over a row's values and the
+ * insert page opens with them already filled in, so a near-duplicate row can be
+ * written without retyping it. The rules, and why each is what it is:
+ *
+ * - An AUTO-ASSIGNED column is left BLANK. This is the column the whole gesture
+ *   is about: the point of copying a row is to write another one, and a filled-in
+ *   id would collide with the row it came from. The engine assigns the next value
+ *   only when the column is left out of the INSERT, which is exactly what a blank
+ *   control means.
+ * - SQL NULL is carried over as a TICKED NULL BOX, not as the four characters
+ *   `null` typed into a text field, which is what the text box would store. A
+ *   NULL in a NOT NULL column is not a value that can be written back, so that
+ *   column is left alone.
+ * - An empty string is carried over ONLY where the form can express it — the
+ *   explicit 空字符串 box `needsEmptyChoice` offers. Everywhere else it is left
+ *   blank and REPORTED: the model's third state (`kind: 'empty'`) renders as a
+ *   DISABLED text box, and on a column whose checkbox is not shown that would be
+ *   a control the user cannot clear.
+ * - A BINARY column is reported and left blank. The grid shows `<binary N bytes>`
+ *   — a placeholder for a value the wire cannot carry — and sent back as text it
+ *   would be stored as that literal string.
+ * - An `enum` whose value is no longer a declared member is reported. A
+ *   controlled select whose value matches no option renders the FIRST member
+ *   while its state says something else, so the form would show one value and
+ *   send another. The same applies to a boolean-ish column holding a value the
+ *   two-choice dropdown cannot express.
+ * - A temporal value is rewritten into the shape the date controls require
+ *   (`2024-01-02T03:04:05`). MySQL answers `2024-01-02 03:04:05`, and an
+ *   `<input type="datetime-local">` holding a space renders EMPTY — the value
+ *   would look lost while still being submitted. A value in no recognisable shape
+ *   (a TIME of `100:00:00` or `-838:59:59`, both legal on MySQL) is reported for
+ *   the same reason: a control that shows nothing while holding a value is worse
+ *   than one the user can see and retype.
+ *
+ * A column absent from `row` is simply not filled in and NOT reported: the wire
+ * omits nothing it could read, so this means the page did not carry the column —
+ * the same as not touching its control.
+ */
+export function prefillForm(
+  engine: string,
+  columns: ColumnInfo[],
+  row: Record<string, string | number | boolean | null>,
+): PrefillResult {
+  const out: Record<string, FieldValue> = {}
+  const skipped: string[] = []
+  for (const column of columns) {
+    if (autoAssigns(engine, column)) continue
+    if (!Object.prototype.hasOwnProperty.call(row, column.name)) continue
+    const value = row[column.name]
+    if (value === null) {
+      if (column.nullable) out[column.name] = { text: '', kind: 'null' }
+      else skipped.push(column.name)
+      continue
+    }
+    const kind = fieldKind(column)
+    if (kind.kind === 'binary') { skipped.push(column.name); continue }
+    const text = typeof value === 'string' ? value : String(value)
+    if (text === '') {
+      if (needsEmptyChoice(column)) out[column.name] = { text: '', kind: 'empty' }
+      else skipped.push(column.name)
+      continue
+    }
+    if (kind.kind === 'enum') {
+      if (kind.options.includes(text)) out[column.name] = { text, kind: 'value' }
+      else skipped.push(column.name)
+      continue
+    }
+    if (kind.kind === 'boolean') {
+      // Only the two values the dropdown actually offers.
+      const mapped = value === true || text === '1' ? '1' : value === false || text === '0' ? '0' : undefined
+      if (mapped === undefined) skipped.push(column.name)
+      else out[column.name] = { text: mapped, kind: 'value' }
+      continue
+    }
+    if (kind.kind === 'date' || kind.kind === 'datetime' || kind.kind === 'time') {
+      const controlText = controlShape(kind.kind, text)
+      if (controlText === undefined) skipped.push(column.name)
+      else out[column.name] = { text: controlText, kind: 'value' }
+      continue
+    }
+    out[column.name] = { text, kind: 'value' }
+  }
+  return { values: out, skipped }
+}
+
+/**
+ * Restate a temporal value in the exact shape its control requires, or undefined
+ * when it cannot be — see the last rule in {@link prefillForm}.
+ *
+ * The date part is anchored at the START and the clock at a separator or the
+ * start, so a MySQL TIME beyond a day (`100:00:00`) is not silently read as
+ * `00:00:00` by a clock pattern that would happily match its tail.
+ */
+function controlShape(kind: 'date' | 'datetime' | 'time', text: string): string | undefined {
+  if (kind === 'date') return /^(\d{4}-\d{2}-\d{2})(?:[ T]|$)/.exec(text)?.[1]
+  const clock = /(?:^|[ T])(\d{1,2}):(\d{2})(?::(\d{2})(\.\d+)?)?$/.exec(text)
+  if (clock === null) return undefined
+  // `<input type="time">` requires two-digit hours; `3:04:05` is not a value it
+  // accepts, so a single-digit hour has to be padded rather than passed through.
+  const normalized = `${clock[1]!.padStart(2, '0')}:${clock[2]}${clock[3] === undefined ? '' : `:${clock[3]}${clock[4] ?? ''}`}`
+  if (kind === 'time') return normalized
+  const day = /^(\d{4}-\d{2}-\d{2})(?:[ T]|$)/.exec(text)?.[1]
+  return day === undefined ? undefined : `${day}T${normalized}`
+}
+
+/**
  * Whether a form was left completely alone.
  *
  * These are SKIPPED rather than validated, which is what makes asking for more

@@ -30,6 +30,7 @@ import {
   needsEmptyChoice,
   parseFormCount,
   placeholderValue,
+  prefillForm,
   resizeForms,
 } from '../src/client/insert-values.ts'
 
@@ -298,5 +299,155 @@ describe('resizeForms: growing appends, shrinking drops from the end', () => {
 describe('blankField', () => {
   it('is an empty value, so an untouched column may be omitted', () => {
     expect(blankField()).toEqual({ text: '', kind: 'value' })
+  })
+})
+
+/**
+ * 浏览 页「复制」的目标：一行数据变成一份填好的插入表单。
+ *
+ * 每一条规则都有一个只在界面上才看得见的失败形态，所以逐条钉住：
+ *
+ *   - 自增列填了值 → 提交就撞上原行的主键（复制一行的意义就是再写一行）；
+ *   - NULL 变成文字 "null" → 库里存的是四个字母；
+ *   - 日期原样是 `2024-01-02 03:04:05` → `datetime-local` 控件显示为空，但提交的
+ *     仍是那个值，用户看到的和写下去的不是一回事；
+ *   - 二进制值原样回填 → 把 `<binary 4 bytes>` 这个占位符当值存进库，而它看上去和
+ *     「这一列本来就没值」一模一样，所以要一并报出来。
+ */
+describe('prefillForm: one grid row becomes a filled-in insert form', () => {
+  it('leaves an AUTO_INCREMENT column blank so the engine assigns the next id', () => {
+    const id = column({ name: 'id', type: 'int', nullable: false, key: 'PRI', extra: 'auto_increment' })
+    const name = column({ name: 'name', type: 'varchar(20)', nullable: true })
+    const { values, skipped } = prefillForm('mysql', [id, name], { id: 7, name: 'copied' })
+    expect(values.id).toBeUndefined()
+    expect(values.name).toEqual({ text: 'copied', kind: 'value' })
+    // 自增列是「有意留空」，不该出现在「没能复制过来」的名单里，否则每一行都会报警。
+    expect(skipped).toEqual([])
+  })
+
+  it('leaves SQLite’s rowid alias blank too', () => {
+    // `INTEGER PRIMARY KEY` is SQLite's auto-assignment; a plain `INT` is not.
+    const alias = column({ name: 'id', type: 'INTEGER', nullable: false, key: 'PRI', primaryKeyPosition: 1 })
+    expect(prefillForm('sqlite', [alias], { id: 3 }).values.id).toBeUndefined()
+    const plain = column({ name: 'id', type: 'INT', nullable: false, key: 'PRI', primaryKeyPosition: 1 })
+    expect(prefillForm('sqlite', [plain], { id: 3 }).values.id).toEqual({ text: '3', kind: 'value' })
+  })
+
+  it('carries a NULL over as a ticked box, not as the text "null"', () => {
+    const { values } = prefillForm('mysql', [column({ name: 'note', type: 'text', nullable: true })], { note: null })
+    expect(values.note).toEqual({ text: '', kind: 'null' })
+  })
+
+  it('leaves a NULL in a NOT NULL column unfilled rather than sending NULL', () => {
+    // The wire cannot produce that row, and a ticked NULL box on a NOT NULL column
+    // is refused by buildRow with a message about a column the user never touched.
+    const { values, skipped } = prefillForm(
+      'mysql',
+      [column({ name: 'note', type: 'text', nullable: false, defaultValue: "'x'" })],
+      { note: null },
+    )
+    expect(values.note).toBeUndefined()
+    expect(skipped).toEqual(['note'])
+  })
+
+  it('keeps an empty string only where the form has the 空字符串 box for it', () => {
+    const forced = column({ name: 'a', type: 'varchar(10)', nullable: false })
+    expect(needsEmptyChoice(forced)).toBe(true)
+    const kept = prefillForm('mysql', [forced], { a: '' })
+    expect(kept.values.a).toEqual({ text: '', kind: 'empty' })
+    expect(kept.skipped).toEqual([])
+
+    // A nullable column would fall back to NULL if the state said 'empty' while
+    // its checkbox was not rendered — a control the user could not clear.
+    const free = column({ name: 'b', type: 'varchar(10)', nullable: true })
+    expect(needsEmptyChoice(free)).toBe(false)
+    const dropped = prefillForm('mysql', [free], { b: '' })
+    expect(dropped.values.b).toBeUndefined()
+    expect(dropped.skipped).toEqual(['b'])
+  })
+
+  it('skips a binary column, whose grid value is only a placeholder', () => {
+    // The grid shows `<binary 4 bytes>`; stored back as text it would be that
+    // literal string rather than the four bytes.
+    const blob = column({ name: 'payload', type: 'blob', nullable: true })
+    const { values, skipped } = prefillForm('mysql', [blob], { payload: '<binary 4 bytes>' })
+    expect(values).toEqual({})
+    expect(skipped).toEqual(['payload'])
+  })
+
+  it('fills an enum only with a value the dropdown actually offers', () => {
+    const status = column({ name: 'status', type: "enum('a','b')", nullable: false, options: ['a', 'b'] })
+    expect(prefillForm('mysql', [status], { status: 'b' }).values.status).toEqual({ text: 'b', kind: 'value' })
+    // A controlled select whose value matches no option renders the FIRST member
+    // while its state says something else: shown one value, submitted another.
+    expect(prefillForm('mysql', [status], { status: 'gone' }).skipped).toEqual(['status'])
+  })
+
+  it('fills a boolean-ish column only with a value the two choices can express', () => {
+    const flag = column({ name: 'flag', type: 'boolean', nullable: false })
+    expect(prefillForm('sqlite', [flag], { flag: 0 }).values.flag).toEqual({ text: '0', kind: 'value' })
+    expect(prefillForm('sqlite', [flag], { flag: true }).values.flag).toEqual({ text: '1', kind: 'value' })
+    expect(prefillForm('sqlite', [flag], { flag: 7 }).skipped).toEqual(['flag'])
+  })
+
+  it('rewrites a MySQL datetime into the shape datetime-local requires', () => {
+    // Measured: MySQL answers `2024-01-02 03:04:05`, and an input[type=datetime-local]
+    // holding that space renders EMPTY while still submitting the value.
+    const at = column({ name: 'at', type: 'datetime', nullable: true })
+    expect(prefillForm('mysql', [at], { at: '2024-01-02 03:04:05' }).values.at)
+      .toEqual({ text: '2024-01-02T03:04:05', kind: 'value' })
+  })
+
+  it('pads a single-digit hour, which input[type=time] rejects', () => {
+    const at = column({ name: 'at', type: 'time', nullable: true })
+    expect(prefillForm('mysql', [at], { at: '3:04:05' }).values.at).toEqual({ text: '03:04:05', kind: 'value' })
+  })
+
+  it('leaves a temporal value blank when its control could not show it', () => {
+    // MySQL accepts a TIME beyond a day; input[type=time] does not. Passing it
+    // through would put a value in the form that is submitted but never seen.
+    const at = column({ name: 'at', type: 'time', nullable: true })
+    expect(prefillForm('mysql', [at], { at: '100:00:00' }).skipped).toEqual(['at'])
+    const day = column({ name: 'd', type: 'date', nullable: true })
+    expect(prefillForm('mysql', [day], { d: 'not a date' }).skipped).toEqual(['d'])
+  })
+
+  it('keeps a date-only value and a datetime with fractional seconds', () => {
+    const day = column({ name: 'd', type: 'date', nullable: true })
+    expect(prefillForm('mysql', [day], { d: '2024-01-02' }).values.d).toEqual({ text: '2024-01-02', kind: 'value' })
+    const at = column({ name: 'at', type: 'timestamp', nullable: true })
+    expect(prefillForm('mysql', [at], { at: '2024-01-02 03:04:05.678' }).values.at)
+      .toEqual({ text: '2024-01-02T03:04:05.678', kind: 'value' })
+  })
+
+  it('numbers a number as text and leaves an absent column untouched', () => {
+    const { values, skipped } = prefillForm('mysql', [
+      column({ name: 'age', type: 'int', nullable: true }),
+      column({ name: 'extra', type: 'int', nullable: true }),
+    ], { age: 42 })
+    expect(values.age).toEqual({ text: '42', kind: 'value' })
+    // Absent means "leave the column out of the INSERT", the same as not touching it
+    // — and it is NOT reported, because nothing was lost: the page never carried it.
+    expect(values.extra).toBeUndefined()
+    expect(skipped).toEqual([])
+  })
+
+  it('reports every lost column by name, in table order', () => {
+    // The notice names them, so a silently blank column cannot be submitted as if
+    // it matched the row that was copied.
+    const { skipped } = prefillForm('mysql', [
+      column({ name: 'payload', type: 'blob', nullable: true }),
+      column({ name: 'name', type: 'varchar(10)', nullable: true }),
+      column({ name: 'gone', type: "enum('a')", nullable: false, options: ['a'] }),
+    ], { payload: '<binary 2 bytes>', name: 'kept', gone: 'z' })
+    expect(skipped).toEqual(['payload', 'gone'])
+  })
+
+  it('produces values the untouched-form test does not read as blank', () => {
+    // The prefill has to make the form count as FILLED IN, or a single-row submit
+    // would be skipped as an empty form and insert nothing.
+    const columns = [column({ name: 'name', type: 'varchar(10)', nullable: false })]
+    const { values } = prefillForm('mysql', columns, { name: 'x' })
+    expect(isUntouchedForm(columns, values)).toBe(false)
   })
 })

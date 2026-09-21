@@ -26,11 +26,6 @@ export function t(key: DbKey, values?: TranslateValues): string {
   )
 }
 
-/** Human-readable error text from an unknown thrown value. */
-export function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
-
 /** Format a byte count compactly. */
 export function formatBytes(bytes: number | undefined): string {
   if (bytes === undefined) return t('common.none')
@@ -208,40 +203,6 @@ export function BackButton(props: { onBack(): void; label?: string }): React.Rea
 /** A lightweight "no data" placeholder. */
 export function Empty(props: { message: string }): React.ReactElement {
   return React.createElement('div', { className: 'dbm-empty' }, props.message)
-}
-
-/**
- * Whether a value is safe to hand to `navigator.clipboard.writeText`.
- *
- * A `null` cell has nothing to copy, and copying the rendered placeholder
- * (`NULL`) would put a literal string in the clipboard that the cell does not
- * contain. The caller decides; this is the predicate for it.
- */
-export function isCopyable(value: string | number | boolean | null): boolean {
-  return value !== null
-}
-
-/**
- * Write text to the clipboard.
- *
- * `navigator.clipboard` is absent on an insecure origin (plain HTTP) and its
- * promise rejects when the document is not focused, so both cases are reported
- * rather than left as an unhandled rejection. The `execCommand` fallback is
- * deliberately NOT used: it needs a selection of the whole document, which on
- * this panel would also copy whatever the user had selected elsewhere.
- *
- * @returns null on success, or a message describing the failure.
- */
-export async function copyText(text: string): Promise<string | null> {
-  try {
-    if (typeof navigator === 'undefined' || navigator.clipboard === undefined) {
-      return 'the clipboard API is unavailable (a secure origin is required)'
-    }
-    await navigator.clipboard.writeText(text)
-    return null
-  } catch (failure) {
-    return errorText(failure)
-  }
 }
 
 /**

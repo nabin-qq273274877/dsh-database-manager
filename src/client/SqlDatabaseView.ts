@@ -16,6 +16,7 @@ import * as React from 'react'
 
 import type { ColumnInfo, DataSourceSummary, IndexInfo, MaintenanceOpView, MaintenanceOutcome, QueryResult, RowFilter, TableActionOp, TableInfo, TablePage } from '../protocol.ts'
 import type { DbApi } from './api.ts'
+import type { PrefillResult } from './insert-values.ts'
 import { SqlBrowseTab, type BrowseQuery } from './SqlBrowseTab.ts'
 import { SqlInsertTab } from './SqlInsertTab.ts'
 import { SqlOperationsTab } from './SqlOperationsTab.ts'
@@ -148,6 +149,29 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
   } | undefined>(undefined)
   /** The open transfer dialog, if any. */
   const [transfer, setTransfer] = React.useState<TransferDialog | undefined>(undefined)
+  /**
+   * A row sent from 浏览 by 复制, waiting to be filled into the 插入 form.
+   *
+   * Held HERE rather than inside `SqlInsertTab` because the two are different
+   * tabs: the browse tab is unmounted by the time the insert tab renders, so its
+   * local state cannot survive the switch. `nonce` makes copying the same row
+   * twice a second event rather than a repeated identical value.
+   *
+   * It is CLEARED whenever the insert form is not the thing being filled —
+   * opening another table, or arriving at 插入 another way — so a row copied
+   * earlier cannot reappear in a form the user opened for something else. See
+   * where it is set and cleared for the two halves of that rule.
+   */
+  const [insertPrefill, setInsertPrefill] = React.useState<{ prefill: PrefillResult; nonce: number } | undefined>(undefined)
+  /**
+   * The counter behind `nonce`.
+   *
+   * A REF rather than `Date.now()`: two 复制 clicks in the same millisecond would
+   * produce equal nonces, and the insert form keys its fill on the nonce alone —
+   * so the second click would be swallowed as "nothing changed". Monotonic, so it
+   * cannot repeat.
+   */
+  const prefillNonce = React.useRef(0)
   /** The schema's table list, read when a transfer dialog needs it. */
   const [schemaTables, setSchemaTables] = React.useState<Array<{ name: string; type: string }>>([])
   /**
@@ -637,6 +661,10 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     // Opening a table replaces whatever was on screen, including a SQL result set
     // shown in 浏览: the grid is about to show a different table's rows.
     setSqlResult(undefined)
+    // A row copied from the PREVIOUS table must not be filled into this one's
+    // form: a column name that happens to match would carry a value into a table
+    // it was never meant for.
+    setInsertPrefill(undefined)
     // A new table starts unsorted on its first page: a sort carried over from the
     // previous table would order by a column this one may not have.
     setBrowse(current => ({ ...current, page: 1, orderBy: undefined, orderByColumns: undefined, filters: undefined }))
@@ -667,6 +695,14 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
      * TABLE — would make the same grid mean two different things.
      */
     if (options.keepSqlResult !== true) setSqlResult(undefined)
+    /*
+     * A row copied from 浏览 lives exactly as long as the visit it caused.
+     *
+     * Leaving 插入 drops it, so returning to the form later gives a BLANK one
+     * rather than the row the user copied some minutes ago — which, after an
+     * insert has already run, would look like the form had resurrected it.
+     */
+    if (next !== 'insert') setInsertPrefill(undefined)
     if (activeTable === undefined || activeSchema === undefined) return
     /*
      * A table read is skipped when a result set is being shown: the grid on screen is
@@ -1087,6 +1123,7 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
           key: 'browse-body',
           api,
           sourceId: source.id,
+          engineKind: source.kind,
           schema: selection.schema,
           table: selection.table,
           rows,
@@ -1122,6 +1159,36 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
             ...(options?.selectedKeys === undefined ? {} : { selectedKeys: options.selectedKeys }),
           }),
           onImport: () => { void openImport(selection.schema) },
+          /*
+           * 复制: the row goes to the 插入 form, filled in.
+           *
+           * The values are stored and the tab switched in this order because
+           * `changeTab` reads and clears state around the notice — the notice has
+           * to be written AFTER the switch for the same reason the insert flow
+           * does it that way, or `changeTab`'s own `setNotice(undefined)` wipes it.
+           *
+           * The structure read is `loadStructure`, not a browse read: the insert
+           * form renders one control per column, and copying a row into a form
+           * that has no columns yet would show nothing and then fill itself in a
+           * moment later.
+           */
+          onCopyRow: (prefill) => {
+            prefillNonce.current += 1
+            setInsertPrefill({ prefill, nonce: prefillNonce.current })
+            changeTab('insert')
+            /*
+             * The notice names the columns that could NOT be carried over.
+             *
+             * Those columns arrive blank, which on the form is indistinguishable
+             * from a value that was blank in the row being copied — and the user is
+             * about to submit it believing it matches. Saying which ones is also
+             * what keeps the silent alternative from being the honest one: a BLOB
+             * is shown as `<binary N bytes>`, never as its bytes.
+             */
+            setNotice(prefill.skipped.length === 0
+              ? t('browse.copiedToInsert')
+              : t('browse.copiedToInsertSkipped', { columns: prefill.skipped.join('、') }))
+          },
           onNotice: message => { setNotice(message); if (message !== undefined) setError(undefined) },
           onError: message => { setError(message); if (message !== undefined) setNotice(undefined) },
         }))
@@ -1237,6 +1304,7 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
           table: selection.table,
           columns,
           loading: columns.length === 0,
+          ...(insertPrefill === undefined ? {} : { prefill: insertPrefill }),
           /*
            * A single-row insert lands on 浏览; a batch stays on the form.
            *

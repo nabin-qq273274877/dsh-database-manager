@@ -35,6 +35,7 @@ import {
   placeholderValue,
   resizeForms,
   type FieldValue,
+  type PrefillResult,
   type RowFailure,
 } from './insert-values.ts'
 import { t } from './ui.ts'
@@ -57,11 +58,21 @@ export interface SqlInsertTabProps {
    */
   onDone(message: string, outcome: 'inserted' | 'again'): void
   onError(message: string | undefined): void
+  /**
+   * One row handed over by the 浏览 tab's 复制, to be filled in.
+   *
+   * A one-shot value rather than state the tab owns: it arrives with the values
+   * already built (see `prefillForm`), is applied to the first form, and is then
+   * the user's to edit like anything they typed. `nonce` exists so copying the
+   * SAME row twice still re-applies — without it the second click would be a
+   * new object with equal content, and a value comparison would swallow it.
+   */
+  prefill?: { prefill: PrefillResult; nonce: number }
 }
 
 /** The 插入 tab. */
 export function SqlInsertTab(props: SqlInsertTabProps): React.ReactElement {
-  const { api, source, schema, table, columns, loading, onDone, onError } = props
+  const { api, source, schema, table, columns, loading, onDone, onError, prefill } = props
   const editable = React.useMemo(() => columns.filter(column => column.generated !== true), [columns])
   /**
    * One set of values per row being composed.
@@ -87,6 +98,38 @@ export function SqlInsertTab(props: SqlInsertTabProps): React.ReactElement {
   // survive: a column name that happens to match would otherwise carry a value
   // into a table it was never meant for.
   React.useEffect(() => { setForms([{}]); setCountText('1') }, [table, schema])
+
+  /**
+   * A row handed over by the 浏览 tab's 复制 lands in the FIRST form.
+   *
+   * Keyed on `nonce` rather than on the values, so pressing 复制 on the same row
+   * twice fills the form again instead of being swallowed as "nothing changed".
+   * Reading `prefill.values` while depending on the nonce alone is safe because
+   * the two always arrive together in one object: the render that changes the
+   * nonce is the one carrying the new values, so the closure holds them.
+   *
+   * Depending on `values` instead would re-fill an edited form on every unrelated
+   * re-render of the caller, which rebuilds that object.
+   *
+   * This effect sits AFTER the table/schema reset on purpose: on mount both run,
+   * in declaration order, so the prefill is the one that survives. Reversed, the
+   * reset would wipe the row that was just copied into the empty form.
+   *
+   * The whole form list is replaced with ONE form: the tab is entered fresh by
+   * this gesture, and a copy that landed in the first of five blank rows would
+   * leave the user scrolling to find it — while submitting would offer to write
+   * the four blanks as well.
+   *
+   * The values are NOT filtered against `editable`: `prefillForm` built them from
+   * the same column list the form renders, and `buildRow` reads only the columns
+   * it is given, so a value for a column this form does not show cannot reach the
+   * statement.
+   */
+  React.useEffect(() => {
+    if (prefill === undefined) return
+    setForms([{ ...prefill.prefill.values }])
+    setCountText('1')
+  }, [prefill?.nonce])
 
   const fieldOf = (form: Record<string, FieldValue>, column: ColumnInfo): FieldValue =>
     form[column.name] ?? blankField()
