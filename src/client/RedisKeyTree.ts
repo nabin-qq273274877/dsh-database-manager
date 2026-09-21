@@ -43,9 +43,13 @@ export interface RedisLevel {
   folders: RedisFolderRow[]
   keys: RedisKeyInfo[]
   /**
-   * True when this level holds more key ROWS than were returned. The folder
-   * counts are exact regardless — `keysAtLevel` says how many rows exist — so
-   * this reports a display cap, never an incomplete directory listing.
+   * True when this level holds more key ROWS than were returned.
+   *
+   * Carried as a FACT about the level, not as something to render: the run-on
+   * notice that used to explain it ("该层共 N 个键，仅显示前 M 个") was removed, because
+   * the rows on screen already answer the question and the tree is a list of keys
+   * rather than a place for commentary. Kept on the type so a caller that needs the
+   * distinction has it — the row cap is still in force either way.
    */
   truncated: boolean
   /** How many keys live at this level, whether or not all were returned. */
@@ -369,20 +373,28 @@ export function RedisKeyTree(props: RedisKeyTreeProps): React.ReactElement {
     for (const info of keys) rows.push(renderKey(db, info, depth, refreshing))
 
     /**
-     * How much of this level is missing, and WHY.
+     * The only notice a level's own content gets is "an index is still building".
      *
-     * Two causes now, and they mean different things to the number the user is
-     * looking at:
+     * There used to be a second one for a capped ROW list — "该层共 N 个键，仅显示前 M
+     * 个；用过滤缩小范围" — and it is deliberately GONE. Two reasons, and the
+     * second is the one that decided it:
      *
-     * - an index still being BUILT → the level will gain rows on its own, and the
-     *   notice says so with the walk's progress. This is the only remaining source
-     *   of an incomplete listing, and it resolves without the user doing anything;
-     * - a capped row list → the counts are exact and only the rows were withheld.
+     * - It restated what the rows already show. A level that holds more keys than
+     *   the row cap is answered exactly, and the rows on screen ARE the answer; a
+     *   sentence under them explaining the row count added no fact the user could
+     *   act on beyond "narrow the filter", which is advice about their keyspace
+     *   rather than information about this level.
+     * - It gave the tree a place to accumulate text. Once one level could print a
+     *   sentence beneath it, the tree stopped being a list of keys with counts and
+     *   became a page with a commentary section — and the next honest-but-rare
+     *   condition (see the index-building notice above, which stays because it is
+     *   TEMPORARY and names work in progress) had somewhere to land.
      *
-     * There is deliberately no third message for "the folder counts are lower
-     * bounds": the per-level scan runs to the end of its level, so a finished
-     * answer is complete. The budget that used to cut it short was removed because
-     * a silently short folder list is exactly what someone deletes on.
+     * The row cap itself is unchanged: `MAX_LEVEL_KEYS_RETURNED` still bounds what
+     * crosses the wire, so a flat prefix of 200k keys still sends one page. What is
+     * gone is the sentence, not the limit. `level.truncated` and `keysAtLevel` still
+     * travel from the server — they are facts about the level, and the driver
+     * reports them on every level — but the tree renders no text about them.
      */
     if (level.partial === true) {
       rows.push(React.createElement('div', {
@@ -392,11 +404,6 @@ export function RedisKeyTree(props: RedisKeyTreeProps): React.ReactElement {
         scanned: (level.visited ?? 0).toLocaleString(),
         total: (level.dbSize ?? 0).toLocaleString(),
       })))
-    } else if (level.truncated) {
-      rows.push(React.createElement('div', {
-        key: `trunc-${db}-${prefix}`,
-        className: `dbm-tree-hint dbm-tree-depth-${Math.min(depth, 8)} dbm-hint`,
-      }, t('redisdb.levelTruncated', { shown: level.keys.length, total: level.keysAtLevel })))
     }
     return rows
   }
