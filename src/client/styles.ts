@@ -670,6 +670,44 @@ export const PANEL_CSS = `
 
 /* ---- data grid --------------------------------------------------------- */
 .dbm-data { flex: 1; min-height: 0; overflow: auto; }
+/*
+ * The horizontal scrollbar, made OBVIOUS.
+ *
+ * Reported as 「看不到最后的字段了，但滚动条还没显示」. Measured on dsh.c_type_move
+ * (11 columns, long values) in a 1600px window:
+ *
+ *   container clientWidth 1007, scrollWidth 1029   → it DOES overflow, by 22px
+ *   horizontal scrollbar height 8, top 855 (viewport 904) → it IS rendered, on screen
+ *
+ * So the scrollbar was neither missing nor off screen: with only 22px to scroll, the
+ * default overlay scrollbar's thumb fills ~98% of its track, which reads as "fully
+ * scrolled, nothing more". The platform's overlay style also hides it until the pointer
+ * is over the grid. An explicit, always-drawn bar is what makes a 22px overflow visible
+ * — and it is the difference the user asked for.
+ *
+ * Styled rather than left to the platform because a data grid's scrollbars are a
+ * navigation control, not chrome: they say "there is more content in this direction",
+ * and a control that only appears on hover cannot say that.
+ */
+.dbm-data::-webkit-scrollbar { width: 12px; height: 12px; }
+.dbm-data::-webkit-scrollbar-track { background: color-mix(in srgb, var(--dsw-alias-label-secondary) 12%, transparent); }
+.dbm-data::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--dsw-alias-label-secondary) 55%, transparent);
+  border-radius: 6px;
+  /* A visible minimum, so a small overflow cannot render as a full-looking bar. */
+  min-width: 40px;
+  min-height: 40px;
+}
+.dbm-data::-webkit-scrollbar-thumb:hover { background: var(--dsw-alias-label-secondary); }
+/*
+ * NOT scrollbar-width here, deliberately.
+ *
+ * In Chromium 121+ (Edge included) a specified scrollbar-width makes the browser IGNORE
+ * the ::-webkit-scrollbar rules above — the standard property wins and the whole block
+ * becomes dead code, so the bar would silently keep its overlay behaviour with no error
+ * anywhere. The webkit rules are the ones that give a minimum thumb size, which is the
+ * property this fix depends on.
+ */
 .dbm-data table { border-collapse: collapse; font-size: 12px; }
 .dbm-data th, .dbm-data td {
   border: 1px solid var(--dsw-alias-border-l3);
@@ -695,6 +733,44 @@ export const PANEL_CSS = `
   color: inherit;
   cursor: pointer;
   padding: 0;
+}
+/*
+ * The column's COMMENT, under its name in the header — phpMyAdmin's layout.
+ *
+ * Deliberately smaller and in the secondary colour: the name is what the eye should land
+ * on when scanning a wide table, and a comment at the same weight made the two
+ * indistinguishable. It is allowed to WRAP (the data cells are nowrap, this is not),
+ * because a comment is a sentence and clipping it to one line would defeat the point of
+ * showing it.
+ *
+ * Capped at two lines so a very long comment cannot make the header taller than the rows
+ * it labels. The title attribute carries the full text, so nothing is unreachable.
+ */
+.dbm-col-comment {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--dsw-alias-label-secondary);
+  line-height: 1.3;
+  margin-top: 2px;
+  white-space: normal;
+  max-width: 220px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/*
+ * The table's own comment, at the right of the pager.
+ *
+ * Same reasoning as the column comment (secondary colour, smaller), with one difference:
+ * it is a single line, so it truncates with an ellipsis instead of wrapping — it sits in a
+ * control row and must not make that row two lines tall.
+ */
+.dbm-table-comment {
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 /*
  * The multi-select checkbox column. It is narrow, it does not sort, and it has to

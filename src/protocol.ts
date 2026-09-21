@@ -285,6 +285,21 @@ export interface TablePage {
    * index list costs a round trip on MySQL and the tree does not need it.
    */
   indexes?: IndexInfo[]
+  /**
+   * The table's own comment, for phpMyAdmin's 「表注释」 line beside the pager.
+   *
+   * ABSENT means "this engine does not report one", not "there is none":
+   * MySQL reads it from `information_schema.TABLES.TABLE_COMMENT`, while SQLite
+   * has no table comment at all (its `sqlite_master` has no such column). The
+   * browser must therefore HIDE the line rather than render an empty one, which
+   * would claim the table has no comment on an engine that cannot have one.
+   *
+   * A VIEW's comment is deliberately dropped at the driver: measured, MySQL
+   * answers the literal string `VIEW` for a view's `TABLE_COMMENT`, which is a
+   * placeholder rather than a comment — showing it would put the word "VIEW" on
+   * screen as if the author had written it.
+   */
+  comment?: string
 }
 
 /**

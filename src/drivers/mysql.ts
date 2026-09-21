@@ -663,6 +663,7 @@ export class MysqlDriver implements SqlDriver {
       values: params,
     })
     const list = Array.isArray(dataRows) ? dataRows : []
+    const comment = await this.tableComment(schema, query.table)
     return {
       columns,
       rows: list.map(row => projectRow(row as Record<string, unknown>)),
@@ -670,7 +671,38 @@ export class MysqlDriver implements SqlDriver {
       page: query.page,
       pageSize: limit,
       primaryKey: columns.filter(column => column.key === 'PRI').map(column => column.name),
+      ...(comment === undefined ? {} : { comment }),
     }
+  }
+
+  /**
+   * The table's own comment, or undefined when there is none to show.
+   *
+   * Read for the 浏览 tab's pager line (phpMyAdmin's 「表注释」). Two things are
+   * deliberately dropped rather than passed through:
+   *
+   * - A VIEW's comment is the literal string `VIEW`, which MySQL reports as a
+   *   placeholder rather than as something a user typed (measured — see the same
+   *   rule in `tableOptionInfo`). Showing it would put "VIEW" on screen as if the
+   *   author had written it.
+   * - MySQL reports an absent comment as the EMPTY STRING, not NULL. Absent is
+   *   what the browser must see, so it can hide the line instead of rendering an
+   *   empty one.
+   *
+   * Cheap: one indexed lookup in `information_schema`. It rides on the page read
+   * because that read is already happening, and a second request for one string
+   * would be a second chance to disagree with it.
+   */
+  private async tableComment(schema: string, table: string): Promise<string | undefined> {
+    const [rows] = await (await this.open()).query({
+      sql: 'SELECT TABLE_TYPE AS type, TABLE_COMMENT AS comment FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?',
+      values: [schema, table],
+    })
+    const first = Array.isArray(rows) ? (rows[0] as Record<string, unknown> | undefined) : undefined
+    if (first === undefined) return undefined
+    if (String(first['type'] ?? '').toUpperCase().includes('VIEW')) return undefined
+    const comment = toWireValue(first['comment'])
+    return typeof comment === 'string' && comment !== '' ? comment : undefined
   }
 
   async query(sql: string, params: unknown[], limit: number, schema?: string): Promise<QueryResult> {

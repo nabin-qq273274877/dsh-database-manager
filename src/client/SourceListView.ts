@@ -3,7 +3,7 @@ import * as React from 'react'
  * The data-source list: the panel's landing view.
  *
  * Toolbar left = search + grouping, toolbar right = 新增数据库. Below is the
- * table with the columns the request named: 数据库类型 / 名称 / 主机 / 用户 /
+ * table whose columns are {@link COLUMNS} — 数据库类型 / 名称 / 主机 / 用户 / 分组 /
  * 认证 / 标签 / 操作, where 操作 carries 测试 / 连接 / 编辑 / 删除.
  */
 
@@ -85,6 +85,29 @@ function matches(source: DataSourceSummary, term: string): boolean {
 /** One 测试 outcome, keyed by source id. */
 type TestState = { status: 'running' } | { status: 'done'; result: TestResult }
 
+/**
+ * The list's columns, in the order the ROWS below render them.
+ *
+ * One array for both the header and every row, so the two cannot drift apart again.
+ * They had drifted: the header listed 分组 third while the rows render 主机 third, so
+ * every heading from the third onward named the wrong cell — reported as 「名称写错了，
+ * 第三列是主机，第四列是用户名，第五列才是分组」. The bug was a heading, not a value,
+ * but nothing in the code said which order was the right one: the header was its own
+ * literal array and the cells were an unrelated run of `createElement` calls.
+ *
+ * Rendering the header from this and the cells in this order makes the correspondence
+ * explicit and checkable.
+ */
+const COLUMNS = ['kind', 'name', 'host', 'user', 'group', 'auth', 'tags', 'actions'] as const
+
+/** One column of the data-source list. */
+type ListColumn = typeof COLUMNS[number]
+
+/** The heading for one column. */
+function headingOf(column: ListColumn): string {
+  return t(`col.${column}` as never)
+}
+
 /** The data-source list view. */
 export function SourceListView(props: SourceListViewProps): React.ReactElement {
   const { api, sources, settings, engines, reload, saveGate, onConnect } = props
@@ -157,7 +180,8 @@ export function SourceListView(props: SourceListViewProps): React.ReactElement {
           { key: `group-${group.label}` },
           React.createElement(
             'td',
-            { colSpan: 8, className: 'dbm-hint', style: { background: 'var(--dsw-alias-interactive-bg-hover)', fontWeight: 500 } },
+            // From the column list, not a literal: a group heading must span the table.
+            { colSpan: COLUMNS.length, className: 'dbm-hint', style: { background: 'var(--dsw-alias-interactive-bg-hover)', fontWeight: 500 } },
             `${group.label} (${group.items.length})`,
           ),
         ),
@@ -165,85 +189,96 @@ export function SourceListView(props: SourceListViewProps): React.ReactElement {
     }
     for (const source of group.items) {
       const test = tests[source.id]
+      /**
+       * One cell's content, chosen by COLUMN rather than by position.
+       *
+       * The map is keyed by the same `ListColumn` names the header uses, so a column
+       * added, removed or reordered in `COLUMNS` cannot leave the heading on one set of
+       * cells and the data on another — which is exactly what had happened.
+       */
+      const cellOf = (column: ListColumn): unknown => {
+        if (column === 'kind') return React.createElement('span', { className: `dbm-badge dbm-badge-${source.kind}` }, source.kind)
+        if (column === 'name') {
+          return [
+            React.createElement('div', { key: 'n', style: { fontWeight: 500 } }, source.name),
+            source.description === '' ? null : React.createElement('div', { key: 'd', className: 'dbm-hint' }, source.description),
+            React.createElement('div', { key: 'i', className: 'dbm-hint dbm-mono' }, source.id),
+          ]
+        }
+        if (column === 'host') return React.createElement('span', { className: 'dbm-mono' }, hostOf(source))
+        if (column === 'user') return source.kind === 'mysql' ? (source.user ?? t('common.none')) : t('common.none')
+        /*
+         * 分组 as its own column, not only as the grouping header.
+         *
+         * The group was previously reachable ONLY by switching the toolbar to
+         * 「按分组」, so a source's group was invisible in the default list — the
+         * one thing a user scans the list to learn. Showing it per row also
+         * makes 「按分组」 a rearrangement of information already on screen
+         * rather than the only way to see it.
+         */
+        if (column === 'group') return source.group === '' ? t('common.none') : source.group
+        if (column === 'auth') {
+          return [
+            authOf(source),
+            source.readonly
+              ? React.createElement('span', { key: 'ro', className: 'dbm-badge', style: { marginLeft: 6 } }, t('form.readonly'))
+              : null,
+          ]
+        }
+        if (column === 'tags') {
+          return source.tags.length === 0
+            ? t('common.none')
+            : React.createElement(
+                'span',
+                { className: 'dbm-tags' },
+                source.tags.map(tag => React.createElement('span', { key: tag, className: 'dbm-badge' }, tag)),
+              )
+        }
+        // 操作: the row's controls, plus the 测试 outcome beneath them.
+        return [
+          React.createElement(
+            'div',
+            { key: 'actions', className: 'dbm-actions' },
+            React.createElement(
+              'button',
+              { key: 'test', type: 'button', className: 'dbm-btn dbm-btn-sm', disabled: test?.status === 'running', onClick: () => { void runTest(source) } },
+              test?.status === 'running' ? t('action.testing') : t('action.test'),
+            ),
+            /*
+             * The connect button shows its own progress, in the same way the
+             * 测试 button does. A spinner is added rather than only swapping
+             * the label, because on a dead host the wait is the driver's full
+             * deadline and a word alone reads as a state, not as activity.
+             */
+            React.createElement(
+              'button',
+              {
+                key: 'connect',
+                type: 'button',
+                className: `dbm-btn dbm-btn-sm dbm-btn-primary${connecting === source.id ? ' dbm-btn-busy' : ''}`,
+                disabled: connecting !== undefined,
+                'aria-busy': connecting === source.id ? 'true' : undefined,
+                onClick: () => { void connect(source) },
+              },
+              connecting === source.id
+                ? [
+                    React.createElement('span', { key: 'spin', className: 'dbm-spinner' }),
+                    t('db.connecting'),
+                  ]
+                : t('action.connect'),
+            ),
+            React.createElement('button', { key: 'edit', type: 'button', className: 'dbm-btn dbm-btn-sm', onClick: () => setEditing(source) }, t('action.edit')),
+            React.createElement('button', { key: 'delete', type: 'button', className: 'dbm-btn dbm-btn-sm dbm-btn-danger', onClick: () => setDeleting(source) }, t('action.delete')),
+          ),
+          test === undefined ? null : TestOutcome(test),
+        ]
+      }
       rows.push(
         React.createElement(
           'tr',
-          { key: source.id },
-          React.createElement('td', null, React.createElement('span', { className: `dbm-badge dbm-badge-${source.kind}` }, source.kind)),
-          React.createElement(
-            'td',
-            null,
-            React.createElement('div', { style: { fontWeight: 500 } }, source.name),
-            source.description === '' ? null : React.createElement('div', { className: 'dbm-hint' }, source.description),
-            React.createElement('div', { className: 'dbm-hint dbm-mono' }, source.id),
-          ),
-          React.createElement('td', { className: 'dbm-mono' }, hostOf(source)),
-          React.createElement('td', null, source.kind === 'mysql' ? (source.user ?? t('common.none')) : t('common.none')),
-          /*
-           * 分组 as its own column, not only as the grouping header.
-           *
-           * The group was previously reachable ONLY by switching the toolbar to
-           * 「按分组」, so a source's group was invisible in the default list — the
-           * one thing a user scans the list to learn. Showing it per row also
-           * makes 「按分组」 a rearrangement of information already on screen
-           * rather than the only way to see it.
-           */
-          React.createElement('td', null, source.group === '' ? t('common.none') : source.group),
-          React.createElement(
-            'td',
-            null,
-            authOf(source),
-            source.readonly ? React.createElement('span', { className: 'dbm-badge', style: { marginLeft: 6 } }, t('form.readonly')) : null,
-          ),
-          React.createElement(
-            'td',
-            null,
-            source.tags.length === 0
-              ? t('common.none')
-              : React.createElement(
-                  'span',
-                  { className: 'dbm-tags' },
-                  source.tags.map(tag => React.createElement('span', { key: tag, className: 'dbm-badge' }, tag)),
-                ),
-          ),
-          React.createElement(
-            'td',
-            null,
-            React.createElement(
-              'div',
-              { className: 'dbm-actions' },
-              React.createElement(
-                'button',
-                { type: 'button', className: 'dbm-btn dbm-btn-sm', disabled: test?.status === 'running', onClick: () => { void runTest(source) } },
-                test?.status === 'running' ? t('action.testing') : t('action.test'),
-              ),
-              /*
-               * The connect button shows its own progress, in the same way the
-               * 测试 button does. A spinner is added rather than only swapping
-               * the label, because on a dead host the wait is the driver's full
-               * deadline and a word alone reads as a state, not as activity.
-               */
-              React.createElement(
-                'button',
-                {
-                  type: 'button',
-                  className: `dbm-btn dbm-btn-sm dbm-btn-primary${connecting === source.id ? ' dbm-btn-busy' : ''}`,
-                  disabled: connecting !== undefined,
-                  'aria-busy': connecting === source.id ? 'true' : undefined,
-                  onClick: () => { void connect(source) },
-                },
-                connecting === source.id
-                  ? [
-                      React.createElement('span', { key: 'spin', className: 'dbm-spinner' }),
-                      t('db.connecting'),
-                    ]
-                  : t('action.connect'),
-              ),
-              React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-sm', onClick: () => setEditing(source) }, t('action.edit')),
-              React.createElement('button', { type: 'button', className: 'dbm-btn dbm-btn-sm dbm-btn-danger', onClick: () => setDeleting(source) }, t('action.delete')),
-            ),
-            test === undefined ? null : TestOutcome(test),
-          ),
+          { key: source.id
+          },
+          ...COLUMNS.map(column => React.createElement('td', { key: column }, cellOf(column) as never)),
         ),
       )
     }
@@ -310,9 +345,7 @@ export function SourceListView(props: SourceListViewProps): React.ReactElement {
                 React.createElement(
                   'tr',
                   null,
-                  ...[t('col.kind'), t('col.name'), t('col.group'), t('col.host'), t('col.user'), t('col.auth'), t('col.tags'), t('col.actions')].map(label =>
-                    React.createElement('th', { key: label }, label),
-                  ),
+                  ...COLUMNS.map(column => React.createElement('th', { key: column }, headingOf(column))),
                 ),
               ),
               React.createElement('tbody', null, rows as never),

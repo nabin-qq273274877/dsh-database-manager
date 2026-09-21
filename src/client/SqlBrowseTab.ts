@@ -347,6 +347,26 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
           column.name,
           React.createElement(SortMark, { direction: sorted ? query.orderDir : 'none' }),
         ),
+        /*
+         * The column's COMMENT, under its name — phpMyAdmin's own layout.
+         *
+         * Shown because the comment is the only place a table says what a column MEANS:
+         * a column called `c_type` or `is_del` is unreadable without it, and the 结构 tab
+         * is a different page from the one being read. It is rendered as a separate block
+         * (not inline) so the name stays the thing the eye lands on, and the comment does
+         * not push the sort arrow around.
+         *
+         * Absent when the engine reports none — SQLite has no column comments at all, and
+         * MySQL reports an absent one as the empty string. Rendering an empty line either
+         * way would add height to every header for nothing.
+         */
+        column.comment === undefined || column.comment === ''
+          ? null
+          : React.createElement(
+              'div',
+              { className: 'dbm-col-comment', title: column.comment, 'data-dbm-col-comment': column.name },
+              column.comment,
+            ),
       ),
     )
   }
@@ -614,6 +634,28 @@ export function SqlBrowseTab(props: SqlBrowseTabProps): React.ReactElement {
     !canActOnRows && page !== undefined && page.columns.length > 0
       ? React.createElement('span', { className: 'dbm-hint' }, t('browse.noPk'))
       : null,
+    /*
+     * The table's own comment, at the RIGHT end of the pager row — phpMyAdmin's
+     * 「表注释」 placement.
+     *
+     * Right-aligned via a spacer rather than appended to the row count, so it is not read
+     * as part of 「第 1–3 行，共 3 行」: the comment describes the TABLE, not the page. It
+     * gets its own truncation because a comment can be long, and the pager must keep its
+     * controls usable at any width.
+     *
+     * Nothing is rendered when the engine reports no comment (SQLite has none at all),
+     * rather than an empty 「表注释：」 label that says nothing.
+     */
+    page?.comment === undefined || page.comment === ''
+      ? null
+      : [
+          React.createElement('span', { key: 'gap', className: 'dbm-spacer' }),
+          React.createElement(
+            'span',
+            { key: 'comment', className: 'dbm-hint dbm-table-comment', title: page.comment, 'data-dbm-table-comment': '' },
+            page.comment,
+          ),
+        ],
   )
 
   return React.createElement(
