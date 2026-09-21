@@ -25,6 +25,7 @@ import {
   defaultToWire,
   DEFAULT_MODES,
   inferDefault,
+  lengthRenamesType,
   nullDefaultNeedsNullable,
   quoteDefaultLiteral,
   requiresLengthOrValues,
@@ -275,5 +276,57 @@ describe('autoIncrementBlocker', () => {
     // A VARCHAR column that is not a key has two problems; the message must name the one to
     // change first rather than a requirement that may already hold.
     expect(autoIncrementBlocker('mysql', { indexKind: '', type: 'VARCHAR' })).toBe('notKey')
+  })
+})
+
+/**
+ * `lengthRenamesType`: the one type-length combination that must keep its own refusal.
+ *
+ * A broad "the type takes no length" check used to reject a digit typed into any type
+ * outside `takesLength`'s list — including INT, where MySQL accepts a display width — and
+ * reported it against the TYPE rather than the column. Removing that check was right, but
+ * it made this reachable, and this one is worse than an error: measured on 8.0, `TEXT(10)`
+ * is ACCEPTED and the column is declared `tinytext`, and `BLOB(10)` becomes `tinyblob`.
+ */
+describe('lengthRenamesType: where a length changes the type instead of qualifying it', () => {
+  it('catches the two types MySQL silently renames', () => {
+    expect(lengthRenamesType('TEXT')).toBe(true)
+    expect(lengthRenamesType('text')).toBe(true)
+    expect(lengthRenamesType('BLOB')).toBe(true)
+    expect(lengthRenamesType(' blob ')).toBe(true)
+  })
+
+  it('leaves the neighbouring sizes alone, which MySQL REFUSES rather than renames', () => {
+    // Measured: `TINYTEXT(10)`, `MEDIUMTEXT(10)`, `LONGTEXT(10)` and their BLOB
+    // counterparts are syntax errors, so the engine reports them and no rule is needed.
+    for (const type of ['TINYTEXT', 'MEDIUMTEXT', 'LONGTEXT', 'TINYBLOB', 'MEDIUMBLOB', 'LONGBLOB']) {
+      expect(lengthRenamesType(type), type).toBe(false)
+    }
+  })
+
+  it('does not fire for the types where a length is legal and kept', () => {
+    // Measured: `INT(11)` comes back as `int` (a display width), `CHAR(10)` / `BINARY(10)`
+    // / `VARCHAR(10)` keep theirs, and `TIMESTAMP(6)` is a fractional-seconds precision.
+    for (const type of ['INT', 'BIGINT', 'CHAR', 'VARCHAR', 'BINARY', 'VARBINARY', 'TIMESTAMP', 'DATETIME', 'TIME', 'DECIMAL']) {
+      expect(lengthRenamesType(type), type).toBe(false)
+    }
+  })
+
+  it('does not fire for the types that cannot take a length at all', () => {
+    // Those are refused by the engine with a syntax error, which the dialog now shows
+    // inside itself — so they need no rule here. Duplicating the engine's list would be a
+    // second copy to keep in step with a server this code cannot see.
+    for (const type of ['DATE', 'JSON', 'YEAR', 'BOOLEAN', 'BOOL', 'GEOMETRY', 'POINT']) {
+      expect(lengthRenamesType(type), type).toBe(false)
+    }
+  })
+
+  it('is what takesLength would have got wrong on its own', () => {
+    // The relationship that matters: `takesLength('INT')` is false, so the old check
+    // rejected a legitimate `INT(11)`. This predicate is deliberately NOT its inverse.
+    expect(takesLength('INT')).toBe(false)
+    expect(lengthRenamesType('INT')).toBe(false)
+    expect(takesLength('TEXT')).toBe(false)
+    expect(lengthRenamesType('TEXT')).toBe(true)
   })
 })

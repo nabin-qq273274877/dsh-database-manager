@@ -52,6 +52,36 @@ export function takesLength(type: string): boolean {
 }
 
 /**
+ * Types MySQL accepts a `(n)` on and then SILENTLY declares as a different type.
+ *
+ * Measured on 8.0: `TEXT(10)` is accepted and the column comes back as `tinytext`;
+ * `BLOB(10)` likewise becomes `tinyblob`. Every other shape is fine — `INT(11)` is kept as
+ * a display width (`int`), `CHAR(10)`/`BINARY(10)`/`VARCHAR(10)` keep their length,
+ * `TIMESTAMP(6)` keeps its precision, and the types that cannot take one at all
+ * (`DATE(10)`, `JSON(10)`, `YEAR(10)`, `POINT(10)`) are REFUSED with a syntax error rather
+ * than quietly changed.
+ *
+ * So this is the one case a shape-only check would miss, and the one that has to keep its
+ * own refusal. A user who typed 10 into a TEXT column's length box meant "10 characters";
+ * getting a `tinytext` (max 255) with no message saying the type changed is the worst of
+ * the three possible outcomes — worse than an error, and worse than doing nothing.
+ *
+ * Only TEXT and BLOB are listed: MySQL 8.0 refuses `(n)` on TINYTEXT/MEDIUMTEXT/LONGTEXT
+ * and on TINYBLOB/MEDIUMBLOB/LONGBLOB (measured), so for those the engine itself reports
+ * the problem.
+ */
+const SILENTLY_RENAMED_BY_LENGTH = /^(TEXT|BLOB)$/
+
+/**
+ * Whether a length on this type would change the type instead of qualifying it.
+ *
+ * @see SILENTLY_RENAMED_BY_LENGTH for the measurement behind this.
+ */
+export function lengthRenamesType(type: string): boolean {
+  return SILENTLY_RENAMED_BY_LENGTH.test(type.trim().toUpperCase())
+}
+
+/**
  * Types MySQL REFUSES without parentheses, measured one by one against 8.0.
  *
  * The form no longer pre-fills the length with 255 (the value is the user's to type), which

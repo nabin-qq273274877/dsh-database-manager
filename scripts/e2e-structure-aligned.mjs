@@ -319,6 +319,18 @@ try {
   if (editor === null) return { ...out, fatal: 'the add-column editor did not open' };
 
   /*
+   * 弹窗宽度：一个竖排字段的表单不需要 1180px。
+   *
+   * 量的是**实际渲染宽度**而不是类名 —— 报的现象就是「那么宽」，所以用像素回答。
+   * 参照是同一个面板里的默认宽度（560px），允许一点余量。
+   */
+  const modalBox = editor.querySelector('.dbm-modal') ?? editor;
+  out.modalWidth = Math.round(modalBox.getBoundingClientRect().width);
+  out.modalIsWide = modalBox.className.includes('dbm-modal-wide');
+  check('the add-column dialog is not the extra-wide variant', out.modalIsWide === false, out.modalIsWide);
+  check('the add-column dialog is about the default width, not 1180px', out.modalWidth <= 620, out.modalWidth);
+
+  /*
    * 类型是分组下拉：optgroup 的存在就是「分组」的证据，而分组是这次明确要求的。
    * 同时那个「类型文本」字段必须不在了 —— 它被单独报告为「不需要」。
    */
@@ -331,6 +343,52 @@ try {
   check('the grouped list offers real types', out.typeOptions.includes('VARCHAR') || out.typeOptions.includes('TEXT'), out.typeOptions.slice(0, 6));
   out.hasSeparateTypeTextField = colTypeText() !== null;
   check('there is no separate 类型文本 field', out.hasSeparateTypeTextField === false);
+
+  /*
+   * 提交失败时，消息必须显现在**弹窗内部**。
+   *
+   * 报的现象是「提示没显示在弹窗里，显示在页面上，但页面又被弹窗遮挡了看不见」。所以
+   * 判据有两半：消息存在，且它的**几何位置在弹窗内**、并且在视口里 —— 只查「页面上有
+   * 一段错误文字」会漏掉被遮挡这个唯一的关键。
+   */
+  setInput(colName(), 'probe_fail');
+  if (engine === 'mysql') {
+    setSelect(colTypeSelect(), 'INT');
+    await sleep(200);
+    setInput(colLength(), 'not-a-number');
+  } else {
+    // SQLite：长度框禁用，所以用「列名为空」触发一次本地拒绝。
+    setInput(colName(), '');
+  }
+  await sleep(200);
+  click(submitEditor());
+  await sleep(1200);
+  const modalAfterRefusal = document.querySelector('.dbm-modal');
+  const banner = modalAfterRefusal === null ? null : modalAfterRefusal.querySelector('.dbm-error');
+  out.refusalInDialog = banner !== null;
+  check('a refusal is shown INSIDE the dialog', out.refusalInDialog === true);
+  if (banner !== null) {
+    const bannerRect = banner.getBoundingClientRect();
+    const modalRect = modalAfterRefusal.getBoundingClientRect();
+    out.refusalGeometry = {
+      text: (banner.textContent || '').slice(0, 80),
+      insideModal: bannerRect.top >= modalRect.top - 1 && bannerRect.bottom <= modalRect.bottom + 1,
+      inViewport: bannerRect.top >= 0 && bannerRect.bottom <= window.innerHeight + 1,
+    };
+    check('the refusal sits inside the dialog box', out.refusalGeometry.insideModal === true, out.refusalGeometry);
+    check('the refusal is inside the viewport, not behind the overlay', out.refusalGeometry.inViewport === true, out.refusalGeometry);
+  }
+  /*
+   * 改动表单会清掉上一条拒绝。
+   *
+   * 改的必须是拒绝所针对的**那个**字段：重新输入一个相同的值不会触发 onChange，测出来的
+   * 会是「没清掉」而其实是「什么都没发生」——这一条第一次就是这样误报的。
+   */
+  if (engine === 'mysql') setInput(colLength(), '11');
+  else setInput(colName(), 'probe_fail_2');
+  await sleep(400);
+  out.refusalClearedOnEdit = document.querySelector('.dbm-modal .dbm-error') === null;
+  check('editing the form clears the stale refusal', out.refusalClearedOnEdit === true);
 
   // 长度框在（SQLite 上存在但禁用，MySQL 上可填）
   out.hasLengthField = colLength() !== null;
@@ -356,7 +414,45 @@ try {
   check('the SQLite append refusal is warned about exactly on SQLite',
     out.sqliteWarning === (engine === 'sqlite'), out.sqliteWarning);
 
+  /*
+   * 报的那条 bug：往 INT 列的长度框里填**纯数字**被拒绝。
+   *
+   * 原来这里还有一道 takesLength(type) 判断，而 takesLength('INT') 是 **false**（INT
+   * 在「不取长度」表里），所以合法输入被拦；并且消息的 {name} 传的是**类型**，于是提示写成
+   * 「列「INT」的长度/值不合法」。两条都要钉住：提交必须**成功**，且提示里不该出现类型名。
+   *
+   * MySQL 侧的最终证据在下面回读 INT 列的类型；这里先确认对话框没有拒绝。
+   */
+  if (engine === 'mysql') {
+    setInput(colName(), 'int_with_length');
+    setSelect(colTypeSelect(), 'INT');
+    await sleep(200);
+    setInput(colLength(), '11');
+    await sleep(200);
+    click(submitEditor());
+    await sleep(2800);
+    const refusal = document.querySelector('.dbm-modal .dbm-error');
+    out.intLengthRefusal = refusal === null ? null : (refusal.textContent || '');
+    /*
+     * No apostrophe in this label.
+     *
+     * The payload below is a template literal in the OUTER module, so a backslash-escaped
+     * quote is UNESCAPED before the browser parses it: the string ends early and the whole
+     * payload fails to parse, with the reported line pointing somewhere unhelpful. The same
+     * hazard applies to backticks and to a dollar-brace, both of which appear in this file's
+     * own header warning — which is why this sentence is spelled out rather than quoted.
+     */
+    check('a plain digit in the length box of an INT column is NOT refused', out.intLengthRefusal === null, out.intLengthRefusal);
+    out.intLengthStillOpen = document.querySelector('.dbm-modal') !== null;
+    check('the dialog closed, so the change was accepted', out.intLengthStillOpen === false, out.intLengthStillOpen);
+  }
+
   // ---- 2. 真的加一列，并验证位置与允许空 --------------------------------
+  if (document.querySelector('.dbm-modal') === null) {
+    click(byText('.dbm-btn', '+ ' + '新增列') || byIncludes('.dbm-btn', '新增列'));
+    await waitFor(() => document.querySelector('.dbm-modal'), 5000);
+    await sleep(300);
+  }
   setInput(colName(), 'added_col');
   if (engine === 'mysql') {
     setSelect(colTypeSelect(), 'VARCHAR');
@@ -378,7 +474,7 @@ try {
   }
   click(submitEditor());
   await sleep(3000);
-  out.addError = (document.querySelector('.dbm-error') || {}).textContent || null;
+  out.addError = (document.querySelector('.dbm-modal .dbm-error') ?? document.querySelector('.dbm-error') ?? {}).textContent || null;
   check('adding the column reported no error', out.addError === null, out.addError);
 
   const afterAdd = await api('/api/dsh-database/sources/' + matches[0].id + '/columns?schema=' + encodeURIComponent(dbName) + '&table=' + tableName);
@@ -430,9 +526,12 @@ try {
     process.exitCode = 1
   } else {
     for (const key of ['hasTypeSelect', 'typeGroupCount', 'hasSeparateTypeTextField', 'hasLengthField', 'lengthDisabled',
-      'nullableDefault', 'positionDisabled', 'sqliteWarning', 'addError', 'columnsAfterAdd', 'addedType', 'editorOpenedOn', 'editError']) {
+      'nullableDefault', 'positionDisabled', 'sqliteWarning', 'modalWidth', 'modalIsWide', 'refusalInDialog',
+      'refusalClearedOnEdit', 'intLengthRefusal', 'intLengthStillOpen', 'addError', 'columnsAfterAdd', 'addedType',
+      'editorOpenedOn', 'editError']) {
       if (report[key] !== undefined) console.log(`${key}: ${JSON.stringify(report[key])}`)
     }
+    if (report.refusalGeometry !== undefined) console.log(`refusalGeometry: ${JSON.stringify(report.refusalGeometry)}`)
     for (const note of report.notes) check(note, true)
     for (const failure of report.failures) check(failure.name, false, failure.detail)
   }
@@ -451,6 +550,16 @@ try {
     const order = columns.map(column => column.name)
     check('the added column sits after first_col on the server too',
       order.indexOf('added_col') === order.indexOf('first_col') + 1, order)
+    /*
+     * 报的那条 bug 的**最终证据**：填进 INT 长度框的 11 真的落到服务端。
+     *
+     * 只看「对话框没报错」是不够的 —— 长度可能被丢掉而一句话都不说。MySQL 会把
+     * `INT(11)` 归一化成 `int`（display width 从 8.0.19 起不再显示），所以判据是
+     * 「列存在且类型仍是 int」，而不是「类型里带 (11)」。
+     */
+    const intColumn = columns.find(column => column.name === 'int_with_length')
+    check('a digit in the length box of an INT column was accepted and reached the server',
+      intColumn !== undefined && /^int$/i.test(intColumn.type), intColumn)
   }
   if (report.fatal === undefined && engine === 'sqlite') {
     const columns = await inspectColumns()

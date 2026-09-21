@@ -93,6 +93,19 @@ export interface ModalProps {
    * the context the form is filled in against.
    */
   wide?: boolean
+  /**
+   * A refusal to show INSIDE the dialog, above its content.
+   *
+   * Exists because the panel's own error banner is drawn on the page, and the overlay
+   * covers the page: a message reported there while a dialog is open is a message the
+   * user cannot see. Measured on the 结构 tab's add-column form — a submit that failed
+   * looked like a button that did nothing, with the explanation hidden behind the
+   * overlay.
+   *
+   * Kept as a prop rather than left to each caller so a new dialog cannot reintroduce
+   * the same invisibility by reporting somewhere else.
+   */
+  error?: string
 }
 
 /**
@@ -124,6 +137,16 @@ export function Modal(props: ModalProps): React.ReactElement {
       'div',
       { className: `dbm-modal${props.wide === true ? ' dbm-modal-wide' : ''}`, role: 'dialog', 'aria-modal': 'true', 'aria-label': title },
       React.createElement('div', { className: 'dbm-modal-head' }, title),
+      /*
+       * The refusal goes ABOVE the fields, and outside the scrolling body.
+       *
+       * Above, because it is the first thing to read after pressing the submit button;
+       * outside `.dbm-modal-body`, because that element scrolls and a message scrolled
+       * out of view is the same invisibility this prop exists to fix.
+       */
+      props.error === undefined
+        ? null
+        : React.createElement(ErrorBanner, { message: props.error }),
       React.createElement('div', { className: 'dbm-modal-body' }, children as never),
       // The footer wrapper owns the top border and nothing else: button layout
       // belongs to the caller, so a dialog that needs its own arrangement

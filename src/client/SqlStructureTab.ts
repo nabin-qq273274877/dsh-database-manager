@@ -28,6 +28,7 @@ import {
   requiresLengthOrValues,
   supportsCurrentTimestamp,
   takesLength,
+  lengthRenamesType,
   type DefaultMode,
 } from './column-defaults.ts'
 import {
@@ -151,6 +152,15 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
   const { api, sourceId, schema, table, kind, columns, indexes, loading, error, onReload, onReloadRows, onNotice, onError } = props
   /** The column editor: a new column, or an existing one being changed. */
   const [editor, setEditor] = React.useState<EditorState | undefined>(undefined)
+  /**
+   * Why the column editor's last submit was refused.
+   *
+   * Held HERE rather than reported through `onError` because that banner is drawn on the
+   * page, BEHIND the dialog's overlay — measured: the add-column failure appeared nowhere
+   * the user could see it, so the button looked inert. Every refusal a submit can produce
+   * is shown in the dialog's own body instead, where the field it names is also visible.
+   */
+  const [editorError, setEditorError] = React.useState<string | undefined>(undefined)
   const [confirming, setConfirming] = React.useState<
     | { op: 'dropColumn'; column: string; rebuild: boolean }
     | { op: 'dropColumns'; columns: string[]; rebuild: boolean }
@@ -165,6 +175,13 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
   const [keyEditor, setKeyEditor] = React.useState<string[] | undefined>(undefined)
   /** The index creator's form. */
   const [indexForm, setIndexForm] = React.useState<{ name: string; columns: string[]; unique: boolean } | undefined>(undefined)
+  /**
+   * Why the index creator's or the key editor's last submit was refused.
+   *
+   * Same reasoning as {@link editorError}: those are dialogs too, so a message sent to the
+   * page's banner is hidden behind their overlay.
+   */
+  const [formError, setFormError] = React.useState<string | undefined>(undefined)
   const [busy, setBusy] = React.useState(false)
 
   // A selection is per table: carrying it across a table change would let "drop
@@ -174,15 +191,19 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
   /**
    * Run one schema change, then reload what it invalidated.
    *
-   * @returns true when the change was applied. The caller needs to know, because a
-   *   failure in one step of a multi-step edit (a column change followed by an index
-   *   change) must STOP the rest: trying to create an index on a column whose own
-   *   change just failed would report a second, misleading error.
+   * Returns the outcome instead of reporting it, because WHERE the message belongs differs
+   * per caller. A change submitted from a DIALOG has to show its refusal INSIDE that
+   * dialog: the page's banner sits behind the overlay, so a user who made a mistake sees
+   * the button do nothing at all. One submitted from the toolbar (a batch drop) belongs on
+   * the page. Measured: the add-column failure was invisible exactly this way.
+   *
+   * `ok: false` also STOPS a multi-step edit — trying to create an index on a column whose
+   * own change just failed would report a second, misleading error.
    */
   const run = async (
     body: Record<string, unknown>,
     options: { rows?: boolean; keepEditor?: boolean } = {},
-  ): Promise<boolean> => {
+  ): Promise<{ ok: true } | { ok: false; error: string }> => {
     setBusy(true)
     try {
       await api.changeSchema(sourceId, { schema, table, ...body } as never)
@@ -197,14 +218,27 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
       // column removes one), so the grid is re-read rather than left showing
       // cells that no longer exist.
       if (options.rows !== false) onReloadRows()
-      return true
+      return { ok: true }
     } catch (failure) {
       setConfirming(undefined)
-      onError(t('db.action.failed', { error: failure instanceof Error ? failure.message : String(failure) }))
-      return false
+      return { ok: false, error: failure instanceof Error ? failure.message : String(failure) }
     } finally {
       setBusy(false)
     }
+  }
+
+  /**
+   * Run a change whose message belongs on the PAGE, and report it there.
+   *
+   * For the callers with no dialog of their own: the toolbar's batch operations and the
+   * confirmation dialogs, whose own result the page is the right place for.
+   */
+  const runOnPage = async (
+    body: Record<string, unknown>,
+    options: { rows?: boolean } = {},
+  ): Promise<void> => {
+    const outcome = await run(body, options)
+    if (!outcome.ok) onError(t('db.action.failed', { error: outcome.error }))
   }
 
   const showDistinct = async (column: string): Promise<void> => {
@@ -250,6 +284,7 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
   }
 
   const startEdit = (column: ColumnInfo): void => {
+    setEditorError(undefined)
     /*
      * The default is converted into the same four-state control 新建表 uses.
      *
@@ -276,6 +311,7 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
   }
 
   const startAdd = (): void => {
+    setEditorError(undefined)
     setEditor({
       mode: 'add',
       original: '',
@@ -331,11 +367,19 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
     if (editor === undefined) return
     const draft = editor.draft
     const name = draft.name.trim()
-    if (name === '') { onError(t('structure.colNameRequired')); return }
+    /*
+     * Every refusal below goes to `editorError`, not `onError`.
+     *
+     * This dialog has no result display of its own, and the page's banner is behind its
+     * overlay: a message sent there is a message the user cannot see. One helper keeps the
+     * two from being mixed up again.
+     */
+    const refuse = (message: string): false => { setEditorError(message); return false }
+    if (name === '') { refuse(t('structure.colNameRequired')); return }
     const taken = columns.some(column => column.name.toLowerCase() === name.toLowerCase() && column.name !== editor.original)
-    if (taken) { onError(t('structure.colNameTaken', { name })); return }
+    if (taken) { refuse(t('structure.colNameTaken', { name })); return }
     if (editor.mode === 'add' && sqliteAddRefused(draft)) {
-      onError(t('structure.addNotNullOnSqlite'))
+      refuse(t('structure.addNotNullOnSqlite'))
       return
     }
 
@@ -372,19 +416,45 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
      * modifier emitted ONCE, from the list.
      */
     const type = joinTypeParts({ base: draft.type, length: draft.length, attributes: draft.attributes })
-    if (type === '') { onError(t('structure.lengthRequired', { type: draft.type || t('common.none'), column: name })); return }
-    if (requiresLengthOrValues(draft.type) && draft.length.trim() === '' && !draft.type.includes('(')) {
-      onError(t('structure.lengthRequired', { type: draft.type, column: name }))
-      return
-    }
+    if (type === '') { refuse(t('structure.typeRequired', { column: name })); return }
     /*
-     * A length belongs to the type. A stale one is dropped when the new type cannot take
-     * it, the same rule 新建表 applies to a changed type: carrying 255 into a type
-     * without a width produced `TIMESTAMP(255)`, which MySQL refuses with a message
-     * about the DEFAULT.
+     * The length, checked for its SHAPE and for the one type-changing case.
+     *
+     * It used to also be rejected whenever `takesLength(type)` said the type wants no
+     * length, and that was simply wrong: `takesLength('INT')` is false (INT is in the
+     * no-length list), so typing a plain digit into an INT column's length box was refused
+     * with a message that ALSO named the type where it should have named the column —
+     * reported as 「列「INT」的长度/值不合法…但我输入的就是数字」. Both halves are fixed: the
+     * broad type check is gone, and every message names the column.
+     *
+     * What replaces it is narrower and measured. `INT(11)` is accepted BY MySQL as a
+     * display width, so "the type takes no length" is not a rule this form may enforce;
+     * but `TEXT(10)` / `BLOB(10)` are accepted and SILENTLY DECLARE A DIFFERENT TYPE
+     * (`tinytext` / `tinyblob`), which is the one outcome worse than an error — the
+     * column changes and nothing says so. See `lengthRenamesType`.
+     *
+     * Everything else that cannot take a length is REFUSED BY THE ENGINE with a syntax
+     * error (`DATE(10)`, `JSON(10)`, `YEAR(10)`, `POINT(10)` — measured), and that is
+     * allowed through: the dialog now shows the engine's own message inside itself, so
+     * the user sees the reason where they can act on it. Duplicating the engine's list
+     * here would be a second copy to keep in step with a server it cannot see.
+     *
+     * The accepted shapes are the two the driver passes through: digits with at most one
+     * comma, or a quoted list of values (`'a','b'` for an enum/set).
      */
-    if (draft.length.trim() !== '' && !takesLength(draft.type) && !/^'/.test(draft.length.trim())) {
-      onError(t('structure.lengthInvalid', { name: draft.type }))
+    const length = draft.length.trim()
+    if (length !== '') {
+      if (lengthRenamesType(draft.type)) {
+        refuse(t('structure.lengthRenamesType', { column: name, type: draft.type.trim() }))
+        return
+      }
+      if (!/^\d{1,10}(\s*,\s*\d{1,10})?$/.test(length) && !/^'([^'\\]|'')*'(\s*,\s*'([^'\\]|'')*')*$/.test(length)) {
+        refuse(t('structure.lengthInvalid', { column: name }))
+        return
+      }
+    }
+    if (requiresLengthOrValues(draft.type) && length === '' && !draft.type.includes('(')) {
+      refuse(t('structure.lengthRequired', { type: draft.type, column: name }))
       return
     }
 
@@ -432,11 +502,12 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
         })
 
     if (editor.mode === 'add') {
-      if (!await run({ action: 'addColumn', column }, { keepEditor: true })) return
+      const added = await run({ action: 'addColumn', column }, { keepEditor: true })
+      if (!added.ok) { refuse(t('db.action.failed', { error: added.error })); return }
       // The column exists only after the call above, so an index it asked for is a
       // second request. `keepEditor` is what lets a failure here leave the form open
       // with the index still chosen, rather than looking like a silent success.
-      await runIndexPlan(plan)
+      await runIndexPlan(plan, refuse)
       return
     }
 
@@ -445,8 +516,9 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
       column: { ...column, name: editor.original },
       ...(name === editor.original ? {} : { rename: name }),
     }
-    if (!await run(body, { keepEditor: true })) return
-    await runIndexPlan(plan)
+    const altered = await run(body, { keepEditor: true })
+    if (!altered.ok) { refuse(t('db.action.failed', { error: altered.error })); return }
+    await runIndexPlan(plan, refuse)
   }
 
   /**
@@ -454,12 +526,16 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
    *
    * Sequential rather than parallel: a drop has to finish before the create that
    * replaces it, and on SQLite each of these can be a whole-table rebuild. It stops at
-   * the first failure, which is left reported — continuing would describe the fallout of
-   * a step that did not happen.
+   * the first failure and reports it through `refuse` — into the DIALOG, since the plan
+   * only ever runs while the column editor is open. Continuing would describe the fallout
+   * of a step that did not happen.
    */
-  const runIndexPlan = async (plan: ReturnType<typeof planIndexChange>): Promise<void> => {
+  const runIndexPlan = async (
+    plan: ReturnType<typeof planIndexChange>,
+    refuse: (message: string) => void,
+  ): Promise<void> => {
     for (const operation of plan) {
-      const done = operation.op === 'setPrimaryKey'
+      const outcome = operation.op === 'setPrimaryKey'
         ? await run({ action: 'setPrimaryKey', columns: operation.columns }, { keepEditor: true })
         : operation.op === 'dropIndex'
           ? await run({ action: 'dropIndex', name: operation.name }, { rows: false, keepEditor: true })
@@ -467,7 +543,7 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
               { action: 'createIndex', index: { name: operation.name, columns: operation.columns, unique: operation.unique } },
               { rows: false, keepEditor: true },
             )
-      if (!done) return
+      if (!outcome.ok) { refuse(t('db.action.failed', { error: outcome.error })); return }
     }
     // The editor closes only once the whole plan has run, so a failure part-way leaves
     // the form on screen rather than looking like a silent success.
@@ -593,10 +669,10 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
               if (current) {
                 const index = indexes.find(entry => entry.unique && entry.columns.length === 1 && entry.columns[0] === column.name)
                 if (index === undefined) { onError(t('structure.refreshFirst')); return }
-                void run({ action: 'dropIndex', name: index.name }, { rows: false })
+                void runOnPage({ action: 'dropIndex', name: index.name }, { rows: false })
                 return
               }
-              void run({ action: 'createIndex', index: { name: uniqueIndexName(column.name, indexes), columns: [column.name], unique: true } }, { rows: false })
+              void runOnPage({ action: 'createIndex', index: { name: uniqueIndexName(column.name, indexes), columns: [column.name], unique: true } }, { rows: false })
             },
           }, `U${column.key === 'UNI' ? '✓' : ''}`),
         )),
@@ -710,7 +786,14 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
             columns,
             indexes,
             busy,
-            onChange: (next: Partial<EditorState>) => setEditor({ ...editor, ...next }),
+            error: editorError,
+            onChange: (next: Partial<EditorState>) => {
+              // A refusal belongs to the submission that produced it, so editing anything
+              // clears it: leaving it up would keep describing a value the user has since
+              // changed, and a stale message is worse than none.
+              setEditorError(undefined)
+              setEditor({ ...editor, ...next })
+            },
             onSubmit: () => { void submitEditor() },
             onCancel: () => setEditor(undefined),
             onError,
@@ -739,18 +822,22 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
             columns,
             indexes,
             busy,
-            onChange: setIndexForm,
+            ...(formError === undefined ? {} : { error: formError }),
+            onChange: (next: { name: string; columns: string[]; unique: boolean }) => { setFormError(undefined); setIndexForm(next) },
             onSubmit: () => {
               const name = indexForm.name.trim()
-              if (name === '') { onError(t('structure.indexNameRequired')); return }
+              if (name === '') { setFormError(t('structure.indexNameRequired')); return }
               if (indexes.some(index => index.name.toLowerCase() === name.toLowerCase())) {
-                onError(t('structure.indexNameTaken', { name }))
+                setFormError(t('structure.indexNameTaken', { name }))
                 return
               }
-              if (indexForm.columns.length === 0) { onError(t('structure.noColumnsSelected')); return }
-              void run({ action: 'createIndex', index: { name, columns: indexForm.columns, unique: indexForm.unique } }, { rows: false })
+              if (indexForm.columns.length === 0) { setFormError(t('structure.noColumnsSelected')); return }
+              void (async () => {
+                const outcome = await run({ action: 'createIndex', index: { name, columns: indexForm.columns, unique: indexForm.unique } }, { rows: false })
+                if (!outcome.ok) setFormError(t('db.action.failed', { error: outcome.error }))
+              })()
             },
-            onCancel: () => setIndexForm(undefined),
+            onCancel: () => { setFormError(undefined); setIndexForm(undefined) },
             onError,
           }),
       indexes.length === 0
@@ -768,9 +855,15 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
             columns,
             order: keyEditor,
             busy,
-            onChange: setKeyEditor,
-            onSubmit: () => { void run({ action: 'setPrimaryKey', columns: keyEditor }) },
-            onCancel: () => setKeyEditor(undefined),
+            ...(formError === undefined ? {} : { error: formError }),
+            onChange: (next: string[]) => { setFormError(undefined); setKeyEditor(next) },
+            onSubmit: () => {
+              void (async () => {
+                const outcome = await run({ action: 'setPrimaryKey', columns: keyEditor })
+                if (!outcome.ok) setFormError(t('db.action.failed', { error: outcome.error }))
+              })()
+            },
+            onCancel: () => { setFormError(undefined); setKeyEditor(undefined) },
             rebuild: needsRebuild(kind, 'key'),
           }),
     ),
@@ -799,15 +892,18 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
           kind,
           onCancel: () => setConfirming(undefined),
           onConfirm: () => {
-            if (confirming.op === 'dropIndex') { void run({ action: 'dropIndex', name: confirming.name }, { rows: false }); return }
-            if (confirming.op === 'dropColumn') { void run({ action: 'dropColumn', column: confirming.column }); return }
+            if (confirming.op === 'dropIndex') { void runOnPage({ action: 'dropIndex', name: confirming.name }, { rows: false }); return }
+            if (confirming.op === 'dropColumn') { void runOnPage({ action: 'dropColumn', column: confirming.column }); return }
             // A multi-column drop is one request per column, in the order on
             // screen: SQLite rebuilds once per drop, so batching them into one
             // request would rebuild several times inside what the user thinks is
             // one action, with no way to report progress between them.
             void (async () => {
               for (const column of confirming.columns) {
-                await run({ action: 'dropColumn', column }, { rows: false })
+                const outcome = await run({ action: 'dropColumn', column }, { rows: false })
+                // Stop at the first failure: the remaining names would be dropped from a
+                // table that is not in the state the list was built against.
+                if (!outcome.ok) { onError(t('db.action.failed', { error: outcome.error })); return }
               }
               setSelected(new Set())
               onReloadRows()
@@ -893,13 +989,15 @@ function ColumnEditor(props: {
   columns: ColumnInfo[]
   indexes: IndexInfo[]
   busy: boolean
+  /** The refusal to show inside the dialog, if the last submit was refused. */
+  error?: string
   /** Patch the editor's own state; the draft and the default live inside it. */
   onChange(next: Partial<EditorState>): void
   onSubmit(): void
   onCancel(): void
   onError(message: string | undefined): void
 }): React.ReactElement {
-  const { editor, kind, columns, indexes, busy, onChange, onSubmit, onCancel } = props
+  const { editor, kind, columns, indexes, busy, error, onChange, onSubmit, onCancel } = props
   const draft = editor.draft
   const defaultDraft = editor.default
   const groups = typeGroupsFor(kind)
@@ -1175,9 +1273,17 @@ function ColumnEditor(props: {
 
   return React.createElement(Modal, {
     title: editor.mode === 'add' ? t('structure.newColumn') : t('structure.editColumn', { column: editor.original }),
-    // A wider dialog, like 新建表's: the field set is the same now, and the default
-    // width squeezed the paired controls.
-    wide: true,
+    /*
+     * NOT `wide`.
+     *
+     * The field set is one column of stacked controls, so the default 560px holds it and
+     * a 1180px dialog was mostly empty space — reported as "不要那么宽". `wide` is for
+     * the 新建表 form, which genuinely needs one control per table column side by side.
+     *
+     * The refusal rides on the dialog itself (see ModalProps.error) so it cannot be hidden
+     * behind the overlay, which is where the page-level banner sits.
+     */
+    ...(error === undefined ? {} : { error }),
     onClose: onCancel,
     footer: [
       React.createElement('button', { key: 'cancel', type: 'button', className: 'dbm-btn', disabled: busy, onClick: onCancel }, t('common.cancel')),
@@ -1347,14 +1453,18 @@ function IndexCreator(props: {
   columns: ColumnInfo[]
   indexes: IndexInfo[]
   busy: boolean
+  /** The refusal to show inside the dialog, if the last submit was refused. */
+  error?: string
   onChange(next: { name: string; columns: string[]; unique: boolean }): void
   onSubmit(): void
   onCancel(): void
   onError(message: string | undefined): void
 }): React.ReactElement {
-  const { form, columns, busy, onChange, onSubmit, onCancel } = props
+  const { form, columns, busy, error, onChange, onSubmit, onCancel } = props
   return React.createElement(Modal, {
     title: t('structure.addIndex'),
+    // Shown inside the dialog: the page's banner is behind this overlay.
+    ...(error === undefined ? {} : { error }),
     onClose: onCancel,
     footer: [
       React.createElement('button', { key: 'cancel', type: 'button', className: 'dbm-btn', disabled: busy, onClick: onCancel }, t('common.cancel')),
@@ -1435,13 +1545,17 @@ function KeyEditor(props: {
   order: string[]
   busy: boolean
   rebuild: boolean
+  /** The refusal to show inside the dialog, if the last save was refused. */
+  error?: string
   onChange(next: string[]): void
   onSubmit(): void
   onCancel(): void
 }): React.ReactElement {
-  const { columns, order, busy, rebuild, onChange, onSubmit, onCancel } = props
+  const { columns, order, busy, rebuild, error, onChange, onSubmit, onCancel } = props
   return React.createElement(Modal, {
     title: t('structure.keyTitle'),
+    // Shown inside the dialog: the page's banner is behind this overlay.
+    ...(error === undefined ? {} : { error }),
     onClose: onCancel,
     footer: [
       React.createElement('button', { key: 'cancel', type: 'button', className: 'dbm-btn', disabled: busy, onClick: onCancel }, t('common.cancel')),
