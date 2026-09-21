@@ -2,9 +2,15 @@
 
 研究基准：**phpMyAdmin 5.2.3**（官方文档 latest / release 5.2.3 + 官方发行包源码）。
 
+**这份报告的性质**：它是一份**对照研究**，不是补齐计划。第 3 节的 34 条缺口按日常使用的重要性排序，用来说明「面板相对 phpMyAdmin 少了什么」，但其中大部分（服务器管理、账号权限、设计器、跟踪、图表、变换…）与本面板的定位不符，不构成本项目的工作清单。要据此排期时，应先在「缺的是不是这个面板该有的」上做一轮取舍。
+
+**复核状态**：第 0、1、2、3、4 节由研究子代理产出；第 5 节由本仓库维护者复核并改写——其中 3 条不确定项经**读本仓库源码**转为确定（给了 `文件:行`），并更正了正文一处对 README 的误判（见 5.2）。**本仓库相关的每一条断言都已在源码中验证过**；phpMyAdmin 一侧的断言以官方文档与 5.2.3 发行包源码为准，未能核实的一律保留在第 5 节，不下结论。
+
 ## 0. 关于来源的一个必须先说明的事实
 
 任务给出的 URL 里，`browse.html`、`tbl_structure.html`、`tbl_create.html`、`sql.html`、`search.html`、`db_operations.html`、`tbl_operations.html`、`designer.html`、`tracking.html`、`user_management.html`、`server_status.html`、`indexes.html` 等**在 phpMyAdmin 官方文档中不存在**。
+
+> **这一页是留给下一个人的警告**：上面那套 URL 是**上游任务凭记忆给的**（本次研究的发起方，也就是本仓库的 agent），不是从官方文档核对来的。它对应的 23 个真实文档名见下面第 3 点。照那份清单抓页面会**全部 404**——这正是本次研究实际遇到的情况，也是为什么本节写在最前面。
 
 核实方法（三重）：
 
@@ -348,12 +354,27 @@
 
 ## 5. 不确定项
 
-以下几条我没能从官方文档或官方源码确认，**不下结论**：
+以下几条没能从官方文档或官方源码确认，**不下结论**：
 
-1. **phpMyAdmin 插入页是否提供 `ON DUPLICATE KEY UPDATE`**。我在 5.2.3 发行包里只找到 `INSERT IGNORE`（`InsertEdit.php:1303`）与 CSV/LOAD DATA 导入侧的 `Add ON DUPLICATE KEY UPDATE`（`Config/Descriptions.php:797,804`）。插入页是否有第三态（如「插入或更新」）未确认——需要看 `InsertEdit::buildSqlQuery` 的完整分支或有 MySQL 环境实测。
-2. **Browse 页多列排序的确切交互**。源码里 `getSingleAndMultiSortUrls` 生成 `single_sort_order` / `multi_sort_order` 两个 URL，说明多列排序存在，但触发方式（是否 Shift+点击，还是历史上由「按索引排序」间接达成）我没在官方文档里找到说明。
-3. **phpMyAdmin 的 Shift 范围选择是否覆盖 Browse 的复选框**。FAQ 6.26 说「works everywhere you see rows, for example in Browse mode or on the Structure page」，但没说是否作用于复选框；`makegrid.js` 里我读到的 `checkall_box` 逻辑未包含 shift 区间分支。
-4. **面板「导出所选」的确切语义**。`export.scope.selected` 的中文是「仅所选」、英文是「Selected rows only」，但结构页的 `db.selectedCount` 是「已选 n 张表」。我倾向前者指行、后者指表，但没有实测确认导出对话框在表级与行级两处的取值差异。
-5. **面板的 `IMPORT_BYTE_CAP` 具体数值**。只确认了常量名与「文件过大」文案，未读到数值。
-6. **面板结构页是否能显式创建生成列**。我读到的是生成列被**识别与保护**（禁改、禁插值），并有建表对话框的列定义通路；能否在既有表上新增生成列未确认。
-7. **phpMyAdmin 5.2 是否仍在界面暴露 `$cfg['EditInWindow']` 的弹窗编辑**。文档标注该设置在 4.3.0 被移除，所以按「已移除」处理，但没进一步核实替代交互。
+1. **phpMyAdmin 插入页是否提供 `ON DUPLICATE KEY UPDATE`**。在 5.2.3 发行包里只找到 `INSERT IGNORE`（`InsertEdit.php:1303`）与 CSV/LOAD DATA 导入侧的 `Add ON DUPLICATE KEY UPDATE`（`Config/Descriptions.php:797,804`）。插入页是否有第三态（如「插入或更新」）未确认——需要看 `InsertEdit::buildSqlQuery` 的完整分支或有 MySQL 环境实测。
+   *（复核注：抓取 5.2.3 的 `InsertEdit.php` 源码两次均失败，此项仍未定。它不改变结论——报告按「两者插入页都没有」记为「相当」；若 phpMyAdmin 确有，也只是把该行改成「更弱」，不影响第 3 节缺口排序。）*
+2. **Browse 页多列排序的确切交互**。源码里 `getSingleAndMultiSortUrls` 生成 `single_sort_order` / `multi_sort_order` 两个 URL，说明多列排序存在，但触发方式（是否 Shift+点击，还是历史上由「按索引排序」间接达成）未在官方文档里找到说明。
+3. **phpMyAdmin 的 Shift 范围选择是否覆盖 Browse 的复选框**。FAQ 6.26 说「works everywhere you see rows, for example in Browse mode or on the Structure page」，但没说是否作用于复选框；`makegrid.js` 里读到的 `checkall_box` 逻辑未包含 shift 区间分支。
+4. **phpMyAdmin 5.2 是否仍在界面暴露 `$cfg['EditInWindow']` 的弹窗编辑**。文档标注该设置在 4.3.0 被移除，所以按「已移除」处理，但没进一步核实替代交互。
+
+### 5.1 复核后已确定，不再是「不确定」
+
+下面几条原本列在不确定项里，经**读本仓库源码**核实（每条都给了 `文件:行`）：
+
+5. ~~面板的 `IMPORT_BYTE_CAP` 具体数值~~ → **32 MiB**，`src/sql-transfer.ts:99`（`32 * 1024 * 1024`；`routes.ts:98` 另把它用作请求体上限 `+ 1 MiB`）。同一行给出导出上限 `EXPORT_ROW_CAP = 200_000`（`sql-transfer.ts:96`）。
+6. ~~面板结构页是否能显式创建生成列~~ → **不能**。`SqlStructureTab.ts` 只有**识别与保护**：生成列被标出（`:559`）、不可选中做批量操作（`:569,574`）、不可插值（`:612`）、不可改定义（`:650,662`）、编辑对话框给出说明（`:1422`）；而新增列的通路是 `addColumn` + 普通列定义渲染，**没有 `GENERATED ALWAYS AS` 的输入位**（`mysql.ts:2124` 只在 `carry.generated === true` 时渲染该子句，`:2136` 才拼接它——而 `carry` 是调用方从**既有列**读来的信息，见 `:2111` 的注释「MySQL reads a generated column's MODIFY as a redefinition」，所以那是**改写既有**生成列用的）。「不能新建、不能改表达式」成立，对照表 2.2 那条「更弱」判断正确。
+7. ~~面板「导出所选」的确切语义~~ → **指选中的行，不是表**。`export.scope.selected`（`locales.ts:668` 中文「仅所选」／`:1478` 英文「Selected rows only」）的选项只在 `hasSelection` 时出现（`SqlTransferDialogs.ts:52,172`），而 `selectedKeys` 唯一来源是浏览表格里选中的行（`SqlBrowseTab.ts` → `SqlDatabaseView.ts:1159`）。结构页的 `db.selectedCount`（「已选 n 张表」）走的是另一条通路——`onBatchExport` 传的是 `tables`（`SqlDatabaseView.ts:1049`），与 `selectedKeys` 无关。两处不是同一个东西。
+
+### 5.2 提请注意：报告正文有一处对 README 的误判（已就地更正）
+
+报告初稿在「README 与源码不符」里称 **README 未提生成列**。**这是错的**：`README.md:61` 写着「生成列标出；它的表达式不可改（那等于换一列），但列的其它属性可以改」，`:76-79` 还详述了生成列的两个判据陷阱。生成列确实**只被提到「标出 + 保护」**这一层，而没提「不能新建」——但那属于「README 没说」而非「README 说错」。真正的 README 与源码不符只有一处，见下。
+
+**README 与源码确实不符的一处**（复核确认）：
+
+- `README.md:59` 写结构页「索引新建与删除」，读者会理解为索引能力完整；实际上结构页的索引通路只支持 `primary / unique / index` 三种（`SqlStructureTab.ts:1159` 的 `ColumnIndexChoice` 只有这三个值，`column-index-plan.ts:176` 明确说明 FULLTEXT/SPATIAL 在该通路上被拒绝），而**建表页**能建 FULLTEXT/SPATIAL（`CreateTableDialog.ts:257-258,766`，含类型校验：FULLTEXT 要文本列、SPATIAL 要 NOT NULL 的几何列）。这个「建表能建、结构页不能建」的不一致是真实的，对照表 2.2 已如实记为「能力偏窄」。
+
