@@ -376,6 +376,13 @@ export type DatabaseOpView = 'create' | 'drop' | 'rename' | 'copy' | 'charset'
  */
 export type { ColumnAttribute, IndexKind, TableIndexSpec, TableOptions } from './drivers/types.ts'
 export { COLUMN_ATTRIBUTES, INDEX_KINDS } from './drivers/types.ts'
+/**
+ * Re-exported so the browser and the driver agree on one definition.
+ *
+ * The sentinel means 「放在最前面」 in `positionAfter`; it lives next to the
+ * driver contract because the driver is what interprets it.
+ */
+export { POSITION_FIRST, type ColumnSpecPositionAfter } from './drivers/types.ts'
 
 /**
  * The 操作 tab's own contract, re-exported for the same reason.
@@ -394,6 +401,8 @@ export { TABLE_ACTION_OPS } from './drivers/types.ts'
  * tab sends it, and the table-creation dialog sends the same shape. Two definitions
  * would be two things to keep in step.
  */
+import type { ColumnSpecPositionAfter } from './drivers/types.ts'
+
 export interface ColumnSpecPayload {
   name: string
   type: string
@@ -408,6 +417,25 @@ export interface ColumnSpecPayload {
   collate?: string
   /** MySQL column attributes (UNSIGNED, BINARY, …). */
   attributes?: import('./drivers/types.ts').ColumnAttribute[]
+  /**
+   * Where a NEW column goes: immediately after this existing column's name.
+   *
+   * MySQL's `ADD COLUMN … AFTER x`, which is how phpMyAdmin's 「在…之后」 offers a
+   * position for a column being appended. `FIRST` is expressed as the sentinel
+   * {@link POSITION_FIRST} rather than by a second field, because "at the very
+   * beginning" and "after the column named nothing" are the same decision.
+   *
+   * Only meaningful for `addColumn`. Absent means "wherever the engine appends
+   * it", which is the end — so an unchanged form and a form that picked the last
+   * column produce the SAME statement rather than two that differ by nothing.
+   *
+   * NOT sent to SQLite: its `ALTER TABLE … ADD COLUMN` has no position clause,
+   * and passing one is worse than useless — measured, SQLite ACCEPTS
+   * `ADD COLUMN c TEXT AFTER a` and swallows `AFTER a` into the declared TYPE
+   * (`c TEXT AFTER a`), so the column does not move and its type name is now a
+   * string no other tool expects.
+   */
+  positionAfter?: ColumnSpecPositionAfter
 }
 
 /** A table-level schema-change request. */

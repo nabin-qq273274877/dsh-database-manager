@@ -273,6 +273,21 @@ function readColumnSpec(value: unknown, what: string): ColumnSpec {
     }
     primaryKeyPosition = record['primaryKeyPosition']
   }
+  /*
+   * Where a new column goes.
+   *
+   * Kept out of the allow-list trap above by being read here explicitly: an unlisted
+   * field is dropped silently, and a dropped position would add the column at the
+   * end while the form still showed a chosen 「在…之后」 — the column would exist, in
+   * the wrong place, with nothing to say so.
+   *
+   * A NUL-led value can only be the sentinel POSITION_FIRST, and any other non-empty
+   * string is a column NAME the driver resolves against the live table. Empty is
+   * treated as absent so 「不指定」 and 「未提供」 mean the same thing.
+   */
+  const positionAfter = typeof record['positionAfter'] === 'string' && record['positionAfter'] !== ''
+    ? record['positionAfter']
+    : undefined
   return {
     name,
     type,
@@ -286,6 +301,7 @@ function readColumnSpec(value: unknown, what: string): ColumnSpec {
     ...(collate === undefined ? {} : { collate }),
     ...(charset === undefined ? {} : { charset }),
     ...(attributes === undefined ? {} : { attributes }),
+    ...(positionAfter === undefined ? {} : { positionAfter }),
   }
 }
 

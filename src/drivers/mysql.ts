@@ -11,6 +11,7 @@
 import type { ColumnInfo, DataSourceEntry, IndexInfo, QueryResult, SchemaInfo, TableInfo, TablePage, TestResult } from '../protocol.ts'
 import { assertSingleStatement, buildSearchWhere, groupSameColumns, isTransactionControl, likeEscapeClause, looksReadOnly, pushDownLimit, qualifyMysql, quoteMysql, requireIdentifier, toWireValue } from '../sql-util.ts'
 import { identifier, normalizeDefault, normalizeType } from '../sql-schema.ts'
+import { POSITION_FIRST } from './types.ts'
 import type {
   ColumnSpec,
   DatabaseOp,
@@ -1107,11 +1108,35 @@ export class MysqlDriver implements SqlDriver {
     return this.exec(`CREATE TABLE ${qualified} (\n  ${items.join(',\n  ')}\n)${suffix}`, [], target)
   }
 
+  /**
+   * Add a column, optionally at a chosen position.
+   *
+   * `AFTER x` / `FIRST` is what phpMyAdmin's 「在…之后」 produces. The column name is
+   * VALIDATED as an existing column first: MySQL would answer `Unknown column 'x' in
+   * 't'`, which is a correct refusal but does not say that the name came from a
+   * position dropdown rather than from the column being added.
+   *
+   * The position is only ever read for `addColumn`. Passing it to a `MODIFY` would
+   * move the column as a side effect of editing its type, which is not what that
+   * form asks for.
+   */
   async addColumn(schema: string | undefined, table: string, spec: ColumnSpec): Promise<QueryResult> {
     const target = this.requireSchema(schema)
     const qualified = qualifyMysql(target, table)
+    let position = ''
+    if (spec.positionAfter !== undefined) {
+      if (spec.positionAfter === POSITION_FIRST) {
+        position = ' FIRST'
+      } else {
+        const existing = await this.columns(target, table)
+        if (!existing.some(column => column.name === spec.positionAfter)) {
+          throw new Error(`找不到要放在其后的列「${spec.positionAfter}」（表结构可能已变化，请刷新后重试）`)
+        }
+        position = ` AFTER ${requireIdentifier(spec.positionAfter, 'column name', quoteMysql)}`
+      }
+    }
     return this.exec(
-      `ALTER TABLE ${qualified} ADD COLUMN ${requireIdentifier(spec.name, 'column name', quoteMysql)} ${renderMysqlDefinition(spec)}`,
+      `ALTER TABLE ${qualified} ADD COLUMN ${requireIdentifier(spec.name, 'column name', quoteMysql)} ${renderMysqlDefinition(spec)}${position}`,
       [],
       target,
     )

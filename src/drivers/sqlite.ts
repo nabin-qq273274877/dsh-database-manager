@@ -1001,6 +1001,21 @@ export class SqliteDriver implements SqlDriver {
 
   async addColumn(schema: string | undefined, table: string, spec: ColumnSpec): Promise<QueryResult> {
     const qualified = qualifySqlite(schema, table)
+    /*
+     * A position clause is REFUSED, not ignored.
+     *
+     * Measured on SQLite: `ALTER TABLE t ADD COLUMN c TEXT AFTER a` is ACCEPTED and
+     * leaves the column at the END with the declared type `TEXT AFTER a` — the
+     * clause is folded into the type name. So dropping the field silently would
+     * look like it worked while producing a column whose type is a string nothing
+     * else expects, and ignoring it would silently do the wrong thing.
+     *
+     * The panel disables the control for SQLite and says why, so this is the
+     * second line of defence for a crafted request.
+     */
+    if (spec.positionAfter !== undefined) {
+      throw new Error('SQLite 的 ADD COLUMN 只能把新列加在最后，不支持指定位置（AFTER / FIRST）')
+    }
     const definition = renderColumn(toDefinition(spec), 'sqlite')
     // A PRIMARY KEY cannot be added by ALTER: the column would have to be the
     // table's only key, which ALTER cannot establish. Say so rather than

@@ -142,6 +142,18 @@ export const PANEL_CSS = `
 .dbm-toolbar .dbm-input { width: 220px; }
 
 /* ---- table ------------------------------------------------------------- */
+/*
+ * The scrolling wrapper for a panel table.
+ *
+ * overflow: auto in BOTH directions is load-bearing: a table with many columns is
+ * wider than the panel, and the overflow has to be scrollable INSIDE this box rather
+ * than escaping it. The structure tab's column list is the case that made this
+ * explicit — its 10 columns are fixed but their CONTENT is not, so a table of long
+ * column names and long defaults pushes the actions column off the right edge.
+ *
+ * overflow-y is auto as well, because the same box is what scrolls a long column list
+ * vertically; the table's sticky header is positioned against THIS box.
+ */
 .dbm-scroll { flex: 1; min-height: 0; overflow: auto; }
 .dbm-table { width: 100%; border-collapse: collapse; }
 .dbm-table th, .dbm-table td {
@@ -160,6 +172,46 @@ export const PANEL_CSS = `
 }
 .dbm-table tbody tr:hover { background: var(--dsw-alias-interactive-bg-hover); }
 .dbm-table td.dbm-mono, .dbm-mono { font-family: var(--ds-font-family-code); font-size: 12px; }
+
+/*
+ * The actions column, pinned to the RIGHT edge of the scroll box.
+ *
+ * This is what makes "操作" reachable on a table that is wider than the panel. The
+ * grid scrolls horizontally, and the actions sat at the END of the row — so reaching
+ * them meant scrolling all the way right and losing the column names off the left edge
+ * in the process. Measured on the structure tab before this: at scrollLeft 0 the
+ * actions cell's right edge was at x=1728.8 while the scroll box's was at 1568, so the
+ * buttons were 161px outside the visible area with no visual hint that they existed.
+ *
+ * It applies to .dbm-table — the structure tab's tables — as well as .dbm-data (the
+ * browse grid). It was scoped to .dbm-data alone, which is why the browse tab had a
+ * pinned column and the structure tab did not: the rule was written for the grid and
+ * silently did not match the tables one tab over.
+ *
+ * right: 0 plus an OPAQUE background is what makes a sticky cell work: without the
+ * background the scrolled columns show through it. width: 1% keeps the column to its
+ * content so it does not claim space from the data columns.
+ */
+.dbm-data th.dbm-row-actions, .dbm-data td.dbm-row-actions,
+.dbm-table th.dbm-row-actions, .dbm-table td.dbm-row-actions {
+  white-space: nowrap;
+  width: 1%;
+  position: sticky;
+  right: 0;
+  background: var(--dsw-alias-bg-base);
+}
+/* The header row's own sticky cells need to sit above the body's. */
+.dbm-data th.dbm-row-actions, .dbm-table th.dbm-row-actions { z-index: 2; }
+.dbm-data td.dbm-row-actions, .dbm-table td.dbm-row-actions { z-index: 1; }
+/* A selected row's tint must show through its pinned cells, so they inherit it. */
+.dbm-data tr[data-selected="true"] > td.dbm-row-actions {
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4c8bf5) 14%, var(--dsw-alias-bg-base));
+}
+/* A divider, because the pinned column floats over the columns it covers. */
+.dbm-data td.dbm-row-actions, .dbm-data th.dbm-row-actions,
+.dbm-table td.dbm-row-actions, .dbm-table th.dbm-row-actions {
+  border-left: 1px solid var(--dsw-alias-border-l3);
+}
 .dbm-empty {
   padding: 36px 16px;
   text-align: center;
@@ -647,9 +699,14 @@ export const PANEL_CSS = `
 /*
  * The multi-select checkbox column. It is narrow, it does not sort, and it has to
  * stay put while the rest of the row scrolls sideways — so it is sticky on the
- * left, the mirror of the sticky header row.
+ * left, the mirror of the pinned actions column on the right.
+ *
+ * Scoped to both table kinds for the same reason as the actions column: it was written
+ * for the browse grid alone, so the structure tab's checkbox column scrolled away with
+ * everything else — leaving a column of checkboxes whose row identity was off screen.
  */
-.dbm-data th.dbm-select-col, .dbm-data td.dbm-select-col {
+.dbm-data th.dbm-select-col, .dbm-data td.dbm-select-col,
+.dbm-table th.dbm-select-col, .dbm-table td.dbm-select-col {
   width: 30px;
   max-width: 30px;
   padding: 4px 6px;
@@ -658,39 +715,15 @@ export const PANEL_CSS = `
   left: 0;
   background: var(--dsw-alias-bg-base);
 }
-.dbm-data td.dbm-select-col { z-index: 0; }
-.dbm-data th.dbm-select-col { z-index: 2; }
+.dbm-data td.dbm-select-col, .dbm-table td.dbm-select-col { z-index: 0; }
+.dbm-data th.dbm-select-col, .dbm-table th.dbm-select-col { z-index: 2; }
 /* The row controls: edit / copy / delete, revealed on hover like the tree's. */
 /*
- * The actions column is pinned to the RIGHT edge of the viewport.
- *
- * The grid scrolls horizontally on a wide table, and the actions sat at the end
- * of the row — so reaching them meant scrolling all the way right, then losing the
- * row's identity off the left edge. Pinning the column keeps "which row" and "what
- * can I do to it" on screen together, which is the same reason the select column
- * is pinned left.
- *
- * 'right: 0' plus a background is what makes a sticky cell work: without an opaque
- * background the scrolled columns show through it.
+ * The pinning rules for the actions column live next to the table block above
+ * (the .dbm-table block), because they apply to the structure tab's tables as well as
+ * the browse grid — see the note there. What remains here is only what is specific to
+ * the BROWSE grid's selected row.
  */
-.dbm-data th.dbm-row-actions, .dbm-data td.dbm-row-actions {
-  white-space: nowrap;
-  width: 1%;
-  position: sticky;
-  right: 0;
-  background: var(--dsw-alias-bg-base);
-}
-/* The header row's own sticky cells need to sit above the body's. */
-.dbm-data th.dbm-row-actions { z-index: 2; }
-.dbm-data td.dbm-row-actions { z-index: 1; }
-/* A selected row's tint must show through its pinned cells, so they inherit it. */
-.dbm-data tr[data-selected="true"] > td.dbm-row-actions {
-  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4c8bf5) 14%, var(--dsw-alias-bg-base));
-}
-/* A divider, because the pinned column floats over the columns it covers. */
-.dbm-data td.dbm-row-actions, .dbm-data th.dbm-row-actions {
-  border-left: 1px solid var(--dsw-alias-border-l3);
-}
 .dbm-row-action {
   font: inherit;
   font-size: 11px;

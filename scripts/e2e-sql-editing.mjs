@@ -696,6 +696,22 @@ ${PRELUDE}
         check('each field label sits above its control', report.columnDialogShape.stacked === true, report.columnDialogShape);
 
         setInput(editorDialog.querySelector('[data-dbm-column-name]'), 'added_col');
+        /*
+         * 允许空 must now be TICKED explicitly.
+         *
+         * The add-column form is aligned with 新建表, whose 允许空 arrives UNTICKED ("允许空默认
+         * 不要选"). With it unticked the new column is NOT NULL with no default, and SQLite
+         * REFUSES to add that to a table that already holds rows ("Cannot add a NOT NULL
+         * column with default value NULL", measured) — this table is seeded with rows, so
+         * leaving it alone makes the add fail and the editor stay open.
+         *
+         * Ticking it is what a user does here, and the FORM's own behaviour around that
+         * default is asserted in scripts/e2e-structure-aligned.mjs. This script's subject
+         * is the dialog's shape and the wiring, not the default's value.
+         */
+        const nullableBox = editorDialog.querySelector('[data-dbm-column-nullable]');
+        if (nullableBox !== null && !nullableBox.checked) click(nullableBox);
+        await sleep(200);
         click(editorDialog.querySelector('[data-dbm-column-submit]'));
         await sleep(2200);
         report.afterAddColumn = (await api('/api/dsh-database/sources/' + sourceId + '/columns?table=people')).columns.map((c) => c.name);

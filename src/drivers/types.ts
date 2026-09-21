@@ -145,7 +145,36 @@ export interface ColumnSpec {
    * `ENUM('a','b')` all use the same slot and only the first is an integer.
    */
   length?: string
+  /**
+   * Where a NEW column goes: right after this existing column.
+   *
+   * MySQL's `ADD COLUMN … AFTER x` / `FIRST`. The MySQL driver renders it; the
+   * SQLite driver REJECTS it rather than ignoring it, because measured, SQLite
+   * accepts `ADD COLUMN c TEXT AFTER a` and folds `AFTER a` into the declared
+   * TYPE — the column does not move and its type name is now a string nothing
+   * else expects.
+   */
+  positionAfter?: ColumnSpecPositionAfter
 }
+
+/**
+ * The {@link ColumnSpec.positionAfter} value meaning 「放在最前面」.
+ *
+ * A shared constant rather than a magic string in two files: the browser sends
+ * it (`ColumnSpecPayload.positionAfter`) and the driver reads it, and the two
+ * have to agree on a value that cannot collide with a real column name.
+ *
+ * A NUL cannot occur in an identifier in either engine, so no column can be
+ * named this and the meaning is unambiguous.
+ */
+export const POSITION_FIRST = '\u0000first'
+
+/**
+ * Where a new column is placed, as {@link ColumnSpec.positionAfter}.
+ *
+ * A plain string (an existing column's name) or {@link POSITION_FIRST}.
+ */
+export type ColumnSpecPositionAfter = string
 
 /** A column attribute the engines treat as a keyword. */
 export type ColumnAttribute =

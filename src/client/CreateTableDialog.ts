@@ -35,6 +35,12 @@ import type { DbApi } from './api.ts'
  * A rule stated twice — once here, once there — is two places to get it wrong.
  */
 import { autoIncrementBlocker, defaultToWire, nullDefaultNeedsNullable, requiresLengthOrValues, supportsCurrentTimestamp, takesLength, type DefaultMode } from './column-defaults.ts'
+/*
+ * The grouped type list and the attribute list are SHARED with the 结构 tab's column
+ * editor, which was asked to offer the same controls. A second copy here would drift
+ * the first time either gained a type.
+ */
+import { ATTRIBUTE_ITEMS, offeredTypes, typeGroupsFor } from './table-types.ts'
 import { Modal, t } from './ui.ts'
 
 /** The index kinds a single column can be assigned to. */
@@ -75,40 +81,10 @@ interface DraftColumn {
 /**
  * Column types, GROUPED as the type dropdown presents them.
  *
- * A flat list of thirty types is hard to scan, and the choice is naturally two-step
- * ("a number, then which number"). Grouping is what was asked for.
+ * The list itself lives in `table-types.ts` so the 结构 tab's column editor offers the
+ * same one — 结构 was asked to align with this form, and one shared list is what keeps
+ * the two from drifting. `typeGroupsFor` and `offeredTypes` are used directly below.
  */
-const TYPE_GROUPS: Record<string, Array<{ label: string; types: string[] }>> = {
-  mysql: [
-    { label: 'createTable.group.integer', types: ['TINYINT', 'SMALLINT', 'MEDIUMINT', 'INT', 'BIGINT'] },
-    { label: 'createTable.group.float', types: ['FLOAT', 'DOUBLE', 'DECIMAL'] },
-    { label: 'createTable.group.string', types: ['CHAR', 'VARCHAR', 'TINYTEXT', 'TEXT', 'MEDIUMTEXT', 'LONGTEXT', 'ENUM', 'SET', 'JSON'] },
-    { label: 'createTable.group.binary', types: ['BIT', 'BINARY', 'VARBINARY', 'TINYBLOB', 'BLOB', 'MEDIUMBLOB', 'LONGBLOB'] },
-    { label: 'createTable.group.temporal', types: ['DATE', 'TIME', 'DATETIME', 'TIMESTAMP', 'YEAR'] },
-    { label: 'createTable.group.spatial', types: ['GEOMETRY', 'POINT', 'LINESTRING', 'POLYGON', 'MULTIPOINT', 'MULTILINESTRING', 'MULTIPOLYGON', 'GEOMETRYCOLLECTION'] },
-  ],
-  /*
-   * SQLite has no type system — a type name is an affinity hint — so these are the
-   * conventional names rather than an exhaustive set. Writing a length into the type
-   * (`VARCHAR(20)`) is the normal thing to do there, so a couple of those are listed.
-   */
-  sqlite: [
-    { label: 'createTable.group.integer', types: ['INTEGER', 'INT', 'TINYINT', 'SMALLINT', 'BIGINT'] },
-    { label: 'createTable.group.float', types: ['REAL', 'DOUBLE', 'FLOAT', 'NUMERIC', 'DECIMAL'] },
-    { label: 'createTable.group.string', types: ['TEXT', 'VARCHAR(255)', 'CHAR(1)', 'CLOB'] },
-    { label: 'createTable.group.binary', types: ['BLOB'] },
-    { label: 'createTable.group.temporal', types: ['DATE', 'DATETIME', 'TIMESTAMP', 'TIME'] },
-    { label: 'createTable.group.other', types: ['BOOLEAN'] },
-  ],
-}
-
-/** Column attributes, as the attribute dropdown lists them. */
-const ATTRIBUTE_ITEMS: Array<{ id: ColumnAttribute; label: string }> = [
-  { id: 'unsigned', label: 'UNSIGNED' },
-  { id: 'zerofill', label: 'ZEROFILL' },
-  { id: 'binary', label: 'BINARY' },
-  { id: 'onUpdateCurrentTimestamp', label: 'ON UPDATE CURRENT_TIMESTAMP' },
-]
 
 /** The collations offered per engine, as a starting point. */
 const COLLATIONS: Record<string, string[]> = {
@@ -515,8 +491,8 @@ export function CreateTableDialog(props: CreateTableDialogProps): React.ReactEle
 
   /** The grouped type dropdown, or the text field it swaps to, for one cell. */
   const typeCell = (column: DraftColumn, index: number): React.ReactElement => {
-    const groups = TYPE_GROUPS[kind] ?? TYPE_GROUPS.mysql!
-    const offered = groups.flatMap(group => group.types)
+    const groups = typeGroupsFor(kind)
+    const offered = offeredTypes(kind)
     const isListed = offered.includes(column.type)
     /*
      * Edit mode is VIEW state, and a blank type counts as editing.

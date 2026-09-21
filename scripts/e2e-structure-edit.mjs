@@ -315,6 +315,28 @@ ${PRELUDE}
       return field === undefined ? null : field.querySelector('input.dbm-input');
     };
 
+    /**
+     * 改这一列的类型，用**当前**的类型控件。
+     *
+     * 类型控件从「扁平下拉 + 常驻的类型文本框」改成了建表页那种**分组下拉**，文本框只在
+     * 选「自定义」时出现（见上面的类型控件断言）。所以要改类型，得从下拉里选一个列表内的
+     * 类型，而不是往文本框里打字。
+     *
+     * 返回实际用上的控件，好让调用方能在 null 上给出可读的失败。
+     */
+    const setType = (dialog, type) => {
+      const select = dialog.querySelector('[data-dbm-column-type-select]');
+      if (select !== null) {
+        const option = Array.from(select.options).find((o) => o.value === type);
+        if (option !== undefined) { setSelect(select, type); return select }
+      }
+      // 列表里没有（或已经处于自定义态）：退回文本框，它此时才是可用的那个控件。
+      const text = dialog.querySelector('[data-dbm-column-type]');
+      if (text === null) return null;
+      setInput(text, type);
+      return text;
+    };
+
     /* ---- 1. 默认值控件是「模式下拉 + 可输入」，与建表一致 ---- */
     const probe = await openEditor('plain');
     if (probe === null) return { fatal: 'could not open the editor for plain' };
@@ -359,9 +381,15 @@ ${PRELUDE}
         if (comment === null) { check('「' + column + '」的对话框里有注释字段', false); await closeDialog(); continue }
         setInput(comment, 'touched-' + column);
       } else {
-        const typeField = dialog.querySelector('[data-dbm-column-type]');
-        if (typeField === null) { check('「' + column + '」的对话框里有类型字段', false); await closeDialog(); continue }
-        setInput(typeField, 'BIGINT');
+        /*
+         * SQLite: change the type through the grouped dropdown.
+         *
+         * The type control is a LIST now (aligned with 新建表), so the change is a
+         * selection rather than typing into a text box. BIGINT is in the integer group on
+         * both engines' lists.
+         */
+        const control = setType(dialog, 'BIGINT');
+        if (control === null) { check('「' + column + '」的对话框里有类型控件', false); await closeDialog(); continue }
       }
       await sleep(200);
       const failure = await submitEditor(dialog);
