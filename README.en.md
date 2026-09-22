@@ -8,7 +8,7 @@
 
 A **database management** panel for the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) Web GUI: one "Database Manager" entry in the sidebar that opens a unified panel for **SQLite / MySQL / Redis**, plus a set of agent tools gated behind a write-protection switch.
 
-No need to leave DSH, and no need to open Navicat / RedisDesktopManager / redis-cli in parallel: browse rows, change schemas, run SQL and inspect Redis keys all in the same interface.
+No need to leave DSH, and no need to open a separate database client: browse rows, change schemas, run SQL and inspect Redis keys all in the same interface.
 
 <p align="center"><img src="docs/images/data-source-list.png" alt="Data source list" width="900"></p>
 
@@ -36,7 +36,7 @@ No need to leave DSH, and no need to open Navicat / RedisDesktopManager / redis-
 - Actions: **Test** (connectivity + latency + server version), **Connect** (open the engine panel), **Edit**, **Delete**
 - Every source carries its own **read-only** flag plus tags / group, and can be added or removed at runtime — no config file edits, no restart
 
-### MySQL / SQLite Panel (phpMyAdmin-style)
+### MySQL / SQLite Panel
 
 A schema / table tree on the left (search filter, view markers, row counts), six tabs on the right:
 
@@ -45,13 +45,13 @@ A schema / table tree on the left (search filter, view markers, row counts), six
 | **Browse** | Paging and page jump, sort by column, sort by index, column comments under the column name, table comment at the right of the paging row, double-click a cell to edit in place, row edit / copy to insert form / delete, multi-select bulk delete. Also hosts SQL result sets |
 | **Structure** | Change / drop / add columns (same controls as the create-table page), primary key editing, unique constraints, index management, distinct-value counts; the action column is pinned to the far right |
 | **SQL** | Editor, Ctrl+Enter to run; SELECT results land on the Browse tab |
-| **Search** | phpMyAdmin-style query by example (QBE): one row per column, only rows with a value take part, conditions are ANDed |
+| **Search** | Query by example (QBE): one row per column, only rows with a value take part, conditions are ANDed |
 | **Insert** | Controls chosen per column type; "number of rows to insert" generates several independent forms submitted in one transaction |
-| **Operations** | Modelled on the phpMyAdmin operations page: move table / table options / copy table / table maintenance / delete data or table |
+| **Operations** | Move table / table options / copy table / table maintenance / delete data or table |
 
 There is also **import / export**: SQL dump (structure / data / DROP optional, whole database or a single table) and CSV (current table), both performed in the browser.
 
-### Redis Panel (RedisDesktopManager-style)
+### Redis Panel
 
 A **key tree** on the left, three tabs on the right:
 
@@ -107,11 +107,41 @@ Two classes of dangerous operation on large tables state their cost before you c
 
 All three source kinds in one place: kind, name, host, user, authentication and tags visible at a glance, with Test / Connect / Edit / Delete per row. The two write-protection switches sit at the bottom of the panel.
 
-### SQL panel
+### Database list and database operations
 
-<p align="center"><img src="docs/images/sql-panel.png" alt="SQL panel" width="900"></p>
+<p align="center"><img src="docs/images/sql-databases.png" alt="Database list and database operations" width="900"></p>
 
-The schema / table tree on the left, the table list and database operations on the right (export database, import into database, rename, copy database, charset, create table). Opening a table reveals six tabs: Browse / Structure / SQL / Search / Insert / Operations.
+The schema / table tree on the left, the table list and database operations on the right (export database, import into database, rename, copy database, charset, create table).
+
+### Browsing data
+
+<p align="center"><img src="docs/images/sql-browse.png" alt="Browsing data" width="900"></p>
+
+Paging and page jump, sort by index, double-click a cell to edit in place, with edit / copy / delete at the end of each row. Column comments sit under the column name, the table comment at the right of the paging row.
+
+### Table structure
+
+<p align="center"><img src="docs/images/sql-structure.png" alt="Table structure" width="900"></p>
+
+Column attributes at a glance (type, nullable, key, default, extra, distinct-value count, comment) with the action column pinned to the far right; indexes are listed below.
+
+### Inserting data
+
+<p align="center"><img src="docs/images/sql-insert.png" alt="Inserting data" width="900"></p>
+
+One row per column, controls chosen by column type. Auto-increment columns are marked "auto-generated when left blank", `datetime` gets a date picker, `enum` a member dropdown, long text a multi-line box with an "empty string" checkbox.
+
+### Searching data
+
+<p align="center"><img src="docs/images/sql-search.png" alt="Searching data" width="900"></p>
+
+Query by example: the header is field / type / collation / operator / value with **one row per column**, only rows with a value take part, and conditions are ANDed. `Execute` and `Clear conditions` stick to the bottom of the viewport.
+
+### Table operations
+
+<p align="center"><img src="docs/images/sql-operations.png" alt="Table operations" width="900"></p>
+
+Move table / table options / copy table / table maintenance / delete data or table — five blocks in order.
 
 ### Redis panel
 
@@ -274,7 +304,7 @@ The E2E scripts (`scripts/e2e-*.mjs`) assert interface **behaviour** rather than
 
 ## Scope and Limitations
 
-This panel is positioned as a **lightweight panel for day-to-day data browsing, schema changes and SQL**, not a MySQL server management suite. What it deliberately does **not** do, compared with phpMyAdmin:
+This panel is positioned as a **lightweight panel for day-to-day data browsing, schema changes and SQL**, not a MySQL server management suite. It deliberately does **not** do:
 
 - User and privilege management (creating users, grants, password changes, account locking)
 - Server status, processes, variables, charsets, engines, plugins, binary log, replication
@@ -284,8 +314,6 @@ This panel is positioned as a **lightweight panel for day-to-day data browsing, 
 - Export covers only SQL dumps and CSV (no compression, no result-set export, single-table truncation at 200k rows)
 - The SQL tab runs one statement at a time, with no syntax highlighting / autocomplete / formatting, and no query history or bookmarks
 - The Structure tab's index path supports primary / unique / index only and **cannot create FULLTEXT or SPATIAL indexes** (the create-table page can)
-
-A feature-by-feature comparison against phpMyAdmin 5.2.3 exists, covering browse / structure / insert / SQL / search / import-export / database operations / users and privileges / everything else, along with the capabilities this panel has that phpMyAdmin lacks. It is an internal research record and is not published with this repository.
 
 ## License
 
