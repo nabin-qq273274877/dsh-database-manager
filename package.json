@@ -42,6 +42,7 @@
   "files": [
     "lib",
     "src",
+    "docs",
     "cordis.patch.yml",
     "README.md",
     "README.en.md",
