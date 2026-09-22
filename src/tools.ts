@@ -17,7 +17,7 @@ import { summarize } from './store.ts'
 import { isRedisDriver, isSqlDriver } from './drivers/types.ts'
 import { isRedisReadCommand } from './drivers/redis.ts'
 import { looksReadOnly } from './sql-util.ts'
-import type { DataSourceSummary, QueryResult } from './protocol.ts'
+import type { DataSourceSummary, QueryResult, ColumnInfo, IndexInfo } from './protocol.ts'
 
 /** One text content block (the only render shape these tools emit). */
 function text(value: string): ContentBlock[] {
@@ -176,10 +176,15 @@ export function makeTools(
                 user: { type: 'string' },
                 database: { type: 'string' },
                 db: { type: 'integer' },
+                tls: { type: 'boolean' },
+                connectTimeoutMs: { type: 'integer' },
+                hasPassword: { type: 'boolean', required: true },
                 auth: { type: 'string', required: true },
                 tags: { type: 'array', items: { type: 'string' }, required: true },
                 readonly: { type: 'boolean', required: true },
                 description: { type: 'string', required: true },
+                createdAt: { type: 'integer', required: true },
+                updatedAt: { type: 'integer', required: true },
               },
             },
           },
@@ -196,7 +201,7 @@ export function makeTools(
             [source.id, source.name, source.group, source.host ?? '', source.file ?? '', source.tags.join(' ')]
               .some(field => field.toLowerCase().includes(term)),
           )
-      return { sources }
+      return { sources: sources.map(shapeSource) }
     },
   })
 
@@ -246,6 +251,11 @@ export function makeTools(
                 defaultValue: { type: 'string' },
                 extra: { type: 'string' },
                 comment: { type: 'string' },
+                primaryKeyPosition: { type: 'integer' },
+                options: { type: 'array', items: { type: 'string' } },
+                generated: { type: 'boolean' },
+                generatedExpression: { type: 'string' },
+                collation: { type: 'string' },
               },
             },
           },
@@ -258,6 +268,8 @@ export function makeTools(
                 name: { type: 'string', required: true },
                 unique: { type: 'boolean', required: true },
                 columns: { type: 'array', items: { type: 'string' }, required: true },
+                type: { type: 'string' },
+                primary: { type: 'boolean' },
               },
             },
           },
@@ -294,16 +306,30 @@ export function makeTools(
     async execute(args: { source: string; schema?: string; table?: string }) {
       const { driver, summary } = driverOf(args.source)
 
+      // Rebuild the exact declared shape at every return point. The drivers hand
+      // back richer objects than the schema declares (see shapeColumnInfo), and
+      // the host rejects — rather than trims — an undeclared key, so a missing
+      // projection turns a useful answer into INVALID_TOOL_OUTPUT.
+      const project = (value: object): object => ({
+        ...value,
+        ...(Object.hasOwn(value, 'columns')
+          ? { columns: (value as { columns: ColumnInfo[] }).columns.map(shapeColumnInfo) }
+          : {}),
+        ...(Object.hasOwn(value, 'indexes')
+          ? { indexes: (value as { indexes: IndexInfo[] }).indexes.map(shapeIndexInfo) }
+          : {}),
+      })
+
       if (isRedisDriver(driver)) {
         const info = await driver.info()
         const redisDatabases = info.databases.map(item => ({ db: item.db, keys: item.keys }))
-        return {
+        return project({
           kind: summary.kind,
           schemas: [],
           tables: [],
           redisDatabases,
           tablesRendered: redisDatabases.length === 0 ? 'no databases hold keys' : redisDatabases.map(item => `db${item.db}: ${item.keys} keys`).join('\n'),
-        }
+        })
       }
       if (!isSqlDriver(driver)) throw new Error('unsupported data source kind')
 
@@ -326,7 +352,7 @@ export function makeTools(
           driver.columns(schema, tableName),
           driver.indexes(schema, tableName).catch(() => []),
         ])
-        return {
+        return project({
           kind: summary.kind,
           schemas,
           tables: [],
@@ -337,13 +363,13 @@ export function makeTools(
           indexesRendered: indexes.length === 0
             ? 'no indexes'
             : indexes.map(index => `${index.name}${index.unique ? ' (unique)' : ''}: ${index.columns.join(', ')}`).join('\n'),
-        }
+        })
       }
 
       // No schema named: for MySQL the useful answer is the database list
       // itself, since each one would need its own round trip to enumerate.
       if (schema === undefined) {
-        return {
+        return project({
           kind: summary.kind,
           schemas,
           tables: [],
@@ -351,11 +377,11 @@ export function makeTools(
             schemas.length === 0
               ? 'no databases visible to this user'
               : `databases (pass "schema" to list one's tables):\n${schemas.join('\n')}`,
-        }
+        })
       }
 
       const tables = await driver.tables(schema)
-      return {
+      return project({
         kind: summary.kind,
         schemas,
         tables: tables.map(table => ({
@@ -365,7 +391,7 @@ export function makeTools(
           ...(table.comment === undefined ? {} : { comment: table.comment }),
         })),
         tablesRendered: `schema ${schema}:\n${renderTables(tables)}`,
-      }
+      })
     },
   })
 
@@ -489,4 +515,98 @@ function shape(result: QueryResult): {
 /** Render one data source summary line (used by the connect tool's output). */
 export function renderSourceLine(source: DataSourceSummary): string {
   return `${source.id} [${source.kind}] ${source.name}${source.readonly ? ' (readonly)' : ''}`
+}
+
+/**
+ * Project a data source onto the `db_list` output shape.
+ *
+ * The host validates every tool's return value against its declared schema, and
+ * `additionalProperties: false` makes an undeclared key a hard failure rather
+ * than an ignored extra: the whole call dies before the model sees any of it.
+ * `summarize()` carries presentation-only fields the schema deliberately does
+ * not declare (`connectTimeoutMs`, `database`), so the tool must project rather
+ * than pass the summary through — returning the summary verbatim failed every
+ * `db_list` call with "is not a declared property".
+ *
+ * The projection and the schema have to move together: a field declared
+ * `required` but not returned here fails the same validation from the other
+ * side ("missing required property"), which is exactly how this was caught.
+ */
+function shapeSource(source: DataSourceSummary): {
+  id: string
+  kind: DataSourceSummary['kind']
+  name: string
+  group: string
+  host?: string
+  port?: number
+  file?: string
+  user?: string
+  database?: string
+  db?: number
+  tls?: boolean
+  hasPassword: boolean
+  auth: DataSourceSummary['auth']
+  tags: string[]
+  readonly: boolean
+  description: string
+  createdAt: number
+  updatedAt: number
+} {
+  return {
+    id: source.id,
+    kind: source.kind,
+    name: source.name,
+    group: source.group,
+    ...(source.host === undefined ? {} : { host: source.host }),
+    ...(source.port === undefined ? {} : { port: source.port }),
+    ...(source.file === undefined ? {} : { file: source.file }),
+    ...(source.user === undefined ? {} : { user: source.user }),
+    ...(source.db === undefined ? {} : { db: source.db }),
+    ...(source.tls === undefined ? {} : { tls: source.tls }),
+    hasPassword: source.hasPassword,
+    auth: source.auth,
+    tags: [...source.tags],
+    readonly: source.readonly,
+    description: source.description,
+    createdAt: source.createdAt,
+    updatedAt: source.updatedAt,
+  }
+}
+
+/**
+ * Project a column onto the `db_schema` column shape.
+ *
+ * `ColumnInfo` carries more than the schema declares (`primaryKeyPosition`,
+ * `options`, `generated`, `generatedExpression`, `collation`), and the drivers
+ * hand those straight through. The schema declares all of them, so this only
+ * has to drop undefined keys — but it still rebuilds the object explicitly so a
+ * future field added to `ColumnInfo` cannot silently break every `db_schema`
+ * call the way it broke `db_list`.
+ */
+function shapeColumnInfo(column: ColumnInfo): Record<string, unknown> {
+  return {
+    name: column.name,
+    type: column.type,
+    nullable: column.nullable,
+    key: column.key,
+    ...(column.defaultValue === undefined ? {} : { defaultValue: column.defaultValue }),
+    ...(column.extra === undefined ? {} : { extra: column.extra }),
+    ...(column.comment === undefined ? {} : { comment: column.comment }),
+    ...(column.primaryKeyPosition === undefined ? {} : { primaryKeyPosition: column.primaryKeyPosition }),
+    ...(column.options === undefined ? {} : { options: [...column.options] }),
+    ...(column.generated === undefined ? {} : { generated: column.generated }),
+    ...(column.generatedExpression === undefined ? {} : { generatedExpression: column.generatedExpression }),
+    ...(column.collation === undefined ? {} : { collation: column.collation }),
+  }
+}
+
+/** Project an index onto the `db_schema` index shape (drops nothing today; see shapeColumnInfo). */
+function shapeIndexInfo(index: IndexInfo): Record<string, unknown> {
+  return {
+    name: index.name,
+    unique: index.unique,
+    columns: [...index.columns],
+    ...(index.type === undefined ? {} : { type: index.type }),
+    ...(index.primary === undefined ? {} : { primary: index.primary }),
+  }
 }
