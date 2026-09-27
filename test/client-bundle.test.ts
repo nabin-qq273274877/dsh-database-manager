@@ -298,6 +298,9 @@ describe('built client half', () => {
     expect(rule).toMatch(/width: var\(--dbm-entry-size, 16px\)/)
     expect(rule).toMatch(/height: var\(--dbm-entry-size, 16px\)/)
     expect(rule).not.toMatch(/margin:/)
+    // Vertical rhythm: the shell's own list adds a 4px gap the SSH entry (which
+    // sits outside that list) does not have, so this row is pulled up by it.
+    expect(css).toContain("button[class*='panelRow']:has(.dbm-entry-glyph) { margin-top: -4px; }")
   })
 
   it('registers both locale dictionaries with matching key sets', () => {

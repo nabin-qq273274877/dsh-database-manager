@@ -57,6 +57,18 @@ export const PANEL_CSS = `
 }
 .dbm-entry-glyph > svg { display: block; }
 
+/*
+ * Row spacing. The shell renders its own entries inside one flex column that
+ * carries gap 4px, while the SSH plugin injects its entry outside that column —
+ * measured from the live UI, the SSH/插件 pair sits about 4px closer together
+ * than 插件/数据库管理 does. Pulling this row up by exactly that gap makes the
+ * three entries read as one evenly spaced menu.
+ *
+ * The row element belongs to the shell, so it is matched through this plugin's
+ * glyph with :has() — the shell's hashed class names are not a stable hook.
+ */
+button[class*='panelRow']:has(.dbm-entry-glyph) { margin-top: -4px; }
+
 /* ---- header ------------------------------------------------------------ */
 /*
  * Deliberately close to the SSH panel's header (its .panelHeader/.panelTitle):
