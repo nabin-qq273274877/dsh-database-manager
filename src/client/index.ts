@@ -65,18 +65,36 @@ const SIBLING_HTML_ATTRIBUTES = { ssh: 'data-dsh-ssh-active', taskboard: 'data-d
 const SIDEBAR_ROW_SELECTOR =
   '[class*="sessionRow"], [class*="projectRow"], [class*="searchResultRow"], [class*="searchResultWorkspace"], [class*="newSession"]'
 
-/** Sidebar glyph: a stacked-database mark at the size the SSH entry uses. */
-const ICON =
-  '<svg viewBox="0 0 16 16" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.4" ' +
-  'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-  '<ellipse cx="8" cy="3.6" rx="5.1" ry="2.1"/>' +
-  '<path d="M2.9 3.6v8.8c0 1.16 2.28 2.1 5.1 2.1s5.1-.94 5.1-2.1V3.6"/>' +
-  '<path d="M2.9 8c0 1.16 2.28 2.1 5.1 2.1s5.1-.94 5.1-2.1"/>' +
+/**
+ * Edge length assumed when the shell does not hand one over.
+ *
+ * The shell gives every `sidebar.panellist` icon component the same `size` prop
+ * and renders its own rows (插件, 任务) at exactly that edge, so 16 is the value
+ * the shell's own entries use and the one that keeps this glyph in the column.
+ */
+const GLYPH_SIZE_FALLBACK = 16
+
+/**
+ * Sidebar glyph: a stacked-database mark, drawn at the edge the shell asked for.
+ *
+ * The size is a parameter rather than a constant because the glyph box width is
+ * what fixes the label's x: an 18px mark inside a 24px box (the earlier
+ * geometry) pushed both the icon and the label ~6px/12px right of every other
+ * sidebar row. Drawing at the shell's own edge keeps this row on the same
+ * column — see the `.dbm-entry-glyph` rule in styles.ts for the measurement.
+ */
+const ICON = (size: number): string =>
+  '<svg viewBox="0 0 16 16" width="' + size + '" height="' + size + '" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<ellipse cx="8" cy="3.3" rx="6.4" ry="2.3"/>' +
+  '<path d="M1.6 3.3v9.4c0 1.27 2.87 2.3 6.4 2.3s6.4-1.03 6.4-2.3V3.3"/>' +
+  '<path d="M1.6 8.1c0 1.27 2.87 2.3 6.4 2.3s6.4-1.03 6.4-2.3"/>' +
   '</svg>'
 
-// The glyph's box geometry (24px, SSH's sizing, plus the 2px per side the
-// shell's narrower row padding lacks) lives in the `.dbm-entry-glyph` rule of
-// styles.ts, where the measured reasoning is recorded.
+// The glyph's box geometry lives in the `.dbm-entry-glyph` rule of styles.ts,
+// where the measured reasoning is recorded. The edge length reaches that rule
+// as the `--dbm-entry-size` custom property rather than as an inline width, so
+// the geometry stays in one place and a user stylesheet can still override it.
 
 /**
  * Services this plugin hard-depends on. `layout` is a genuine dependency: the
@@ -154,13 +172,17 @@ export function apply(ctx: unknown): void {
             order: 20,
             label: () => labelOf(context, 'entry.label', '数据库管理'),
           },
-          (props: { size: number; active: boolean }) =>
-            React.createElement('span', {
+          (props: { size?: number; active?: boolean }) => {
+            const size =
+              typeof props.size === 'number' && props.size > 0 ? props.size : GLYPH_SIZE_FALLBACK
+            return React.createElement('span', {
               className: 'dbm-entry-glyph',
+              style: { '--dbm-entry-size': size + 'px' },
               [ENTRY_GLYPH_ATTRIBUTE]: ENTRY_ID,
-              'data-size': String(props.size),
-              dangerouslySetInnerHTML: { __html: ICON },
-            }),
+              'data-size': String(size),
+              dangerouslySetInnerHTML: { __html: ICON(size) },
+            })
+          },
         ),
       )
     } catch (failure) {

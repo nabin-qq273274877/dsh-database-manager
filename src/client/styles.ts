@@ -31,21 +31,28 @@ export const PANEL_CSS = `
 
 /* ---- sidebar entry glyph ------------------------------------------------ */
 /*
- * The shell lays this row out with padding 7px 8px and gap 8px, while the SSH
- * plugin's own injected row uses padding 0 10px and gap 10px around a 24px icon
- * box. Measured in a real browser, the shell's row started its glyph 5px left of
- * SSH's and 8px left of its label. This box adopts SSH's 24px geometry and adds
- * the 2px per side the shell's smaller padding lacks, so the glyph and the label
- * both land on the same x as the SSH entry.
+ * The shell renders every sidebar.panellist row with the same box model
+ * (.panelRow: margin 0 2px, padding 7px 8px, gap 8px, plus a .panelGlyph
+ * wrapper around the icon component), and hands each icon component the same
+ * size. Its own rows therefore start the glyph at row + 10px and the label at
+ * row + 10 + size + 8.
+ *
+ * An earlier version drew this glyph 18px wide inside a 24px box with a 2px
+ * margin on each side. Measured against the 插件 row in a real browser, that
+ * put the mark about 6px right of the others and the label about 12px right —
+ * the box, not the drawing, is what fixes the label's x. The box now takes the
+ * edge length the shell handed over (the --dbm-entry-size custom property,
+ * defaulting to the 16px the shell's own entries use), so icon and label land
+ * on the column every other row uses, in both the expanded and the collapsed
+ * rail.
  */
 .dbm-entry-glyph {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   box-sizing: border-box;
-  width: 24px;
-  height: 24px;
-  margin: 0 2px;
+  width: var(--dbm-entry-size, 16px);
+  height: var(--dbm-entry-size, 16px);
   flex: none;
 }
 .dbm-entry-glyph > svg { display: block; }

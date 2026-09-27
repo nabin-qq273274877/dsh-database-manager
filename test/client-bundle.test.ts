@@ -286,16 +286,18 @@ describe('built client half', () => {
     expect(style.css).toMatch(/var\(--dsw-alias-/)
   })
 
-  it('carries the sidebar-entry alignment rule measured against the SSH row', () => {
+  it('carries the sidebar-entry alignment rule measured against the shell rows', () => {
     const loaded = load()
     const css = loaded.styles[0]!.css
-    // The 24px box plus 2px per side is what makes the glyph and label land on
-    // the same x as the SSH entry, whose row uses wider padding than the shell's
-    // panel row.
+    // The glyph box takes the edge length the shell handed over, so this row's
+    // mark and label land on the same x as the shell's own rows (插件/任务),
+    // which render their icon component at that same edge inside the same
+    // .panelGlyph wrapper. No extra margin: the shell's panelRow already
+    // contributes one.
     const rule = /\.dbm-entry-glyph \{[^}]*\}/.exec(css)?.[0] ?? ''
-    expect(rule).toMatch(/width: 24px/)
-    expect(rule).toMatch(/height: 24px/)
-    expect(rule).toMatch(/margin: 0 2px/)
+    expect(rule).toMatch(/width: var\(--dbm-entry-size, 16px\)/)
+    expect(rule).toMatch(/height: var\(--dbm-entry-size, 16px\)/)
+    expect(rule).not.toMatch(/margin:/)
   })
 
   it('registers both locale dictionaries with matching key sets', () => {
@@ -327,17 +329,31 @@ describe('built client half', () => {
     expect(loaded.styles).toHaveLength(1)
   })
 
-  it('renders the entry glyph as a 24px box holding the 18px svg', () => {
+  it('renders the entry glyph as a box at the edge the shell asked for', () => {
     const loaded = load({ render: false })
     const entry = loaded.registered.find(item => item.slot === 'sidebar.panellist')!
     const element = (entry.component as (props: unknown) => { props: Record<string, unknown> })({ size: 16, active: false })
-    // The glyph carries its own class rather than an inline size, so the
+    // The glyph carries its own class rather than an inline width, so the
     // measured geometry lives in one place (styles.ts) and user CSS can
-    // override it.
+    // override it. The edge length travels as a custom property.
     expect(element.props['className']).toBe('dbm-entry-glyph')
+    expect((element.props['style'] as Record<string, string>)['--dbm-entry-size']).toBe('16px')
     const html = element.props['dangerouslySetInnerHTML'] as { __html: string }
-    expect(html.__html).toContain('width="18"')
-    expect(html.__html).toContain('height="18"')
+    expect(html.__html).toContain('width="16"')
+    expect(html.__html).toContain('height="16"')
+  })
+
+  it('draws the glyph at whatever edge a future shell hands over', () => {
+    const loaded = load({ render: false })
+    const entry = loaded.registered.find(item => item.slot === 'sidebar.panellist')!
+    const element = (entry.component as (props: unknown) => { props: Record<string, unknown> })({ size: 20, active: false })
+    // Box and drawing must move together, or the label drifts off the column
+    // again — the failure this rule exists to prevent.
+    expect((element.props['style'] as Record<string, string>)['--dbm-entry-size']).toBe('20px')
+    expect(element.props['data-size']).toBe('20')
+    const html = element.props['dangerouslySetInnerHTML'] as { __html: string }
+    expect(html.__html).toContain('width="20"')
+    expect(html.__html).toContain('height="20"')
   })
 
   it('subscribes the document listeners the centre-column arbitration needs', () => {
