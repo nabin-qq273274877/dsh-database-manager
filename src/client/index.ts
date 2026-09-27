@@ -82,13 +82,17 @@ const GLYPH_SIZE_FALLBACK = 16
  * geometry) pushed both the icon and the label ~6px/12px right of every other
  * sidebar row. Drawing at the shell's own edge keeps this row on the same
  * column — see the `.dbm-entry-glyph` rule in styles.ts for the measurement.
+ *
+ * The mark fills its 16-unit viewBox on purpose: the shell's own entries are
+ * iconify glyphs whose ink reaches the edges, so a smaller drawing reads as an
+ * icon with padding above and below it even when the box is the right size.
  */
 const ICON = (size: number): string =>
   '<svg viewBox="0 0 16 16" width="' + size + '" height="' + size + '" fill="none" stroke="currentColor" ' +
   'stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-  '<ellipse cx="8" cy="3.3" rx="6.4" ry="2.3"/>' +
-  '<path d="M1.6 3.3v9.4c0 1.27 2.87 2.3 6.4 2.3s6.4-1.03 6.4-2.3V3.3"/>' +
-  '<path d="M1.6 8.1c0 1.27 2.87 2.3 6.4 2.3s6.4-1.03 6.4-2.3"/>' +
+  '<ellipse cx="8" cy="3.5" rx="6.6" ry="2.35"/>' +
+  '<path d="M1.4 3.5v9.15c0 1.3 2.96 2.35 6.6 2.35s6.6-1.05 6.6-2.35V3.5"/>' +
+  '<path d="M1.4 8.25c0 1.3 2.96 2.35 6.6 2.35s6.6-1.05 6.6-2.35"/>' +
   '</svg>'
 
 // The glyph's box geometry lives in the `.dbm-entry-glyph` rule of styles.ts,
