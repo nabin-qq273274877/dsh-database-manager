@@ -631,32 +631,27 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
         'td',
         {
           className: 'dbm-mono',
-          // The comment as a TOOLTIP on the name as well as a line under it: a very long
-          // comment is clamped to two lines, and the title is what makes the rest
-          // readable without widening the column.
+          /*
+           * The column's COMMENT, as a TOOLTIP on the name.
+           *
+           * Reported: 表结构页看不到注释 — the 注释 column exists, but it is the eighth one, so
+           * on a wide table it is scrolled off at exactly the moment the comment is what tells
+           * `is_del` from `c_type` apart.
+           *
+           * This cell briefly carried the comment as a second line as well, copying the 浏览
+           * grid's header. It was dropped on the user's call: this tab already HAS a comment
+           * column, so the repetition bought nothing and cost every row a second line of
+           * height — it doubled the table on a commented schema. The tooltip is what makes the
+           * value reachable without scrolling to that column.
+           *
+           * Absent when the engine reports none: SQLite has no column comments at all, and
+           * MySQL reports an absent one as the empty string. An empty title would still pop an
+           * empty tooltip box, which reads as a rendering bug.
+           */
           ...(commentText(column) === '' ? {} : { title: commentText(column) }),
           'data-dbm-col-name': column.name,
         },
         column.name,
-        /*
-         * The column's COMMENT, under its name — the same layout the 浏览 grid's header
-         * uses.
-         *
-         * Reported: 表结构页看不到注释. The 注释 column exists, but it is the eighth one,
-         * so on a wide table it is scrolled off screen at exactly the moment the comment
-         * is what tells `is_del` from `c_type`. phpMyAdmin puts it under the name, and
-         * this tab already has a whole column for the editable value.
-         *
-         * Absent when the engine reports none: SQLite has no column comments at all, and
-         * MySQL reports an absent one as the empty string.
-         */
-        commentText(column) === ''
-          ? null
-          : React.createElement(
-              'div',
-              { className: 'dbm-col-comment', 'data-dbm-col-comment': column.name },
-              commentText(column),
-            ),
       ),
       React.createElement('td', { className: 'dbm-mono' }, column.type === '' ? t('common.none') : column.type),
       React.createElement('td', null, column.nullable ? t('common.yes') : t('common.no')),

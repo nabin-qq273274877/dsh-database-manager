@@ -2248,15 +2248,25 @@ function DatabaseSqlView(props: {
         React.createElement('span', { className: 'dbm-hint' }, t('sql.allowWrite.hint')),
       ),
       message === undefined ? null : React.createElement('div', { className: 'dbm-hint', 'data-dbm-db-sql-message': '' }, message),
+      /*
+       * The result heading, inside the editor block rather than with the grid.
+       *
+       * Reported: 库级 SQL 查询结果过长没有滚动条，下面的看不了. The grid had been nested in a
+       * `dbm-pad` wrapper together with this line, and `dbm-pad` neither grows nor bounds its
+       * children — so the grid was laid out at its full content height, overflowed the pane,
+       * and was simply clipped, with nothing to scroll.
+       *
+       * `SqlResultGrid` renders `dbm-data`, which is `flex: 1; min-height: 0; overflow: auto`
+       * precisely so that it scrolls when it is a DIRECT child of a `dbm-tab-body` column. It
+       * is one now, exactly like the result page the 表级 SQL tab hands to 浏览. Anything
+       * added between the two must not break that chain of flex sizing.
+       */
+      result === undefined
+        ? null
+        : React.createElement('div', { className: 'dbm-hint dbm-mono', 'data-dbm-db-sql-heading': '' },
+            t('sql.resultFrom', { schema, n: result.rows.length })),
     ),
-    result === undefined
-      ? null
-      : React.createElement(
-          'div',
-          { className: 'dbm-pad', style: { paddingTop: 0 } },
-          React.createElement('div', { className: 'dbm-hint dbm-mono' }, `${t('sql.resultFrom', { schema, n: result.rows.length })}`),
-          React.createElement(SqlResultGrid, { result }),
-        ),
+    result === undefined ? null : React.createElement(SqlResultGrid, { result }),
   )
 }
 

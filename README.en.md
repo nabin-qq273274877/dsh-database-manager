@@ -43,7 +43,7 @@ A schema / table tree on the left (search filter, view markers, row counts), six
 | Tab | What it does |
 | --- | --- |
 | **Browse** | Paging and page jump, sort by column, sort by index, column comments under the column name, table comment at the right of the paging row, double-click a cell to edit in place, row edit / copy to insert form / delete, multi-select bulk delete. Also hosts SQL result sets |
-| **Structure** | Change / drop / add columns (same controls as the create-table page), primary key editing, unique constraints, index management, distinct-value counts; **a column's comment is shown under its name as well** (clipped when long, full text on hover), and the comment column itself stays; the action column is pinned to the far right |
+| **Structure** | Change / drop / add columns (same controls as the create-table page), primary key editing, unique constraints, index management, distinct-value counts; the comment is carried by the **Comment column**, and **hovering a column name shows its full text** (that column scrolls out of view on a wide table); the action column is pinned to the far right |
 | **SQL** | Editor, Ctrl+Enter to run; SELECT results land on the Browse tab |
 | **Search** | Query by example (QBE): one row per column, only rows with a value take part, conditions are ANDed |
 | **Insert** | Controls chosen per column type; "number of rows to insert" generates several independent forms submitted in one transaction |
@@ -53,7 +53,7 @@ There is also **import / export**: SQL dump (structure / data / DROP optional, w
 
 The **table list page** you get by clicking a database name carries two permanent control rows at the top: **Database actions** (export database / import into this database / **SQL** / rename / copy / character set / drop database) and the table filter with **New table**. Both rows are **clickable before the table list has been read** — the busy state occupies only the table region below. On a database with many tables the names appear first and the row counts and sizes fill in afterwards (shown as `…` while pending, which is deliberately distinct from "unknown", the engine genuinely not reporting one).
 
-**Database-level SQL** (the `SQL` button in the database actions row, phpMyAdmin's database-page equivalent) runs statements against this database in a full-page editor; the schema travels with each statement, so no `USE` is needed. Statements that act on the DATABASE rather than a table — `CREATE TABLE`, `SHOW TABLES`, `ALTER DATABASE` — are run here (the table-level SQL tab is reached from a table, so there was nowhere to type a `CREATE TABLE`). A result set is rendered in place with the same read-only grid, and a write re-reads the table list and its statistics.
+**Database-level SQL** (the `SQL` button in the database actions row, phpMyAdmin's database-page equivalent) runs statements against this database in a full-page editor; the schema travels with each statement, so no `USE` is needed. Statements that act on the DATABASE rather than a table — `CREATE TABLE`, `SHOW TABLES`, `ALTER DATABASE` — are run here (the table-level SQL tab is reached from a table, so there was nowhere to type a `CREATE TABLE`). A result set is rendered in place with the same read-only grid, which scrolls in both directions when it is long, and a write re-reads the table list and its statistics.
 
 ### Redis Panel
 
@@ -127,7 +127,7 @@ Paging and page jump, sort by index, double-click a cell to edit in place, with 
 
 <p align="center"><img src="docs/images/sql-structure.png" alt="Table structure" width="900"></p>
 
-Column attributes at a glance (type, nullable, key, default, extra, distinct-value count, comment) with the action column pinned to the far right, and **each column's comment repeated under its name** (hover for the full text); indexes are listed below.
+Column attributes at a glance (type, nullable, key, default, extra, distinct-value count, comment) with the action column pinned to the far right; **hovering a column name shows its comment in full** (the Comment column itself scrolls out of view on a wide table). Indexes are listed below.
 
 ### Inserting data
 
