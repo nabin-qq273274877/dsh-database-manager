@@ -560,6 +560,14 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
     return column.key === '' ? t('common.none') : column.key
   }
 
+  /**
+   * A column's comment as display text, never undefined.
+   *
+   * The engines report "no comment" two ways — SQLite omits the field, MySQL sends the
+   * empty string — and both must render as nothing at all rather than as an empty line.
+   */
+  const commentText = (column: ColumnInfo): string => column.comment ?? ''
+
   const header = React.createElement(
     'tr',
     null,
@@ -619,7 +627,37 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
             })
           },
         })),
-      React.createElement('td', { className: 'dbm-mono' }, column.name),
+      React.createElement(
+        'td',
+        {
+          className: 'dbm-mono',
+          // The comment as a TOOLTIP on the name as well as a line under it: a very long
+          // comment is clamped to two lines, and the title is what makes the rest
+          // readable without widening the column.
+          ...(commentText(column) === '' ? {} : { title: commentText(column) }),
+          'data-dbm-col-name': column.name,
+        },
+        column.name,
+        /*
+         * The column's COMMENT, under its name — the same layout the 浏览 grid's header
+         * uses.
+         *
+         * Reported: 表结构页看不到注释. The 注释 column exists, but it is the eighth one,
+         * so on a wide table it is scrolled off screen at exactly the moment the comment
+         * is what tells `is_del` from `c_type`. phpMyAdmin puts it under the name, and
+         * this tab already has a whole column for the editable value.
+         *
+         * Absent when the engine reports none: SQLite has no column comments at all, and
+         * MySQL reports an absent one as the empty string.
+         */
+        commentText(column) === ''
+          ? null
+          : React.createElement(
+              'div',
+              { className: 'dbm-col-comment', 'data-dbm-col-comment': column.name },
+              commentText(column),
+            ),
+      ),
       React.createElement('td', { className: 'dbm-mono' }, column.type === '' ? t('common.none') : column.type),
       React.createElement('td', null, column.nullable ? t('common.yes') : t('common.no')),
       React.createElement(

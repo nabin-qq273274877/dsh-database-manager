@@ -1485,4 +1485,24 @@ textarea.dbm-cell-input {
  * success line look like two unrelated fragments.
  */
 .dbm-ok { color: #1a8a4a; font-size: 12px; display: block; }
+/*
+ * The 导出 / 导入 dialog's completion banner.
+ *
+ * Reported: 导出完成了但浮窗还在，不知道有没有成功. The outcome line existed but sat at the
+ * BOTTOM of the dialog body, under four form controls, at the same weight as the hint text
+ * around it — so it read as more help text rather than as an answer. The banner is boxed
+ * and moved to the top of the body (see SqlTransferDialogs) so the first thing in the
+ * dialog after a run is what happened.
+ *
+ * color-mix rather than fixed hex fills, matching the sidebar's own treatment: the panel
+ * is used in both light and dark themes, and a hard-coded pale green is unreadable on one
+ * of them.
+ */
+.dbm-export-done, .dbm-import-done {
+  margin-bottom: 10px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, #1a8a4a 35%, transparent);
+  background: color-mix(in srgb, #1a8a4a 10%, transparent);
+}
 `

@@ -125,23 +125,70 @@ export function ExportDialog(props: ExportDialogProps): React.ReactElement {
       control as never,
     )
 
+  /*
+   * The finished state.
+   *
+   * Reported: 导出完成了，但浮窗还在，不知道有没有成功. Both halves were true — the dialog
+   * stayed open (it must: it carries the truncation warning) and the only feedback was a
+   * small line at the BOTTOM of the body, under the form, while the primary button still
+   * said 导出并下载 as if nothing had happened.
+   *
+   * So a completed export now says so in three places, in the order the eye travels: a
+   * banner at the TOP of the dialog, the primary button relabelled 导出完成 (disabled,
+   * because there is nothing left for it to do), and the panel's own notice behind the
+   * dialog. 再次导出 re-runs with the settings on screen, so a second export in another
+   * format is still one dialog.
+   */
+  const finished = result !== undefined
+
   return React.createElement(Modal, {
     title: t('export.title'),
     onClose: onClose,
     footer: [
-      React.createElement('button', { key: 'close', type: 'button', className: 'dbm-btn', disabled: busy, onClick: onClose }, t('common.close')),
+      React.createElement('button', { key: 'close', type: 'button', className: `dbm-btn${finished ? ' dbm-btn-primary' : ''}`, disabled: busy, onClick: onClose }, t('common.close')),
+      finished
+        ? React.createElement('button', {
+            key: 'again',
+            type: 'button',
+            className: 'dbm-btn',
+            disabled: busy,
+            'data-dbm-export-again': '',
+            onClick: () => { setResult(undefined); void run() },
+          }, t('export.again'))
+        : null,
       React.createElement('button', {
         key: 'go',
         type: 'button',
         className: 'dbm-btn dbm-btn-primary',
-        disabled: busy || (!includeStructure && !includeData),
+        disabled: busy || finished || (!includeStructure && !includeData),
         'data-dbm-export-submit': '',
+        'aria-busy': busy ? 'true' : undefined,
         onClick: () => { void run() },
-      }, busy ? t('export.busy') : t('export.submit')),
-    ],
+      }, busy
+        ? [React.createElement('span', { key: 'spin', className: 'dbm-spinner' }), t('export.busy')]
+        : finished ? t('export.finished') : t('export.submit')),
+    ].filter(entry => entry !== null),
     children: React.createElement(
       'div',
       null,
+      /*
+       * The SUCCESS BANNER, first in the body.
+       *
+       * Above the form rather than below it: this is the answer to "did it work", and an
+       * answer placed under four controls is one the user has to look for. It states the
+       * file name and size, which is also what proves the export ran against the scope on
+       * screen.
+       */
+      result === undefined
+        ? null
+        : React.createElement(
+            'div',
+            { className: 'dbm-ok dbm-export-done', 'data-dbm-export-done': '' },
+            `✔ ${t('export.done', { name: result.filename, size: formatBytes(result.size) })}`,
+            result.truncated.length === 0
+              ? null
+              : React.createElement('div', { className: 'dbm-hint' }, t('export.truncated', { n: result.truncated.length })),
+          ),
       row(t('export.format'), React.createElement(
         'select',
         {
@@ -203,16 +250,8 @@ export function ExportDialog(props: ExportDialogProps): React.ReactElement {
         }),
         t('export.dropTable'))),
       drop ? React.createElement('div', { className: 'dbm-hint' }, t('export.dropWarn')) : null,
-      result === undefined
-        ? null
-        : React.createElement(
-            'div',
-            { className: 'dbm-ok' },
-            t('export.done', { name: result.filename, size: formatBytes(result.size) }),
-            result.truncated.length === 0
-              ? null
-              : React.createElement('div', { className: 'dbm-hint' }, t('export.truncated', { n: result.truncated.length })),
-          ),
+      // The outcome is reported ONCE, in the banner at the top — a second copy at the
+      // bottom of the form was the version nobody read.
       React.createElement('div', { className: 'dbm-hint' }, t('export.hint')),
     ),
   })
@@ -300,23 +339,46 @@ export function ImportDialog(props: ImportDialogProps): React.ReactElement {
       control as never,
     )
 
+  /*
+   * The finished state, in the same shape the 导出 dialog uses — see its own comment. An
+   * import is the longer-running of the two, so leaving the button reading 导入 with a
+   * result line buried under the form was the same "did it work?" for a slower operation.
+   */
+  const finished = result !== undefined
+
   return React.createElement(Modal, {
     title: t('import.title'),
     onClose,
     footer: [
-      React.createElement('button', { key: 'close', type: 'button', className: 'dbm-btn', disabled: busy, onClick: onClose }, t('common.close')),
+      React.createElement('button', { key: 'close', type: 'button', className: `dbm-btn${finished ? ' dbm-btn-primary' : ''}`, disabled: busy, onClick: onClose }, t('common.close')),
+      finished
+        ? React.createElement('button', {
+            key: 'again',
+            type: 'button',
+            className: 'dbm-btn',
+            disabled: busy,
+            'data-dbm-import-again': '',
+            onClick: () => { setResult(undefined); void run() },
+          }, t('import.again'))
+        : null,
       React.createElement('button', {
         key: 'go',
         type: 'button',
         className: 'dbm-btn dbm-btn-primary',
-        disabled: busy || file === undefined,
+        disabled: busy || finished || file === undefined,
         'data-dbm-import-submit': '',
+        'aria-busy': busy ? 'true' : undefined,
         onClick: () => { void run() },
-      }, busy ? t('import.busy') : t('import.submit')),
-    ],
+      }, busy
+        ? [React.createElement('span', { key: 'spin', className: 'dbm-spinner' }), t('import.busy')]
+        : finished ? t('import.finished') : t('import.submit')),
+    ].filter(entry => entry !== null),
     children: React.createElement(
       'div',
       null,
+      result === undefined
+        ? null
+        : React.createElement('div', { className: 'dbm-ok dbm-import-done', 'data-dbm-import-done': '' }, `✔ ${result}`),
       row(t('import.format'), React.createElement(
         'select',
         {
@@ -375,7 +437,7 @@ export function ImportDialog(props: ImportDialogProps): React.ReactElement {
         ? React.createElement('div', { className: 'dbm-hint' }, t('import.noFile'))
         : React.createElement('div', { className: 'dbm-hint' }, `${file.name} · ${formatBytes(file.size)}`),
       React.createElement('div', { className: 'dbm-hint' }, t('import.warn')),
-      result === undefined ? null : React.createElement('div', { className: 'dbm-ok' }, result),
+      // Reported once, in the banner at the top — see the 导出 dialog's own note.
       React.createElement('div', { className: 'dbm-hint' }, t('import.hint')),
     ),
   })

@@ -43,13 +43,17 @@ A schema / table tree on the left (search filter, view markers, row counts), six
 | Tab | What it does |
 | --- | --- |
 | **Browse** | Paging and page jump, sort by column, sort by index, column comments under the column name, table comment at the right of the paging row, double-click a cell to edit in place, row edit / copy to insert form / delete, multi-select bulk delete. Also hosts SQL result sets |
-| **Structure** | Change / drop / add columns (same controls as the create-table page), primary key editing, unique constraints, index management, distinct-value counts; the action column is pinned to the far right |
+| **Structure** | Change / drop / add columns (same controls as the create-table page), primary key editing, unique constraints, index management, distinct-value counts; **a column's comment is shown under its name as well** (clipped when long, full text on hover), and the comment column itself stays; the action column is pinned to the far right |
 | **SQL** | Editor, Ctrl+Enter to run; SELECT results land on the Browse tab |
 | **Search** | Query by example (QBE): one row per column, only rows with a value take part, conditions are ANDed |
 | **Insert** | Controls chosen per column type; "number of rows to insert" generates several independent forms submitted in one transaction |
 | **Operations** | Move table / table options / copy table / table maintenance / delete data or table |
 
-There is also **import / export**: SQL dump (structure / data / DROP optional, whole database or a single table) and CSV (current table), both performed in the browser.
+There is also **import / export**: SQL dump (structure / data / DROP optional, whole database or a single table) and CSV (current table), both performed in the browser. A finished export says so — "Export complete: name (size)" — and the dialog's primary button becomes that same completed state, with **Export again** beside it re-running the current settings.
+
+The **table list page** you get by clicking a database name carries two permanent control rows at the top: **Database actions** (export database / import into this database / **SQL** / rename / copy / character set / drop database) and the table filter with **New table**. Both rows are **clickable before the table list has been read** — the busy state occupies only the table region below. On a database with many tables the names appear first and the row counts and sizes fill in afterwards (shown as `…` while pending, which is deliberately distinct from "unknown", the engine genuinely not reporting one).
+
+**Database-level SQL** (the `SQL` button in the database actions row, phpMyAdmin's database-page equivalent) runs statements against this database in a full-page editor; the schema travels with each statement, so no `USE` is needed. Statements that act on the DATABASE rather than a table — `CREATE TABLE`, `SHOW TABLES`, `ALTER DATABASE` — are run here (the table-level SQL tab is reached from a table, so there was nowhere to type a `CREATE TABLE`). A result set is rendered in place with the same read-only grid, and a write re-reads the table list and its statistics.
 
 ### Redis Panel
 
@@ -111,7 +115,7 @@ All three source kinds in one place: kind, name, host, user, authentication and 
 
 <p align="center"><img src="docs/images/sql-databases.png" alt="Database list and database operations" width="900"></p>
 
-The schema / table tree on the left, the table list and database operations on the right (export database, import into database, rename, copy database, charset, create table).
+The schema / table tree on the left, the table list and database operations on the right (export database, import into database, **database-level SQL**, rename, copy database, charset, drop database, create table). On a database with many tables the list appears first and the counts follow; both control rows are usable throughout.
 
 ### Browsing data
 
@@ -123,7 +127,7 @@ Paging and page jump, sort by index, double-click a cell to edit in place, with 
 
 <p align="center"><img src="docs/images/sql-structure.png" alt="Table structure" width="900"></p>
 
-Column attributes at a glance (type, nullable, key, default, extra, distinct-value count, comment) with the action column pinned to the far right; indexes are listed below.
+Column attributes at a glance (type, nullable, key, default, extra, distinct-value count, comment) with the action column pinned to the far right, and **each column's comment repeated under its name** (hover for the full text); indexes are listed below.
 
 ### Inserting data
 
@@ -158,6 +162,8 @@ The key tree folded by `:` on the left (showing the key count of each directory)
 | **Redis** | `ioredis` | Plugin dependency, clients cached per database |
 
 Availability of all three engines is shown at the top of the panel; a missing dependency produces an explicit notice instead of a silent failure. Drivers are loaded lazily and translate their errors, so a deployment with only SQLite still starts normally.
+
+**MySQL is read according to what the server actually has, not assuming the newest release**: the generated-column expression (`information_schema.COLUMNS.GENERATION_EXPRESSION`) only exists from MySQL 5.7.6 / MariaDB 10.2, and asking an older server for it fails the whole statement with `Unknown column 'GENERATION_EXPRESSION'` — and that one statement is behind every list read (Structure / Browse / Search / Insert). The driver probes for the column once with a `SHOW COLUMNS` and caches the answer, falling back to the form without it (an old server has no generated columns to report anyway); if the probe is somehow wrong and the server still refuses, the read retries the legacy form and remembers that. Measured on the MySQL 5.5.62 server this was reported from: every list read failed before, and Structure / Browse now return normally, column comments included.
 
 SQLite connects directly to a local `.db` file, which makes it handy for quick inspection and edits; MySQL goes through a connection pool that reclaims idle connections after 30 minutes and discards the old driver when connection fields change.
 

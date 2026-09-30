@@ -83,6 +83,14 @@ export class MysqlDriver implements SqlDriver {
   readonly kind = 'mysql' as const
   private readonly entry: DataSourceEntry
   private pool: MysqlPool | undefined
+  /**
+   * Cached answer to "does this server have COLUMNS.GENERATION_EXPRESSION".
+   *
+   * `undefined` until the first column read probes it; see
+   * {@link MysqlDriver.generationExpressionSupport}. Cleared when the pool is closed, so
+   * a re-open against a different server cannot inherit the previous server's answer.
+   */
+  private generationSupport: boolean | undefined
 
   constructor(entry: DataSourceEntry) {
     this.entry = entry
@@ -147,6 +155,9 @@ export class MysqlDriver implements SqlDriver {
   async close(): Promise<void> {
     const pool = this.pool
     this.pool = undefined
+    // The capability answer belongs to the server the pool was talking to, so it goes
+    // with it.
+    this.generationSupport = undefined
     if (pool === undefined) return
     try {
       await pool.end()
@@ -437,17 +448,59 @@ export class MysqlDriver implements SqlDriver {
     })
   }
 
+  /**
+   * Whether this server's `information_schema.COLUMNS` has `GENERATION_EXPRESSION`.
+   *
+   * The column was added in MySQL 5.7.6 (and MariaDB 10.2). Asking for it on an older
+   * server fails the WHOLE read — "Unknown column 'GENERATION_EXPRESSION' in 'field
+   * list'" — and with it every surface that reads columns, which on MySQL 5.5 (the 05老库
+   * this was reported against, 5.5.62) meant the 结构 / 浏览 / 搜索 / 插入 tabs and the
+   * row read all answered with that error. So the read is built per server rather than
+   * assuming the newest schema.
+   *
+   * A capability probe rather than a version comparison: MariaDB and the MySQL forks
+   * report version strings this file has no business parsing, and `SHOW COLUMNS` answers
+   * the actual question in one round trip. The answer is cached for the pool's lifetime
+   * (and re-probed if the pool is closed and reopened).
+   */
+  private async generationExpressionSupport(): Promise<boolean> {
+    if (this.generationSupport !== undefined) return this.generationSupport
+    const [rows] = await (await this.open()).query({
+      sql: "SHOW COLUMNS FROM information_schema.COLUMNS LIKE 'GENERATION_EXPRESSION'",
+    })
+    const supported = Array.isArray(rows) && rows.length > 0
+    this.generationSupport = supported
+    return supported
+  }
+
+  /**
+   * Read every column of one table, in the variant the server understands.
+   *
+   * A wrong capability answer is corrected rather than fatal: if the server rejects
+   * `GENERATION_EXPRESSION` with `ER_BAD_FIELD_ERROR`, the read is retried without it and
+   * the cached answer is updated, so only the first column read of a session can pay for
+   * the mistake.
+   */
+  private async readColumnRows(target: string, table: string): Promise<unknown> {
+    const values = [target, table]
+    const pool = await this.open()
+    if (await this.generationExpressionSupport()) {
+      try {
+        const [rows] = await pool.query({ sql: columnsSelect(true), values })
+        return rows
+      } catch (error) {
+        if (!isMissingGenerationColumn(error)) throw error
+        this.generationSupport = false
+      }
+    }
+    const [rows] = await pool.query({ sql: columnsSelect(false), values })
+    return rows
+  }
+
   async columns(schema: string | undefined, table: string): Promise<ColumnInfo[]> {
     const target = this.requireSchema(schema)
     requireIdentifier(table, 'table name', quoteMysql)
-    const [rows] = await (await this.open()).query({
-      sql:
-        'SELECT COLUMN_NAME AS name, COLUMN_TYPE AS type, IS_NULLABLE AS nullable, COLUMN_DEFAULT AS dflt, ' +
-        'COLUMN_KEY AS col_key, COLUMN_COMMENT AS comment, EXTRA AS extra, COLLATION_NAME AS collation, ' +
-        'GENERATION_EXPRESSION AS generation ' +
-        'FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION',
-      values: [target, table],
-    })
+    const rows = await this.readColumnRows(target, table)
     /*
      * The primary key's column order comes from STATISTICS, and whether a key
      * EXISTS comes from COLUMNS. Neither alone is enough:
@@ -2422,6 +2475,46 @@ function toCount(value: unknown): number | undefined {
   if (text === '') return undefined
   const parsed = Number(text)
   return Number.isFinite(parsed) ? parsed : undefined
+}
+
+/**
+ * The `information_schema.COLUMNS` read, in the two variants the servers need.
+ *
+ * `GENERATION_EXPRESSION` is the generated column's expression — the only place it can
+ * be read from, and the reliable test for "is this column generated" (see the mapping
+ * below). MySQL 5.7.6 and MariaDB 10.2 added it; asking an older server for it fails the
+ * whole statement with `ER_BAD_FIELD_ERROR`. See
+ * {@link MysqlDriver.generationExpressionSupport}.
+ *
+ * The projection is shared so the two variants cannot drift apart; only the one column
+ * differs between them.
+ *
+ * @param hasGenerationExpression - whether the server has that column.
+ * @returns the statement, with `?` placeholders for schema and table.
+ */
+export function columnsSelect(hasGenerationExpression: boolean): string {
+  return (
+    'SELECT COLUMN_NAME AS name, COLUMN_TYPE AS type, IS_NULLABLE AS nullable, COLUMN_DEFAULT AS dflt, ' +
+    'COLUMN_KEY AS col_key, COLUMN_COMMENT AS comment, EXTRA AS extra, COLLATION_NAME AS collation' +
+    (hasGenerationExpression ? ', GENERATION_EXPRESSION AS generation' : '') +
+    ' FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION'
+  )
+}
+
+/**
+ * Whether a failure is the server refusing `GENERATION_EXPRESSION` as an unknown column.
+ *
+ * Matched on the error CODE first and the text only as a fallback: the code is what
+ * mysql2 carries from the server's own error packet, while the message is localized on
+ * some builds ("Unknown column" is not translated in practice, but the code is the
+ * contract).
+ */
+function isMissingGenerationColumn(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false
+  const record = error as { code?: unknown; errno?: unknown; message?: unknown; sqlMessage?: unknown }
+  if (record.code === 'ER_BAD_FIELD_ERROR' || record.errno === 1054) return true
+  const text = `${typeof record.sqlMessage === 'string' ? record.sqlMessage : ''} ${typeof record.message === 'string' ? record.message : ''}`
+  return text.includes('GENERATION_EXPRESSION')
 }
 
 /** Human-readable MySQL error, keeping the engine's own error code visible. */

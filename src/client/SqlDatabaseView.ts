@@ -202,6 +202,24 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
   const [batchBusy, setBatchBusy] = React.useState(false)
   /** Whether the 新建表 dialog is open. */
   const [creatingTable, setCreatingTable] = React.useState(false)
+  /**
+   * Whether the right pane is showing the DATABASE-level SQL page instead of the table list.
+   *
+   * A separate page rather than a modal: it is a workspace (an editor, a run button, a
+   * results grid), and a dialog would have to be re-opened to run a second statement. It is
+   * also the only way to run DDL for an object that does not exist yet — the 表级 SQL tab
+   * is reached from a table, so `CREATE TABLE` had nowhere to be typed.
+   */
+  const [dbSqlOpen, setDbSqlOpen] = React.useState(false)
+  /**
+   * The database SQL page's editor text and write switch.
+   *
+   * Held HERE, like the table SQL tab's, so switching back to the table list and returning
+   * does not discard the statement — losing what someone typed because they glanced at the
+   * table list is the failure the table tab's own comment describes.
+   */
+  const [dbSqlText, setDbSqlText] = React.useState('')
+  const [dbSqlAllowWrite, setDbSqlAllowWrite] = React.useState(false)
 
   /**
    * Table statistics for the overview pane, per database.
@@ -222,6 +240,17 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
   const statsBySchemaRef = React.useRef(statsBySchema)
   statsBySchemaRef.current = statsBySchema
   const [statsLoading, setStatsLoading] = React.useState(false)
+  /**
+   * Databases whose list is on screen but whose row counts and sizes are still being read.
+   *
+   * The statistics read is a SECOND request (see {@link loadStats}), and on a large database
+   * it can take tens of seconds: measured 24–33s for a 1282-table database on a MySQL 5.5 server whose
+   * `innodb_stats_on_metadata` is ON (the 5.5 default), against 0.1s for the same list without
+   * them. The names are therefore shown as soon as they arrive, and this flag is what keeps
+   * the two statistics columns from claiming "unknown" during that window — an absence that
+   * means something else entirely (SQLite before ANALYZE).
+   */
+  const [statsPending, setStatsPending] = React.useState<Record<string, boolean>>({})
   /** Which destructive action is awaiting confirmation. */
   const [confirming, setConfirming] = React.useState<TableConfirm | undefined>(undefined)
   const [acting, setActing] = React.useState(false)
@@ -319,6 +348,15 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
    * `force` re-reads after a change that can move the numbers (a truncate, a
    * drop, an insert), because a cached count would then be a stale answer to
    * the question the user just asked.
+   *
+   * TWO REQUESTS, names first. The statistics columns are what make this read slow — on
+   * MySQL 5.5 they cost 24–33s for a 1282-table database against 0.1s for the same list without
+   * them (measured on the reported server; `innodb_stats_on_metadata` has no session-scoped
+   * form there, so the driver cannot make the server answer faster) — and the names alone are
+   * enough to draw the list, the filter, the count and every per-table action. The counts and
+   * sizes then fill in behind it, with the two cells that would carry them marked as pending
+   * rather than as unknown. On a fast server the two reads are milliseconds apart and nothing
+   * is visible at all.
    */
   const loadStats = React.useCallback(async (schema: string, force = false): Promise<void> => {
     /*
@@ -330,16 +368,22 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
      */
     if (!force && statsBySchemaRef.current[schema] !== undefined) return
     setStatsLoading(true)
+    setStatsPending(current => ({ ...current, [schema]: true }))
     try {
+      const names = await api.tables(source.id, schema)
+      setStatsBySchema(current => ({ ...current, [schema]: names }))
+      setError(undefined)
       const list = await api.tables(source.id, schema, true)
       setStatsBySchema(current => ({ ...current, [schema]: list }))
-      setError(undefined)
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure))
       // An empty list keeps a failing database from retrying on every render;
-      // the refresh button clears the cache.
-      setStatsBySchema(current => ({ ...current, [schema]: [] }))
+      // the refresh button clears the cache. A list already on screen from the
+      // name-only read is KEPT: those names are known to be right, and replacing them with
+      // an empty list would delete the rows the user is looking at because a COUNT failed.
+      setStatsBySchema(current => (current[schema] === undefined ? { ...current, [schema]: [] } : current))
     } finally {
+      setStatsPending(current => ({ ...current, [schema]: false }))
       setStatsLoading(false)
     }
   }, [api, source.id])
@@ -387,6 +431,9 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
   const selectSchema = (schema: string): void => {
     setActiveTable(undefined)
     setActiveSchema(schema)
+    // Picking a database returns to that database's TABLE LIST, so a database-level SQL
+    // page left open would hide the list the click just asked for.
+    setDbSqlOpen(false)
     setOpenSchemas(current => (current[schema] === true ? current : { ...current, [schema]: true }))
     setError(undefined)
     void loadTables(schema)
@@ -658,6 +705,8 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
     setActiveSchema(schema)
     setActiveTable(table)
     setTab(nextTab)
+    // A table replaces the page the database-level SQL editor owns.
+    setDbSqlOpen(false)
     // Opening a table replaces whatever was on screen, including a SQL result set
     // shown in 浏览: the grid is about to show a different table's rows.
     setSqlResult(undefined)
@@ -1027,14 +1076,47 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
   if (activeSchema === undefined) {
     body.push(React.createElement(Empty, { key: 'empty', message: t('db.selectSchema') }))
   } else if (selection === undefined) {
-    body.push(
-      React.createElement(TableOverview, {
+    /*
+     * The database-level SQL page takes over the pane the table list was in.
+     *
+     * It replaces the list rather than sitting beside it because both are workspaces: the
+     * statement needs the width for its results, and the list is one click away on the
+     * 返回表列表 button this page draws.
+     */
+    body.push(dbSqlOpen
+      ? React.createElement(DatabaseSqlView, {
+          key: 'db-sql',
+          api,
+          sourceId: source.id,
+          schema: activeSchema,
+          sql: dbSqlText,
+          allowWrite: dbSqlAllowWrite,
+          onSql: setDbSqlText,
+          onAllowWrite: setDbSqlAllowWrite,
+          onBack: () => setDbSqlOpen(false),
+          onResult: (message, wrote) => {
+            setNotice(message)
+            setError(undefined)
+            // A statement that returned rows may have been `SHOW TABLES` and one that wrote
+            // may have created, dropped or emptied a table — either way the list and its
+            // statistics are no longer trustworthy. Re-read only on a write: a SELECT
+            // cannot change them, and re-reading a slow server's statistics after every
+            // `SHOW TABLES` would make the page feel broken (measured on MySQL 5.5: the
+            // stats read takes ~25s there).
+            if (!wrote) return
+            void loadTables(activeSchema, true)
+            void loadStats(activeSchema, true)
+          },
+          onError: message => { setError(message); setNotice(undefined) },
+        })
+      : React.createElement(TableOverview, {
         key: 'overview',
         schema: activeSchema,
         tables: statsBySchema[activeSchema],
         filter: tableFilter,
         onFilter: setTableFilter,
         loading: statsLoading,
+        statsPending: statsPending[activeSchema] === true,
         onOpen: (table, nextTab) => openTable(activeSchema, table.name, nextTab),
         onTruncate: table => setConfirming({ kind: 'single', table, schema: activeSchema, op: 'truncate' }),
         onDrop: table => setConfirming({ kind: 'single', table, schema: activeSchema, op: 'drop' }),
@@ -1051,9 +1133,9 @@ export function SqlDatabaseView(props: SqlDatabaseViewProps): React.ReactElement
         onExportDatabase: () => setTransfer({ kind: 'export' }),
         onImportDatabase: () => { void openImport(activeSchema) },
         onCreateTable: () => setCreatingTable(true),
+        onOpenSql: () => setDbSqlOpen(true),
         onDatabaseAction: action => setDatabaseAction(action),
-      }),
-    )
+      }))
   } else {
     body.push(
       React.createElement(TabStrip, {
@@ -1610,6 +1692,8 @@ function TableOverview(props: {
   filter: string
   onFilter(value: string): void
   loading: boolean
+  /** Whether the row counts and sizes are still being read for the list on screen. */
+  statsPending: boolean
   onOpen(table: TableInfo, tab: SqlTab): void
   onTruncate(table: TableInfo): void
   onDrop(table: TableInfo): void
@@ -1633,24 +1717,33 @@ function TableOverview(props: {
   onDatabaseAction(action: 'create' | 'rename' | 'copy' | 'drop' | 'charset'): void
   /** Open the 新建表 dialog. */
   onCreateTable(): void
+  /** Open the database-level SQL page. */
+  onOpenSql(): void
 }): React.ReactElement {
   const {
-    schema, tables, filter, onFilter, loading, onOpen, onTruncate, onDrop, onRefresh,
+    schema, tables, filter, onFilter, loading, statsPending, onOpen, onTruncate, onDrop, onRefresh,
     selected, onSelect, maintenanceSupport, engineKind, busy,
     onBatchTruncate, onBatchDrop, onBatchExport, onMaintain,
-    onExportDatabase, onImportDatabase, onDatabaseAction, onCreateTable,
+    onExportDatabase, onImportDatabase, onDatabaseAction, onCreateTable, onOpenSql,
   } = props
 
-  if (tables === undefined) {
-    return React.createElement(
-      'div',
-      { className: 'dbm-tab-body' },
-      React.createElement('div', { className: 'dbm-pad dbm-hint' }, t('db.loadingStats')),
-    )
-  }
-
+  /*
+   * NOTHING here returns early while the table list loads.
+   *
+   * The pane used to be replaced by 正在读取表和统计信息… until the statistics arrived, which
+   * on a large database is the wrong trade twice over: the two control rows (数据库操作 and
+   * the table filter) were unreachable for as long as the read took, and the read can be
+   * genuinely slow — measured 24–33s for one 1282-table database on the reported MySQL
+   * 5.5 server, and there is nothing to click while it runs.
+   *
+   * Reported: 上面的第一行数据库操作、第二行筛选，页面加载时就显示，下面的表数据才 loading，
+   * 因为有时不用看列表，直接执行新建表等操作. So the toolbars render immediately and
+   * unconditionally, and only the TABLE REGION shows the loading state.
+   */
+  const loaded = tables !== undefined
+  const all = tables ?? []
   const needle = filter.trim().toLowerCase()
-  const list = needle === '' ? tables : tables.filter(table => table.name.toLowerCase().includes(needle))
+  const list = needle === '' ? all : all.filter(table => table.name.toLowerCase().includes(needle))
 
   /*
    * A selection is pruned to what is VISIBLE.
@@ -1715,6 +1808,22 @@ function TableOverview(props: {
         'data-dbm-dbop': 'import',
         onClick: onImportDatabase,
       }, t('db.op.importDb')),
+      /*
+       * The 库级 SQL page's way in.
+       *
+       * Beside 导入到本库 because it acts on the same subject — this database — and NOT
+       * beside 新建表 on the table row below: what it runs is a statement against the
+       * database, and the objects it can name include ones that do not exist yet. That is
+       * also why it is here at all: the 表级 SQL tab is reached FROM a table, so
+       * `CREATE TABLE` / `SHOW TABLES` had nowhere to be typed.
+       */
+      React.createElement('button', {
+        type: 'button',
+        className: 'dbm-btn dbm-btn-sm',
+        title: t('db.sql.hint'),
+        'data-dbm-dbop': 'sql',
+        onClick: onOpenSql,
+      }, t('db.sql')),
       React.createElement('span', { className: 'dbm-batch-sep' }),
       React.createElement('button', {
         type: 'button',
@@ -1761,7 +1870,15 @@ function TableOverview(props: {
         // duplicated control rather than two different ones.
         onChange: (event: { target: { value: string } }) => onFilter(event.target.value),
       }),
-      React.createElement('span', { className: 'dbm-hint' }, t('db.overviewFor', { schema, n: tables.length })),
+      /*
+       * The count of tables, or the loading state while it is unknown.
+       *
+       * A count cannot be shown before the read answers, and showing 0 would be a claim
+       * about an empty database that has not been checked — so the hint reports the READ
+       * instead, which is also what tells the user why the list below is empty.
+       */
+      React.createElement('span', { className: 'dbm-hint', 'data-dbm-overview-count': loaded ? 'ready' : 'loading' },
+        loaded ? t('db.overviewFor', { schema, n: all.length }) : t('db.loadingStats')),
       React.createElement('span', { className: 'dbm-spacer' }),
       /*
        * 新建表 sits on the ROW OF TABLE controls, not with the database actions above.
@@ -1817,9 +1934,24 @@ function TableOverview(props: {
       onMaintain: (op: MaintenanceOpView) => onMaintain(op, visibleSelected.map(table => table.name)),
       onClear: () => onSelect(new Set()),
     }),
-    list.length === 0
-      ? React.createElement(Empty, { message: tables.length === 0 ? t('db.overviewEmpty') : t('list.emptyFiltered') })
-      : React.createElement(
+    /*
+     * The TABLE REGION is the only place the read's own state is shown.
+     *
+     * `!loaded` is the 正在读取表和统计信息… state, now scoped here instead of replacing the
+     * whole pane — see the note at the top of this component. The batch bar above it stays
+     * out of the way on its own: with nothing selected (and nothing to select) it renders
+     * nothing at all.
+     */
+    !loaded
+      ? React.createElement(
+          'div',
+          { className: 'dbm-pad dbm-hint dbm-row', 'data-dbm-overview-loading': '' },
+          React.createElement('span', { className: 'dbm-spinner' }),
+          t('db.loadingStats'),
+        )
+      : list.length === 0
+        ? React.createElement(Empty, { message: all.length === 0 ? t('db.overviewEmpty') : t('list.emptyFiltered') })
+        : React.createElement(
           'div',
           { className: 'dbm-scroll' },
           React.createElement(
@@ -1894,13 +2026,19 @@ function TableOverview(props: {
                    * run it as a side effect of listing — the 分析 batch action is how
                    * a user asks for it. Rendering 0 there would state something false
                    * about a table that may hold millions.
+                   *
+                   * While the statistics request is still in flight the cell says so
+                   * instead (see `statsPending`): "not read yet" and "this engine does not
+                   * report one" are different answers, and only the first is temporary.
                    */
                   React.createElement(
                     'td',
-                    { className: 'dbm-mono' },
-                    table.rows === undefined
-                      ? React.createElement('span', { className: 'dbm-hint', title: t('db.rowsUnknown.hint') }, t('db.rowsUnknown'))
-                      : table.rows.toLocaleString(),
+                    { className: 'dbm-mono', 'data-dbm-rows': statsPending ? 'pending' : 'ready' },
+                    statsPending
+                      ? React.createElement('span', { className: 'dbm-hint', title: t('db.statsPending.hint') }, '…')
+                      : table.rows === undefined
+                        ? React.createElement('span', { className: 'dbm-hint', title: t('db.rowsUnknown.hint') }, t('db.rowsUnknown'))
+                        : table.rows.toLocaleString(),
                   ),
                   React.createElement(
                     'td',
@@ -1912,7 +2050,15 @@ function TableOverview(props: {
                     table.engine ?? (table.type === 'view' ? t('db.type.view') : t('db.type.table')),
                   ),
                   React.createElement('td', { className: 'dbm-mono' }, table.collation ?? t('common.none')),
-                  React.createElement('td', { className: 'dbm-mono' }, formatBytes(table.size)),
+                  // Same distinction as the row count: pending is temporary, absent is the
+                  // engine having nothing to say.
+                  React.createElement(
+                    'td',
+                    { className: 'dbm-mono', 'data-dbm-size': statsPending ? 'pending' : 'ready' },
+                    statsPending
+                      ? React.createElement('span', { className: 'dbm-hint', title: t('db.statsPending.hint') }, '…')
+                      : formatBytes(table.size),
+                  ),
                   React.createElement('td', { title: table.comment ?? '' }, table.comment ?? ''),
                 ),
               ),
@@ -1977,6 +2123,140 @@ function SqlResultGrid(props: { result: QueryResult }): React.ReactElement {
         ),
       ),
     ),
+  )
+}
+
+/**
+ * The database-level SQL page.
+ *
+ * Opened from the 数据库操作 row's SQL button, and it exists because a statement that acts
+ * on the DATABASE has no table to reach the 表级 SQL tab from: `CREATE TABLE`, `SHOW
+ * TABLES`, `ALTER DATABASE`, or any DDL for an object that does not exist yet. phpMyAdmin's
+ * database page carries the same tab, in the same place.
+ *
+ * The `schema` is passed to the host with every statement, so `USE` is not needed and an
+ * unqualified table name resolves to the database the page was opened on — the same rule the
+ * table tab follows.
+ *
+ * A result set is rendered HERE rather than in 浏览, unlike the table tab's: the browse grid
+ * belongs to a table, and a database-level statement has none. It reuses {@link SqlResultGrid}
+ * so rows look the same wherever they appear, and it is deliberately NOT paged, sortable or
+ * editable for the reason that component documents.
+ *
+ * One statement per run, like the table tab: the host's read path accepts one statement per
+ * call, and a box accepting several would run them in an order the single results grid could
+ * not report back per statement.
+ */
+function DatabaseSqlView(props: {
+  api: DbApi
+  sourceId: string
+  schema: string
+  sql: string
+  allowWrite: boolean
+  onSql(text: string): void
+  onAllowWrite(next: boolean): void
+  /** Leave for the table list. */
+  onBack(): void
+  /** The statement finished; `wrote` says whether it may have changed the table list. */
+  onResult(message: string, wrote: boolean): void
+  onError(message: string): void
+}): React.ReactElement {
+  const { api, sourceId, schema, sql, allowWrite, onSql, onAllowWrite, onBack, onResult, onError } = props
+  const [message, setMessage] = React.useState<string | undefined>(undefined)
+  const [result, setResult] = React.useState<QueryResult | undefined>(undefined)
+  const [busy, setBusy] = React.useState(false)
+
+  const run = async (): Promise<void> => {
+    if (sql.trim() === '') return
+    setBusy(true)
+    setMessage(undefined)
+    // The previous statement's rows go before the new one runs, so a failed read cannot
+    // leave the PREVIOUS result on screen under the new statement.
+    setResult(undefined)
+    try {
+      const value = await api.runSql(sourceId, { sql, schema, allowWrite })
+      if (value.write) {
+        const text = t('sql.affected', { n: value.affected, ms: value.durationMs })
+        setMessage(text)
+        onResult(text, true)
+      } else {
+        const text = `${t('sql.rows', { n: value.rows.length, ms: value.durationMs })}${value.truncated ? ` · ${t('sql.truncated')}` : ''}`
+        setResult(value)
+        setMessage(text)
+        onResult(text, false)
+      }
+    } catch (failure) {
+      onError(failure instanceof Error ? failure.message : String(failure))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return React.createElement(
+    'div',
+    { className: 'dbm-tab-body', 'data-dbm-db-sql': '' },
+    React.createElement(
+      'div',
+      { className: 'dbm-toolbar' },
+      React.createElement('button', {
+        type: 'button',
+        className: 'dbm-btn dbm-btn-sm',
+        'data-dbm-db-sql-back': '',
+        onClick: onBack,
+      }, `‹ ${t('db.sql.back')}`),
+      React.createElement('span', { className: 'dbm-title' }, t('db.sql.title')),
+      React.createElement('span', { className: 'dbm-subtitle dbm-mono' }, schema),
+    ),
+    React.createElement(
+      'div',
+      { className: 'dbm-pad' },
+      React.createElement('textarea', {
+        className: 'dbm-textarea',
+        rows: 6,
+        value: sql,
+        placeholder: t('db.sql.placeholder'),
+        spellcheck: false,
+        'data-dbm-db-sql-editor': '',
+        onChange: (event: { target: { value: string } }) => onSql(event.target.value),
+        onKeyDown: (event: { key: string; ctrlKey: boolean; metaKey: boolean; preventDefault(): void }) => {
+          if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+            event.preventDefault()
+            void run()
+          }
+        },
+      }),
+      React.createElement(
+        'div',
+        { className: 'dbm-row' },
+        React.createElement('button', {
+          type: 'button',
+          className: 'dbm-btn dbm-btn-primary',
+          disabled: busy,
+          'data-dbm-db-sql-run': '',
+          onClick: () => { void run() },
+        }, busy ? t('sql.running') : t('sql.run')),
+        React.createElement(
+          'label',
+          { className: 'dbm-check' },
+          React.createElement('input', {
+            type: 'checkbox',
+            checked: allowWrite,
+            onChange: (event: { target: { checked: boolean } }) => onAllowWrite(event.target.checked),
+          }),
+          t('sql.allowWrite'),
+        ),
+        React.createElement('span', { className: 'dbm-hint' }, t('sql.allowWrite.hint')),
+      ),
+      message === undefined ? null : React.createElement('div', { className: 'dbm-hint', 'data-dbm-db-sql-message': '' }, message),
+    ),
+    result === undefined
+      ? null
+      : React.createElement(
+          'div',
+          { className: 'dbm-pad', style: { paddingTop: 0 } },
+          React.createElement('div', { className: 'dbm-hint dbm-mono' }, `${t('sql.resultFrom', { schema, n: result.rows.length })}`),
+          React.createElement(SqlResultGrid, { result }),
+        ),
   )
 }
 

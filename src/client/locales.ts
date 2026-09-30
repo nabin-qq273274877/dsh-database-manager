@@ -219,6 +219,17 @@ export const zh = {
   'db.op.importDb': '导入到本库',
   'db.op.refreshSchemas': '刷新库列表',
   'db.op.createTable': '新建表',
+  /*
+   * 库级 SQL 页（数据库操作后的 SQL 按钮）。
+   *
+   * The button is labelled just 「SQL」, matching the table tab of the same name: it is the
+   * same idea one level up, and a longer label would push 重命名/复制/删除 off the row.
+   */
+  'db.sql': 'SQL',
+  'db.sql.hint': '在本库执行 SQL 语句（可执行建表等库级操作）',
+  'db.sql.title': '执行 SQL',
+  'db.sql.back': '返回表列表',
+  'db.sql.placeholder': '输入一条在本库执行的 SQL 语句，Ctrl+Enter 执行',
 
   /*
    * 操作 tab: the table-level page phpMyAdmin's 操作 offers.
@@ -402,6 +413,14 @@ export const zh = {
   'db.type.view': '视图',
   'db.rowsUnknown': '未知',
   'db.rowsUnknown.hint': 'SQLite 没有行数统计，需要执行 ANALYZE 后才会显示；此处不会替你修改数据库文件。',
+  /*
+   * The two statistics cells while their read is still running.
+   *
+   * Distinct from 未知 above on purpose: 未知 is a fact about the engine (SQLite keeps no
+   * count), while this is a fact about the network — the counts are coming, and replacing
+   * them with 未知 for 20 seconds would report the second as the first.
+   */
+  'db.statsPending.hint': '正在读取行数与大小…',
   'db.loadingStats': '正在读取表和统计信息…',
   'db.action.browse': '浏览',
   'db.action.structure': '结构',
@@ -673,7 +692,16 @@ export const zh = {
   'export.dropWarn': '勾选后，导入到已有数据库会先删除同名表，再重建。',
   'export.submit': '导出并下载',
   'export.busy': '正在生成…',
-  'export.done': '已下载 {name}（{size}）',
+  /**
+   * The done state's own words.
+   *
+   * `export.finished` is the primary button AFTER a successful export: it is disabled, so
+   * it reports the outcome instead of inviting a second click. `export.again` is the
+   * enabled control beside it, which re-runs with the settings on screen.
+   */
+  'export.finished': '导出完成',
+  'export.again': '再次导出',
+  'export.done': '导出完成：{name}（{size}）',
   'export.empty': '没有可导出的表',
   'export.truncated': '有 {n} 张表的行数超过导出上限，文件中的这些表被截断。',
   'export.csvOneTable': 'CSV 一次只能导出一张表',
@@ -694,6 +722,10 @@ export const zh = {
   'import.emptyAsNullHint': '不勾选则写入空字符串。',
   'import.submit': '开始导入',
   'import.busy': '正在导入…',
+  // The same done state the 导出 dialog has: a disabled button that reports the outcome,
+  // beside an enabled 再次导入.
+  'import.finished': '导入完成',
+  'import.again': '再次导入',
   'import.warn': '导入会写数据且不可撤销。SQL 文件里的 DROP TABLE 会删除同名表。',
   'import.refuseTooBig': '文件过大：{size}，上限 {limit}',
   'import.done': '已执行 {n} 条语句',
@@ -1041,6 +1073,11 @@ export const en: Record<DbKey, string> = {
   'db.op.importDb': 'Import into this database',
   'db.op.refreshSchemas': 'Reload databases',
   'db.op.createTable': 'New table',
+  'db.sql': 'SQL',
+  'db.sql.hint': 'Run SQL against this database (DDL such as CREATE TABLE included)',
+  'db.sql.title': 'Run SQL',
+  'db.sql.back': 'Back to the table list',
+  'db.sql.placeholder': 'Type one statement to run on this database; Ctrl+Enter runs it',
 
   'createTable.title': 'New table',
   'createTable.tableName': 'Table name',
@@ -1154,6 +1191,7 @@ export const en: Record<DbKey, string> = {
   'db.type.view': 'View',
   'db.rowsUnknown': 'unknown',
   'db.rowsUnknown.hint': 'SQLite keeps no row-count statistic until ANALYZE runs; this panel will not modify your database file to get one.',
+  'db.statsPending.hint': 'Reading the row counts and sizes…',
   'db.loadingStats': 'Reading tables and statistics…',
   'db.action.browse': 'Browse',
   'db.action.structure': 'Structure',
@@ -1476,7 +1514,9 @@ export const en: Record<DbKey, string> = {
   'export.dropWarn': 'With this on, importing into an existing database deletes same-named tables first and rebuilds them.',
   'export.submit': 'Export and download',
   'export.busy': 'Generating…',
-  'export.done': 'Downloaded {name} ({size})',
+  'export.finished': 'Export complete',
+  'export.again': 'Export again',
+  'export.done': 'Export complete: {name} ({size})',
   'export.empty': 'There is no table to export',
   'export.truncated': '{n} table(s) exceeded the export row cap and were truncated in the file.',
   'export.csvOneTable': 'CSV can only export one table at a time',
@@ -1497,6 +1537,8 @@ export const en: Record<DbKey, string> = {
   'import.emptyAsNullHint': 'Unticked, an empty field becomes an empty string.',
   'import.submit': 'Start the import',
   'import.busy': 'Importing…',
+  'import.finished': 'Import complete',
+  'import.again': 'Import again',
   'import.warn': 'An import writes data and cannot be undone. A DROP TABLE in a SQL file deletes same-named tables.',
   'import.refuseTooBig': 'The file is too large: {size}, above the {limit} limit',
   'import.done': '{n} statement(s) executed',
