@@ -43,7 +43,7 @@ import {
   type ColumnIndexChoice,
 } from './column-index-plan.ts'
 import { ATTRIBUTE_ITEMS, collationsFor, offeredTypes, typeGroupsFor } from './table-types.ts'
-import { ErrorBanner, Modal, t } from './ui.ts'
+import { ErrorBanner, Modal, t, useHoverTip } from './ui.ts'
 
 /**
  * The 默认值 control's state, mirroring the 新建表 form's four modes.
@@ -568,6 +568,15 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
    */
   const commentText = (column: ColumnInfo): string => column.comment ?? ''
 
+  /**
+   * The panel-drawn hover box for a column's comment.
+   *
+   * Held here rather than per cell: one box serves every row, since only one cell can be
+   * hovered at a time — a per-row box would add a React node to each of a table's rows for no
+   * gain. See {@link useHoverTip} for why the browser's own `title` was not enough.
+   */
+  const { tipProps, tip } = useHoverTip()
+
   const header = React.createElement(
     'tr',
     null,
@@ -632,23 +641,20 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
         {
           className: 'dbm-mono',
           /*
-           * The column's COMMENT, as a TOOLTIP on the name.
+           * The column's COMMENT, as the panel's own hover box on the name.
            *
-           * Reported: 表结构页看不到注释 — the 注释 column exists, but it is the eighth one, so
-           * on a wide table it is scrolled off at exactly the moment the comment is what tells
-           * `is_del` from `c_type` apart.
+           * Reported twice: 表结构页看不到注释, and then — after the comment was put under the
+           * name as a second line — 字段名下方不要重复（后面有注释列）. This is the settled
+           * shape: the row keeps one line, the comment lives in its own column, and hovering
+           * the NAME reveals the full text for anyone who has scrolled that column away.
            *
-           * This cell briefly carried the comment as a second line as well, copying the 浏览
-           * grid's header. It was dropped on the user's call: this tab already HAS a comment
-           * column, so the repetition bought nothing and cost every row a second line of
-           * height — it doubled the table on a commented schema. The tooltip is what makes the
-           * value reachable without scrolling to that column.
+           * It is `useHoverTip`, not a `title` attribute: a title was set on this very cell and
+           * the desktop app showed nothing on hover (reported as 鼠标放在字段名上不显示注释).
            *
-           * Absent when the engine reports none: SQLite has no column comments at all, and
-           * MySQL reports an absent one as the empty string. An empty title would still pop an
-           * empty tooltip box, which reads as a rendering bug.
+           * Nothing is attached when the engine reports no comment — SQLite has none at all, and
+           * MySQL sends the empty string; an empty box on hover reads as a rendering bug.
            */
-          ...(commentText(column) === '' ? {} : { title: commentText(column) }),
+          ...tipProps(commentText(column)),
           'data-dbm-col-name': column.name,
         },
         column.name,
@@ -671,7 +677,10 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
           className: 'dbm-link',
           onClick: () => { void showDistinct(column.name) },
         }, t('structure.col.distinct'))),
-      React.createElement('td', null, column.comment ?? ''),
+      // The 注释 column keeps the text itself reachable at a glance; hovering it gives the
+      // same box as the name, so a long comment can be read in full without the column
+      // widening the table.
+      React.createElement('td', { 'data-dbm-col-comment': column.name, ...tipProps(commentText(column)) }, column.comment ?? ''),
       React.createElement('td', { className: 'dbm-row-actions' },
         React.createElement('div', { className: 'dbm-actions' },
           React.createElement('button', {
@@ -943,6 +952,15 @@ export function SqlStructureTab(props: SqlStructureTabProps): React.ReactElement
             })()
           },
         }),
+    /*
+     * The hover box itself, rendered once at the end of the tree.
+     *
+     * Where it sits does not matter — its position comes from the hovered cell's own rect —
+     * but it must NOT be inside `.dbm-scroll`: the box would then live in the scrollable
+     * content, and `position: fixed` inside it is still subject to that container's clipping
+     * in some engines. Out here it is a direct child of the tab body.
+     */
+    tip,
   )
 }
 

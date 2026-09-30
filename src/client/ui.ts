@@ -7,6 +7,7 @@ import * as React from 'react'
 
 import { en, zh, type DbKey } from './locales.ts'
 import { formatDuration } from './ttl.ts'
+import { TIP_MAX_WIDTH, hoverTipPosition } from './hover-tip.ts'
 
 /** Template values accepted by the interpolator. */
 export type TranslateValues = Record<string, string | number>
@@ -73,6 +74,85 @@ export function renderCell(value: string | number | boolean | null): string {
 export function isNull(value: string | number | boolean | null): boolean {
   return value === null
 }
+
+/**
+ * A hover tooltip that the PANEL draws, instead of relying on the browser's `title`.
+ *
+ * Why it exists: 结构页鼠标放在字段名上不显示注释. The cell HAD its `title` attribute (verified in
+ * the live DOM) and the browser is supposed to show it after a short delay, but nothing
+ * appeared in the desktop app — so the comment stayed unreachable unless the user scrolled
+ * sideways to the 注释 column. A mechanism that does not work is not a mechanism; this one is
+ * panel-rendered, so it is visible immediately, wraps long text, and can be asserted in a
+ * test by dispatching a real hover.
+ *
+ * `position: fixed` rather than `absolute`: the anchor lives inside a scroll container, and an
+ * absolutely positioned box would be clipped (or scrolled out of reach) at that container's
+ * edges — precisely the rows where the comment is hardest to see. Fixed escapes the clipping,
+ * and no ancestor of a table cell in this panel creates a containing block for it (the only
+ * `transform` in the stylesheet is on the spinner, which is never an ancestor of a cell).
+ *
+ * Usage: spread {@link HoverTip.tipProps} onto the element that carries the text, and render
+ * {@link HoverTip.tip} once, anywhere in the same tree (its position is computed from the
+ * anchor, so where it sits in the JSX does not matter).
+ *
+ * @returns the handlers for an anchor, and the element to render — null while nothing is hovered.
+ */
+export function useHoverTip(): {
+  tipProps(text: string): Record<string, unknown>
+  tip: React.ReactElement | null
+} {
+  const [tip, setTip] = React.useState<{ text: string; x: number; y: number } | undefined>(undefined)
+
+  /**
+   * Anchor the box BESIDE the hovered element, centred on its row.
+   *
+   * Beside rather than below: a table row is ~38px tall, so a box placed under the cell
+   * covers the next row's data — the user is reading that row while hovering this one. Beside
+   * it, the box belongs to the cell it describes, and because it is vertically centred on a
+   * row that is already on screen it cannot fall outside the viewport.
+   *
+   * It is pulled back inside the window when the anchor sits near the right edge; the 340px
+   * cap is what keeps that from having to happen for every row of a wide table.
+   */
+  const show = (text: string) => (event: { currentTarget: { getBoundingClientRect(): DOMRect } }): void => {
+    if (text === '') return
+    const { x, y } = hoverTipPosition(event.currentTarget.getBoundingClientRect(), {
+      width: window.innerWidth,
+      height: window.innerHeight,
+    })
+    setTip({ text, x, y })
+  }
+
+  return {
+    tipProps: text => ({
+      onMouseEnter: show(text),
+      onMouseLeave: () => setTip(undefined),
+      // Left over from a row that has been re-rendered or scrolled away, the box would float
+      // over whatever replaced it.
+      onMouseDown: () => setTip(undefined),
+    }),
+    tip: tip === undefined
+      ? null
+      : React.createElement(
+          'div',
+          {
+            key: 'hover-tip',
+            className: 'dbm-tip',
+            role: 'tooltip',
+            'data-dbm-tip': '',
+            style: {
+              left: tip.x,
+              top: tip.y,
+              maxWidth: TIP_MAX_WIDTH,
+              // Centred on the anchor's row, whatever the box's own height turns out to be.
+              transform: 'translateY(-50%)',
+            },
+          },
+          tip.text,
+        ),
+  }
+}
+
 
 /** The modal shell every dialog renders into. */
 export interface ModalProps {

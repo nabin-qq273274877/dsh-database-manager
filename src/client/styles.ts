@@ -1505,4 +1505,28 @@ textarea.dbm-cell-input {
   border: 1px solid color-mix(in srgb, #1a8a4a 35%, transparent);
   background: color-mix(in srgb, #1a8a4a 10%, transparent);
 }
+/*
+ * The hover tooltip the panel draws itself (see useHoverTip in ui.ts).
+ *
+ * Reported: 结构页鼠标放在字段名上不显示注释 — the cells carried a title attribute and the
+ * browser showed nothing. This box is the replacement, so it has to look like a tooltip and
+ * behave like one: on top of everything, never intercepting the pointer (a box that eats the
+ * hover ends the hover and flickers), wrapping rather than widening past the viewport, and
+ * readable in both themes — hence the theme aliases rather than fixed colours.
+ */
+.dbm-tip {
+  position: fixed;
+  z-index: 60;
+  padding: 5px 9px;
+  border-radius: 6px;
+  border: 1px solid var(--dsw-alias-border-l3);
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .18);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+}
 `
