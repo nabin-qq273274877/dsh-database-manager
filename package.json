@@ -1,6 +1,6 @@
 {
   "name": "dsh-database-manager",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DSH Web GUI 数据库管理面板：侧边栏入口 + 独立面板，统一管理 SQLite / MySQL / Redis（数据源配置、实时连接池、SQL 浏览器、Redis 键浏览器），并提供受审批保护的 agent 工具。 | Database management panel for the DeepSeek Harness Web GUI: a sidebar entry and a dedicated panel managing SQLite / MySQL / Redis (source configuration, live connection pool, a SQL browser, a Redis key browser), plus approval-guarded agent tools.",
   "type": "module",
   "engines": {
